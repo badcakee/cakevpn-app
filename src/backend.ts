@@ -82,6 +82,7 @@ export const backend = {
   settingsInfo: () => invoke<{ version: string; autostart: boolean }>("settings_info"),
   setAutostart: (enabled: boolean) => invoke<boolean>("set_autostart", { enabled }),
   createInvite: () => invoke<Account>("create_invite"),
+  deleteInvite: (code: string) => invoke<Account>("delete_invite", { code }),
   checkUpdate: () => invoke<{ version: string; notes: string | null } | null>("check_update"),
   installUpdate: () => invoke<void>("install_update"),
 };

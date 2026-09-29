@@ -154,6 +154,15 @@ pub async fn create_invite(token: &str) -> Result<Invite, ApiError> {
     read(client().post(format!("{API_BASE}/cakevpn/api/v1/invite")).bearer_auth(token).send().await).await
 }
 
+/// Takes back an invite code nobody has used yet.
+pub async fn delete_invite(token: &str, code: &str) -> Result<(), ApiError> {
+    let body = serde_json::json!({ "code": code });
+    let _: serde_json::Value =
+        read(client().post(format!("{API_BASE}/cakevpn/api/v1/invite/delete")).bearer_auth(token).json(&body).send().await)
+            .await?;
+    Ok(())
+}
+
 pub async fn sign_out(token: &str) {
     let _ = client().post(format!("{API_BASE}/cakevpn/api/v1/signout")).bearer_auth(token).send().await;
 }

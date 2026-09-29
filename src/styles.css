@@ -747,6 +747,35 @@ label.row {
   margin-top: 18px;
 }
 
+.updates .row {
+  padding-top: 0;
+}
+
+.outline {
+  width: 100%;
+  margin: 4px 0 10px;
+  padding: 11px;
+  border-radius: 12px;
+  border: 1.5px solid var(--pink);
+  color: var(--pink-dark);
+  font-weight: 600;
+  transition: background-color 0.2s var(--ease), color 0.2s var(--ease);
+}
+
+.outline:hover:not(:disabled) {
+  background: var(--pink);
+  color: #fff;
+}
+
+.updates .primary {
+  margin: 4px 0 10px;
+}
+
+.update-message {
+  margin-bottom: 6px;
+  color: var(--text);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -851,6 +880,21 @@ label.row {
 .tag.waiting {
   background: var(--line);
   color: var(--muted);
+}
+
+.delete-code {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 10px;
+  border-radius: 8px;
+  color: var(--red);
+  transition: background-color 0.2s var(--ease), color 0.2s var(--ease);
+}
+
+.delete-code:hover:not(:disabled),
+.delete-code.confirm {
+  background: var(--red);
+  color: #fff;
 }
 
 .copy-code {

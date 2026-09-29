@@ -164,6 +164,14 @@ async fn create_invite(state: State<'_, AppState>) -> Result<Account, ApiError> 
     fetch_account(&state).await
 }
 
+/// Deletes an unused invite code and returns the account without it.
+#[tauri::command]
+async fn delete_invite(state: State<'_, AppState>, code: String) -> Result<Account, ApiError> {
+    let token = store::token().ok_or_else(not_signed_in)?;
+    api::delete_invite(&token, &code).await?;
+    fetch_account(&state).await
+}
+
 #[tauri::command]
 async fn sign_out(state: State<'_, AppState>) -> Result<(), String> {
     let _ = helper::ask(Request::Disconnect).await;
@@ -422,6 +430,7 @@ pub fn run() {
             settings_info,
             set_autostart,
             create_invite,
+            delete_invite,
             check_update,
             install_update
         ])

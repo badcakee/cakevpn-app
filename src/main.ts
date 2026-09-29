@@ -51,8 +51,10 @@ const state = {
   speed: { up: 0, down: 0 },
   /** Why CakeVPN moved to another location, shown under the button. */
   moveNotice: "",
-  /** Account refreshes in a row that found the connected location overloaded. */
-  overloadChecks: 0,
+  /** Since when (ms) the connected location has been overloaded; 0 when it isn't. */
+  overloadSince: 0,
+  /** The invite code whose Delete button was pressed once and now asks to confirm. */
+  confirmDelete: "",
   /** When CakeVPN last moved away from an overloaded location. */
   movedAt: 0,
 };
@@ -493,16 +495,22 @@ function renderSettings() {
           : ""
       }
 
-      <div class="about muted small">
-        CakeVPN ${esc(state.appVersion)}${helperVersion ? ` · helper ${esc(helperVersion)}` : ""}
-        <div>${
+      <div class="section-label">Updates</div>
+      <div class="card updates">
+        <div class="row"><span><b>Version</b></span><span class="value">${esc(state.appVersion)}</span></div>
+        ${
           state.update
             ? `<button class="primary" id="settings-update" ${state.updating ? "disabled" : ""}>${
                 state.updating ? "Updating…" : `Update to ${esc(state.update.version)}`
               }</button>`
-            : `<button class="link" id="check-update">Check for updates</button>`
-        }</div>
-        ${state.updateMessage ? `<div>${esc(state.updateMessage)}</div>` : ""}
+            : `<button class="outline" id="check-update" ${state.updateMessage === "Checking…" ? "disabled" : ""}>Check for updates</button>`
+        }
+        ${state.updateMessage ? `<div class="muted small update-message">${esc(state.updateMessage)}</div>` : ""}
+        <div class="muted small">CakeVPN also checks by itself every 10 minutes.</div>
+      </div>
+
+      <div class="about muted small">
+        CakeVPN ${esc(state.appVersion)}${helperVersion ? ` · helper ${esc(helperVersion)}` : ""}
       </div>
     </main>`;
 
@@ -542,6 +550,9 @@ function renderSettings() {
   app.querySelectorAll<HTMLButtonElement>(".copy-code").forEach((button) =>
     button.addEventListener("click", () => copyCode(button)),
   );
+  app.querySelectorAll<HTMLButtonElement>(".delete-code").forEach((button) =>
+    button.addEventListener("click", () => deleteInvite(button.dataset.code!)),
+  );
 }
 
 function invitesHtml(account: Account): string {
@@ -557,6 +568,13 @@ function invitesHtml(account: Account): string {
           <span class="invite-code">${esc(i.code)}</span>
           <span class="tag ${i.joined ? "joined" : "waiting"}">${i.joined ? "Joined" : "Not used yet"}</span>
           <button class="copy-code" data-code="${esc(i.code)}">Copy</button>
+          ${
+            i.joined
+              ? ""
+              : `<button class="delete-code ${state.confirmDelete === i.code ? "confirm" : ""}" data-code="${esc(i.code)}" ${
+                  state.busy ? "disabled" : ""
+                }>${state.confirmDelete === i.code ? "Delete?" : "Delete"}</button>`
+          }
         </div>`,
     )
     .join("");
@@ -638,6 +656,35 @@ async function makeInvite() {
     const before = new Set(state.account?.referral.invites.map((i) => i.code));
     state.account = await backend.createInvite();
     state.newInvite = state.account.referral.invites.find((i) => !before.has(i.code))?.code ?? "";
+  } catch (e) {
+    state.inviteError = asApiError(e).message;
+  }
+  state.busy = false;
+  render();
+  $("#invites")?.scrollIntoView({ block: "start" });
+}
+
+let confirmTimer: number | undefined;
+
+/** The first press asks "Delete?"; a second press within 4 seconds deletes. */
+async function deleteInvite(code: string) {
+  clearTimeout(confirmTimer);
+  if (state.confirmDelete !== code) {
+    state.confirmDelete = code;
+    render();
+    $("#invites")?.scrollIntoView({ block: "start" });
+    confirmTimer = window.setTimeout(() => {
+      state.confirmDelete = "";
+      if (state.screen === "settings") render();
+    }, 4000);
+    return;
+  }
+  state.confirmDelete = "";
+  state.busy = true;
+  state.inviteError = "";
+  render();
+  try {
+    state.account = await backend.deleteInvite(code);
   } catch (e) {
     state.inviteError = asApiError(e).message;
   }
@@ -828,21 +875,22 @@ async function refreshAccount() {
 }
 
 /**
- * Moves the tunnel off a location that stays above OVERLOAD_PERCENT for two
- * account refreshes in a row (about 20 seconds), when a quieter one is up.
- * It moves at most once every 10 minutes so people don't bounce around.
+ * Moves the tunnel off a location that stays above OVERLOAD_PERCENT for 20
+ * seconds, when a quieter one is up. It moves at most once every 10 minutes
+ * so people don't bounce around.
  */
 async function leaveOverloadedLocation() {
   const current = (state.account?.locations ?? []).find((l) => l.id === state.overview?.locationId);
   if (tunnelState() !== "connected" || !overloaded(current)) {
-    state.overloadChecks = 0;
+    state.overloadSince = 0;
     return;
   }
-  state.overloadChecks += 1;
-  if (state.busy || state.overloadChecks < 2 || Date.now() - state.movedAt < 10 * 60 * 1000) return;
+  const now = Date.now();
+  if (!state.overloadSince) state.overloadSince = now;
+  if (state.busy || now - state.overloadSince < 20_000 || now - state.movedAt < 10 * 60 * 1000) return;
   const target = quieterLocation(current);
   if (!current || !target) return;
-  state.overloadChecks = 0;
+  state.overloadSince = 0;
   state.movedAt = Date.now();
   followMove(target);
   state.busy = true;
@@ -891,7 +939,7 @@ async function start() {
 
   if (state.autoConnect && state.screen === "home" && tunnelState() === "disconnected") togglePower();
   checkForUpdate();
-  setInterval(checkForUpdate, 6 * 60 * 60 * 1000);
+  setInterval(checkForUpdate, 10 * 60 * 1000);
 
   setInterval(async () => {
     await refreshOverview();
@@ -907,8 +955,8 @@ async function start() {
   }, 2000);
   // The connected timer ticks every second between the 2-second status polls.
   setInterval(updateHome, 1000);
-  // Load changes quickly, so the account (with each location's load) is refreshed often.
-  setInterval(refreshAccount, 20000);
+  // The account carries each location's load, which the servers measure every 5 seconds.
+  setInterval(refreshAccount, 5000);
   setInterval(refreshPings, 30000);
 }
 
