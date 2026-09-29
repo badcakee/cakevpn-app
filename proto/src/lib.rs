@@ -13,7 +13,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// helper to be reinstalled on macOS. Windows reinstalls it with every update.
 ///
 /// 2: QUIC (UDP 443) is refused in the tunnel.
-pub const HELPER_REVISION: u32 = 2;
+/// 3: IPv6 is let through for users with their own IPv6 exit.
+pub const HELPER_REVISION: u32 = 3;
 
 pub const WINDOWS_PIPE: &str = r"\\.\pipe\cakevpn-helper";
 pub const UNIX_SOCKET: &str = "/var/run/cakevpn-helper.sock";
@@ -32,6 +33,9 @@ pub struct ConnectParams {
     pub public_key: String,
     pub short_id: String,
     pub fingerprint: String,
+    /// The user has their own IPv6 exit here, so IPv6 may go through the tunnel.
+    #[serde(default)]
+    pub ipv6: bool,
 }
 
 impl ConnectParams {
@@ -153,6 +157,7 @@ mod tests {
             public_key: "_OU5fl_xBw2CuAdTyvqgl4jDgxo0PN1DiaxEd7JQslE".into(),
             short_id: "26bd688ca4".into(),
             fingerprint: "chrome".into(),
+            ipv6: false,
         }
     }
 

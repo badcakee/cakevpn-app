@@ -980,3 +980,27 @@ label.row {
 .about .link {
   margin-top: 6px;
 }
+
+/* ---------- your IP ---------- */
+
+.your-ip {
+  font-size: 11px;
+  color: var(--muted);
+  padding: 4px 6px 0;
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.your-ip:empty {
+  display: none;
+}
+
+.row .value.ip {
+  font: 12px ui-monospace, "SF Mono", Consolas, monospace;
+  word-break: break-all;
+  max-width: 60%;
+  user-select: text;
+  -webkit-user-select: text;
+}

@@ -28,6 +28,18 @@ pub struct Settings<'a> {
 /// Discord uploads hang, and QUIC inside a TCP tunnel is slower anyway.
 pub fn config(s: &Settings) -> Value {
     let p = s.params;
+    // Users with their own IPv6 exit get IPv6 too, but IPv4 stays first: all
+    // IPv6 leaves through one Oracle VM, so it shouldn't carry everything.
+    let dns_strategy = if p.ipv6 { "prefer_ipv4" } else { "ipv4_only" };
+    let mut rules = vec![
+        json!({ "action": "sniff" }),
+        json!({ "protocol": "dns", "action": "hijack-dns" }),
+        json!({ "network": "udp", "port": 443, "action": "reject" }),
+    ];
+    if !p.ipv6 {
+        rules.push(json!({ "ip_version": 6, "action": "reject" }));
+    }
+    rules.push(json!({ "ip_is_private": true, "outbound": "direct" }));
     let inbound = match s.capture {
         Capture::Tun => {
             let mut tun = json!({
@@ -60,7 +72,7 @@ pub fn config(s: &Settings) -> Value {
                 { "type": "local", "tag": "local" }
             ],
             "final": "remote",
-            "strategy": "ipv4_only"
+            "strategy": dns_strategy
         },
         "inbounds": [inbound],
         "outbounds": [
@@ -82,13 +94,7 @@ pub fn config(s: &Settings) -> Value {
             { "type": "direct", "tag": "direct" }
         ],
         "route": {
-            "rules": [
-                { "action": "sniff" },
-                { "protocol": "dns", "action": "hijack-dns" },
-                { "network": "udp", "port": 443, "action": "reject" },
-                { "ip_version": 6, "action": "reject" },
-                { "ip_is_private": true, "outbound": "direct" }
-            ],
+            "rules": rules,
             "final": "proxy",
             "auto_detect_interface": true,
             "default_domain_resolver": "local"
@@ -116,6 +122,7 @@ mod tests {
             public_key: "_OU5fl_xBw2CuAdTyvqgl4jDgxo0PN1DiaxEd7JQslE".into(),
             short_id: "26bd688ca4".into(),
             fingerprint: "chrome".into(),
+            ipv6: false,
         }
     }
 
@@ -133,13 +140,29 @@ mod tests {
         assert!(rules.iter().any(|r| r["network"] == "udp" && r["port"] == 443 && r["action"] == "reject"), "QUIC is not refused");
     }
 
+    #[test]
+    fn ipv6_only_for_users_with_their_own_address() {
+        let mut p = params();
+        let without = config(&Settings { params: &p, capture: Capture::Tun, api_port: 9095, api_secret: "s" });
+        assert_eq!(without["dns"]["strategy"], "ipv4_only");
+        assert!(without["route"]["rules"].as_array().unwrap().iter().any(|r| r["ip_version"] == 6));
+        p.ipv6 = true;
+        let with = config(&Settings { params: &p, capture: Capture::Tun, api_port: 9095, api_secret: "s" });
+        assert_eq!(with["dns"]["strategy"], "prefer_ipv4");
+        assert!(!with["route"]["rules"].as_array().unwrap().iter().any(|r| r["ip_version"] == 6));
+    }
+
     /// Writes both variants for `sing-box check` (see scripts/check-singbox-config.sh).
     #[test]
     fn write_configs_for_sing_box_check() {
         let Ok(dir) = std::env::var("CAKEVPN_WRITE_CONFIGS") else { return };
         let p = params();
-        for (name, capture) in [("tun", Capture::Tun), ("local", Capture::LocalPort(11095))] {
-            let c = config(&Settings { params: &p, capture, api_port: 9095, api_secret: "s" });
+        let mut v6 = params();
+        v6.ipv6 = true;
+        for (name, params, capture) in
+            [("tun", &p, Capture::Tun), ("local", &p, Capture::LocalPort(11095)), ("tun-ipv6", &v6, Capture::Tun)]
+        {
+            let c = config(&Settings { params, capture, api_port: 9095, api_secret: "s" });
             std::fs::write(format!("{dir}/{name}.json"), serde_json::to_string_pretty(&c).unwrap()).unwrap();
         }
     }

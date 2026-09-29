@@ -40,6 +40,8 @@ export interface Account {
     bonusMbps: number;
     invites: Invite[];
   };
+  /** Where this user's traffic leaves from; empty strings when shared or unknown. */
+  ips?: { ipv4: string; ipv6: string };
 }
 
 export interface ApiError {

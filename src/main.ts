@@ -305,6 +305,7 @@ function renderHome() {
         <div class="card-label">Location</div>
         <button class="loc current" id="toggle-picker">${currentLocationHtml()}</button>
         <div class="picker ${state.pickerOpen ? "open" : ""}" id="picker"><div class="picker-inner">${pickerHtml()}</div></div>
+        <div class="your-ip" id="your-ip"></div>
       </div>
 
       <div class="card stats">
@@ -326,6 +327,7 @@ function renderHome() {
   $("#open-settings")!.addEventListener("click", () => openSettings());
   $("#invite-link")?.addEventListener("click", () => openSettings(true));
   $("#update-now")!.addEventListener("click", installUpdate);
+  updateLocations();
   $("#toggle-picker")!.addEventListener("click", () => {
     state.pickerOpen = !state.pickerOpen;
     $("#picker")!.classList.toggle("open", state.pickerOpen);
@@ -388,6 +390,13 @@ function updateHome() {
   if (speed.innerHTML !== speedHtml) speed.innerHTML = speedHtml;
 }
 
+/** "IPv4 1.2.3.4 · IPv6 2603:…" for the main location, or "" when unknown. */
+function ipsText(account: Account | null): string {
+  const ips = account?.ips;
+  if (!ips) return "";
+  return [ips.ipv4 && `IPv4 ${ips.ipv4}`, ips.ipv6 && `IPv6 ${ips.ipv6}`].filter(Boolean).join(" · ");
+}
+
 /** Redraws the location parts after the account, pings or choice changed. */
 function updateLocations() {
   if (state.screen !== "home") return;
@@ -395,6 +404,9 @@ function updateLocations() {
   const inner = $("#picker .picker-inner");
   if (current) current.innerHTML = currentLocationHtml();
   if (inner) inner.innerHTML = pickerHtml();
+  // The addresses belong to the main location; other locations use their own.
+  const main = chosenLocation()?.id === "main";
+  setText("#your-ip", main ? ipsText(state.account) : "");
 }
 
 function renderSettings() {
@@ -436,6 +448,10 @@ function renderSettings() {
         <div class="row"><span><b>Plan</b></span><span class="value">${esc(planLabel(account))}</span></div>
         <div class="row"><span><b>Used this month</b></span><span class="value">${formatBytes(account.usage.bytes)}</span></div>
         <div class="row"><span><b>Traffic</b></span><span class="value">Unlimited</span></div>
+        ${account.ips?.ipv4 ? `<div class="row"><span><b>Your IPv4</b></span><span class="value ip">${esc(account.ips.ipv4)}</span></div>` : ""}
+        <div class="row"><span><b>Your IPv6</b></span><span class="value ip">${
+          account.ips?.ipv6 ? esc(account.ips.ipv6) : "Shared"
+        }</span></div>
       </div>
       <button class="danger-outline" id="sign-out">Sign out of this device</button>`
           : ""

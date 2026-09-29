@@ -77,6 +77,16 @@ pub struct Account {
     pub locations: Vec<Location>,
     #[serde(default)]
     pub referral: Referral,
+    #[serde(default)]
+    pub ips: Ips,
+}
+
+/// Where this user's traffic leaves from; empty when unknown or shared.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct Ips {
+    pub ipv4: String,
+    pub ipv6: String,
 }
 
 /// An error the window can show. `error` is a short code such as
