@@ -122,6 +122,14 @@ async fn refresh_account(state: State<'_, AppState>) -> Result<Account, ApiError
     fetch_account(&state).await
 }
 
+/// Makes an invite code and returns the account with it in the invite list.
+#[tauri::command]
+async fn create_invite(state: State<'_, AppState>) -> Result<Account, ApiError> {
+    let token = store::token().ok_or_else(not_signed_in)?;
+    api::create_invite(&token).await?;
+    fetch_account(&state).await
+}
+
 #[tauri::command]
 async fn sign_out(state: State<'_, AppState>) -> Result<(), String> {
     let _ = helper::ask(Request::Disconnect).await;
@@ -340,7 +348,8 @@ pub fn run() {
             install_helper,
             ping_locations,
             settings_info,
-            set_autostart
+            set_autostart,
+            create_invite
         ])
         .build(tauri::generate_context!())
         .expect("error while starting CakeVPN");

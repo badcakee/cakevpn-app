@@ -47,10 +47,36 @@ pub struct Location {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Invite {
+    pub code: String,
+    pub joined: bool,
+    pub created_at: i64,
+}
+
+/// Each friend who signs in with one of your invites adds `mbps_per_friend`
+/// to your speed, for up to `max_friends` friends.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Referral {
+    pub mbps_per_friend: u32,
+    pub max_friends: u32,
+    pub friends: u32,
+    pub bonus_mbps: u32,
+    pub invites: Vec<Invite>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct Account {
     pub plan: Plan,
+    /// The plan speed with the invite bonus; 0 means no cap.
+    #[serde(default)]
+    pub speed_mbps: u32,
     pub usage: Usage,
     pub locations: Vec<Location>,
+    #[serde(default)]
+    pub referral: Referral,
 }
 
 /// An error the window can show. `error` is a short code such as
@@ -111,6 +137,11 @@ pub async fn redeem(code: &str, device_id: &str, device_name: &str) -> Result<St
 
 pub async fn account(token: &str) -> Result<Account, ApiError> {
     read(client().get(format!("{API_BASE}/cakevpn/api/v1/account")).bearer_auth(token).send().await).await
+}
+
+/// Makes an invite code for a friend.
+pub async fn create_invite(token: &str) -> Result<Invite, ApiError> {
+    read(client().post(format!("{API_BASE}/cakevpn/api/v1/invite")).bearer_auth(token).send().await).await
 }
 
 pub async fn sign_out(token: &str) {

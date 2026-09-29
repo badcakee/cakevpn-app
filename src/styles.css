@@ -756,3 +756,114 @@ label.row {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ---------- invites ---------- */
+
+.invite-link {
+  display: block;
+  margin: 10px auto 0;
+  text-decoration: none;
+  color: var(--pink);
+  font-weight: 600;
+}
+
+.invites .primary {
+  margin-top: 10px;
+  padding: 11px;
+  font-size: 14px;
+}
+
+.invite-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 6px;
+}
+
+.invite-head b {
+  display: block;
+  font-size: 20px;
+  color: var(--pink);
+}
+
+.invite-head small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.progress {
+  flex: 1;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.progress i {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #ff6f91, #ffb36b);
+  transition: width 0.6s var(--ease);
+}
+
+.invite-list {
+  margin-top: 10px;
+}
+
+.invite-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.invite-row.new {
+  animation: new-invite 1.6s var(--ease);
+}
+
+@keyframes new-invite {
+  from {
+    background: rgba(255, 111, 145, 0.18);
+  }
+}
+
+.invite-code {
+  flex: 1;
+  font: 700 17px ui-monospace, "SF Mono", Consolas, monospace;
+  letter-spacing: 2px;
+}
+
+.tag {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 999px;
+}
+
+.tag.joined {
+  background: rgba(34, 181, 115, 0.15);
+  color: var(--green);
+}
+
+.tag.waiting {
+  background: var(--line);
+  color: var(--muted);
+}
+
+.copy-code {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 10px;
+  border-radius: 8px;
+  background: var(--line);
+  min-width: 64px;
+  transition: background-color 0.2s var(--ease), color 0.2s var(--ease);
+}
+
+.copy-code.done {
+  background: var(--green);
+  color: #fff;
+}

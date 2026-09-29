@@ -40,6 +40,9 @@ const state = {
   lockedUntil: 0,
   actionError: "",
   settingsError: "",
+  inviteError: "",
+  /** The invite code made last, highlighted in the list. */
+  newInvite: "",
   lastBytes: null as { at: number; up: number; down: number } | null,
   speed: { up: 0, down: 0 },
 };
@@ -96,7 +99,13 @@ function formatDuration(seconds: number): string {
 
 function planLabel(account: Account): string {
   const p = account.plan;
-  return p.mbps > 0 ? `${p.name} · ${p.mbps} Mbps` : `${p.name} · Max speed`;
+  // speedMbps includes the invite bonus; older servers leave it out.
+  const mbps = account.speedMbps || p.mbps;
+  return p.mbps > 0 ? `${p.name} · ${mbps} Mbps` : `${p.name} · Max speed`;
+}
+
+function invitesOn(account: Account | null): boolean {
+  return !!account?.referral && account.referral.maxFriends > 0;
 }
 
 /** Lower is better: a quick answer and a quiet server. */
@@ -285,10 +294,16 @@ function renderHome() {
         <div><div class="card-label">Speed now</div><div class="big-number small" id="speed"></div></div>
       </div>
       <div class="muted small center-text">Unlimited traffic on every plan</div>
+      ${
+        invitesOn(account) && account.plan.mbps > 0
+          ? `<button class="link invite-link" id="invite-link">🎁 Invite friends · +${account.referral.mbpsPerFriend} Mbps each</button>`
+          : ""
+      }
     </main>`;
 
   $("#power")!.addEventListener("click", togglePower);
-  $("#open-settings")!.addEventListener("click", openSettings);
+  $("#open-settings")!.addEventListener("click", () => openSettings());
+  $("#invite-link")?.addEventListener("click", () => openSettings(true));
   $("#toggle-picker")!.addEventListener("click", () => {
     state.pickerOpen = !state.pickerOpen;
     $("#picker")!.classList.toggle("open", state.pickerOpen);
@@ -383,6 +398,8 @@ function renderSettings() {
         ${themeButton("system", "Automatic")}${themeButton("light", "Light")}${themeButton("dark", "Dark")}
       </div>
 
+      ${invitesOn(account) ? invitesHtml(account!) : ""}
+
       ${
         account
           ? `<div class="section-label">Account</div>
@@ -423,6 +440,46 @@ function renderSettings() {
     app.querySelectorAll(".seg").forEach((el) => el.classList.toggle("active", el === button));
   });
   $("#sign-out")?.addEventListener("click", signOut);
+  $("#make-invite")?.addEventListener("click", makeInvite);
+  app.querySelectorAll<HTMLButtonElement>(".copy-code").forEach((button) =>
+    button.addEventListener("click", () => copyCode(button)),
+  );
+}
+
+function invitesHtml(account: Account): string {
+  const r = account.referral;
+  const capped = account.plan.mbps > 0;
+  const full = r.invites.length >= r.maxFriends;
+  const friends = Math.min(r.friends, r.maxFriends);
+  const rows = [...r.invites]
+    .reverse()
+    .map(
+      (i) => `
+        <div class="invite-row ${i.code === state.newInvite ? "new" : ""}">
+          <span class="invite-code">${esc(i.code)}</span>
+          <span class="tag ${i.joined ? "joined" : "waiting"}">${i.joined ? "Joined" : "Not used yet"}</span>
+          <button class="copy-code" data-code="${esc(i.code)}">Copy</button>
+        </div>`,
+    )
+    .join("");
+  return `
+      <div class="section-label" id="invites">Invite friends</div>
+      <div class="card invites">
+        ${
+          capped
+            ? `<div class="invite-head">
+                 <div><b>+${r.bonusMbps} Mbps</b><small>${friends} of ${r.maxFriends} friends joined</small></div>
+                 <div class="progress"><i style="width:${(friends / Math.max(1, r.maxFriends)) * 100}%"></i></div>
+               </div>
+               <p class="muted small">Each friend who signs in with your invite code gives you +${r.mbpsPerFriend} Mbps, up to ${r.maxFriends} friends. They get their own free CakeVPN.</p>`
+            : `<p class="muted small">You already have the fastest plan, so invites don't add speed, but your friends still get their own free CakeVPN.</p>`
+        }
+        ${state.inviteError ? `<div class="error">${esc(state.inviteError)}</div>` : ""}
+        <button class="primary" id="make-invite" ${full || state.busy ? "disabled" : ""}>${
+          full ? `You've made all ${r.maxFriends} invites` : state.busy ? "Making a code…" : "Create invite code"
+        }</button>
+        ${rows ? `<div class="invite-list">${rows}</div>` : ""}
+      </div>`;
 }
 
 // ---------- actions ----------
@@ -433,7 +490,7 @@ function setScreen(screen: Screen) {
   render();
 }
 
-async function openSettings() {
+async function openSettings(toInvites = false) {
   try {
     const info = await backend.settingsInfo();
     state.autostart = info.autostart;
@@ -442,7 +499,46 @@ async function openSettings() {
     /* show the page anyway */
   }
   state.settingsError = "";
+  state.inviteError = "";
   setScreen("settings");
+  if (toInvites) $("#invites")?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function makeInvite() {
+  state.busy = true;
+  state.inviteError = "";
+  render();
+  try {
+    const before = new Set(state.account?.referral.invites.map((i) => i.code));
+    state.account = await backend.createInvite();
+    state.newInvite = state.account.referral.invites.find((i) => !before.has(i.code))?.code ?? "";
+  } catch (e) {
+    state.inviteError = asApiError(e).message;
+  }
+  state.busy = false;
+  render();
+  $("#invites")?.scrollIntoView({ block: "start" });
+}
+
+async function copyCode(button: HTMLButtonElement) {
+  const code = button.dataset.code!;
+  try {
+    await navigator.clipboard.writeText(code);
+  } catch {
+    // Older webviews: copy through a hidden text box.
+    const box = document.createElement("textarea");
+    box.value = code;
+    document.body.appendChild(box);
+    box.select();
+    document.execCommand("copy");
+    box.remove();
+  }
+  button.textContent = "Copied!";
+  button.classList.add("done");
+  setTimeout(() => {
+    button.textContent = "Copy";
+    button.classList.remove("done");
+  }, 1500);
 }
 
 function closeSettings() {

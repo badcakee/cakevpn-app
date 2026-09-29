@@ -21,10 +21,25 @@ export interface Location {
   load: Load | null;
 }
 
+export interface Invite {
+  code: string;
+  joined: boolean;
+  createdAt: number;
+}
+
 export interface Account {
   plan: Plan;
+  /** Plan speed plus the invite bonus; 0 means no cap. */
+  speedMbps: number;
   usage: { month: string; bytes: number };
   locations: Location[];
+  referral: {
+    mbpsPerFriend: number;
+    maxFriends: number;
+    friends: number;
+    bonusMbps: number;
+    invites: Invite[];
+  };
 }
 
 export interface ApiError {
@@ -64,6 +79,7 @@ export const backend = {
   pingLocations: () => invoke<Record<string, number | null>>("ping_locations"),
   settingsInfo: () => invoke<{ version: string; autostart: boolean }>("settings_info"),
   setAutostart: (enabled: boolean) => invoke<boolean>("set_autostart", { enabled }),
+  createInvite: () => invoke<Account>("create_invite"),
 };
 
 /** Tauri hands back command errors as the value the Rust side returned. */
