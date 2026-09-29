@@ -33,7 +33,10 @@ case "$TARGET" in
     arm=$(fetch_tar darwin-arm64)
     intel=$(fetch_tar darwin-amd64)
     lipo -create -output "$OUT/sing-box-$TARGET" "$arm" "$intel"
-    codesign --force --sign - "$OUT/sing-box-$TARGET"
+    # Tauri builds each architecture first and checks for its own copy too.
+    cp "$arm" "$OUT/sing-box-aarch64-apple-darwin"
+    cp "$intel" "$OUT/sing-box-x86_64-apple-darwin"
+    for f in "$OUT"/sing-box-*-apple-darwin; do codesign --force --sign - "$f"; done
     ;;
   x86_64-unknown-linux-gnu)
     cp "$(fetch_tar linux-amd64)" "$OUT/sing-box-$TARGET"
