@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// Set CAKEVPN_API when building to point the app at another server.
+/// CI passes an empty value when the setting is unset, which also means the default.
 pub const API_BASE: &str = match option_env!("CAKEVPN_API") {
-    Some(url) => url,
-    None => "https://147.135.128.62:2096",
+    Some(url) if !url.is_empty() => url,
+    _ => "https://147.135.128.62:2096",
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -80,8 +81,13 @@ fn client() -> reqwest::Client {
 }
 
 async fn read<T: for<'de> Deserialize<'de>>(response: Result<reqwest::Response, reqwest::Error>) -> Result<T, ApiError> {
-    let response = response.map_err(|_| {
-        ApiError::new("offline", "Can't reach CakeVPN. Check your internet connection and try again.")
+    let response = response.map_err(|e| {
+        if e.is_builder() {
+            // The request never left the computer: the server address built into the app is wrong.
+            ApiError::new("bad_build", format!("This copy of CakeVPN has a wrong server address ({API_BASE:?}). Get a new download."))
+        } else {
+            ApiError::new("offline", "Can't reach CakeVPN. Check your internet connection and try again.")
+        }
     })?;
     let status = response.status();
     let body = response.bytes().await.map_err(|_| ApiError::new("offline", "The connection dropped. Try again."))?;
@@ -109,4 +115,12 @@ pub async fn account(token: &str) -> Result<Account, ApiError> {
 
 pub async fn sign_out(token: &str) {
     let _ = client().post(format!("{API_BASE}/cakevpn/api/v1/signout")).bearer_auth(token).send().await;
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn api_base_is_a_full_https_url() {
+        assert!(super::API_BASE.starts_with("https://"), "API_BASE = {:?}", super::API_BASE);
+    }
 }
