@@ -1,0 +1,68 @@
+name: Build CakeVPN
+
+# Run it from the Actions tab ("Run workflow"), or push a tag like v1.0.0.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+env:
+  # Set the repository variable CAKEVPN_API to your panel's app address,
+  # e.g. https://vpn.example.com:2096. Without it the app uses the default in src-tauri/src/api.rs.
+  CAKEVPN_API: ${{ vars.CAKEVPN_API }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - name: Build the helper service
+        run: |
+          cargo build --release -p cakevpn-helper --target x86_64-pc-windows-msvc
+          cp target/x86_64-pc-windows-msvc/release/cakevpn-helper.exe src-tauri/binaries/cakevpn-helper-x86_64-pc-windows-msvc.exe
+      - run: scripts/fetch-sing-box.sh x86_64-pc-windows-msvc
+      - run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CakeVPN-Windows
+          path: target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - name: Build the helper for Apple Silicon and Intel
+        run: |
+          cargo build --release -p cakevpn-helper --target aarch64-apple-darwin
+          cargo build --release -p cakevpn-helper --target x86_64-apple-darwin
+          lipo -create -output src-tauri/binaries/cakevpn-helper-universal-apple-darwin \
+            target/aarch64-apple-darwin/release/cakevpn-helper target/x86_64-apple-darwin/release/cakevpn-helper
+          # Unsigned code must at least be ad-hoc signed to run on Apple Silicon.
+          codesign --force --sign - src-tauri/binaries/cakevpn-helper-universal-apple-darwin
+      - run: scripts/fetch-sing-box.sh universal-apple-darwin
+      - run: npm run tauri build -- --target universal-apple-darwin --bundles app,dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CakeVPN-macOS
+          path: target/universal-apple-darwin/release/bundle/dmg/*.dmg

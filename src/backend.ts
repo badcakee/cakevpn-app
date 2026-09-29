@@ -1,0 +1,70 @@
+// Typed wrappers around the Rust commands in src-tauri/src/lib.rs.
+import { invoke } from "@tauri-apps/api/core";
+
+export interface Plan {
+  id: string;
+  name: string;
+  /** 0 means no speed cap. */
+  mbps: number;
+}
+
+export interface Load {
+  percent: number;
+  level: "low" | "medium" | "high";
+}
+
+export interface Location {
+  id: string;
+  name: string;
+  country: string;
+  online: boolean;
+  load: Load | null;
+}
+
+export interface Account {
+  plan: Plan;
+  usage: { month: string; bytes: number };
+  locations: Location[];
+}
+
+export interface ApiError {
+  error: string;
+  message: string;
+  retryAfter?: number;
+  triesLeft?: number;
+}
+
+export type TunnelState = "disconnected" | "connecting" | "connected" | "failed";
+
+export interface Status {
+  state: TunnelState;
+  error: string | null;
+  connectedSince: number | null;
+  upBytes: number;
+  downBytes: number;
+}
+
+export interface Overview {
+  helper: "ok" | "missing" | "outdated";
+  status: Status | null;
+  banner: { kind: "wifi" | "load" | "slow"; message: string } | null;
+  locationId: string | null;
+}
+
+export const backend = {
+  loadSession: () => invoke<{ signedIn: boolean; account: Account | null }>("load_session"),
+  redeem: (code: string) => invoke<Account>("redeem", { code }),
+  refreshAccount: () => invoke<Account>("refresh_account"),
+  signOut: () => invoke<void>("sign_out"),
+  connect: (locationId: string) => invoke<Status>("connect", { locationId }),
+  disconnect: () => invoke<Status>("disconnect"),
+  overview: () => invoke<Overview>("overview"),
+  installHelper: () => invoke<void>("install_helper"),
+  pingLocations: () => invoke<Record<string, number | null>>("ping_locations"),
+};
+
+/** Tauri hands back command errors as the value the Rust side returned. */
+export function asApiError(e: unknown): ApiError {
+  if (e && typeof e === "object" && "message" in e) return e as ApiError;
+  return { error: "error", message: String(e) };
+}
