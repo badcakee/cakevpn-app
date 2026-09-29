@@ -37,6 +37,7 @@ export interface ApiError {
 export type TunnelState = "disconnected" | "connecting" | "connected" | "failed";
 
 export interface Status {
+  version: string;
   state: TunnelState;
   error: string | null;
   connectedSince: number | null;
@@ -61,6 +62,8 @@ export const backend = {
   overview: () => invoke<Overview>("overview"),
   installHelper: () => invoke<void>("install_helper"),
   pingLocations: () => invoke<Record<string, number | null>>("ping_locations"),
+  settingsInfo: () => invoke<{ version: string; autostart: boolean }>("settings_info"),
+  setAutostart: (enabled: boolean) => invoke<boolean>("set_autostart", { enabled }),
 };
 
 /** Tauri hands back command errors as the value the Rust side returned. */

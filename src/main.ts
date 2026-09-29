@@ -2,7 +2,25 @@ import { Account, asApiError, backend, Location, Overview } from "./backend";
 
 // ---------- state ----------
 
-type Screen = "loading" | "code" | "home" | "setup";
+type Screen = "loading" | "code" | "home" | "setup" | "settings";
+type Theme = "system" | "light" | "dark";
+
+const saved = {
+  get: (key: string) => {
+    try {
+      return localStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  },
+  set: (key: string, value: string) => {
+    try {
+      localStorage.setItem(key, value);
+    } catch {
+      /* the setting just won't be remembered */
+    }
+  },
+};
 
 const state = {
   screen: "loading" as Screen,
@@ -10,13 +28,18 @@ const state = {
   overview: null as Overview | null,
   pings: {} as Record<string, number | null>,
   /** "best" or a location id; remembered between runs. */
-  choice: localStorage.getItem("location") || "best",
+  choice: saved.get("location") || "best",
+  autoConnect: saved.get("autoConnect") === "1",
+  theme: (saved.get("theme") as Theme) || "system",
+  autostart: false,
+  appVersion: "",
   pickerOpen: false,
   busy: false,
   codeError: "",
   codeNotice: "",
   lockedUntil: 0,
   actionError: "",
+  settingsError: "",
   lastBytes: null as { at: number; up: number; down: number } | null,
   speed: { up: 0, down: 0 },
 };
@@ -28,6 +51,15 @@ const isWindows = navigator.userAgent.includes("Windows");
 
 function esc(text: string): string {
   return text.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+}
+
+function $(selector: string): HTMLElement | null {
+  return app.querySelector(selector);
+}
+
+function setText(selector: string, text: string) {
+  const el = $(selector);
+  if (el && el.textContent !== text) el.textContent = text;
 }
 
 function flag(country: string): string {
@@ -91,33 +123,41 @@ function tunnelState() {
   return state.overview?.status?.state ?? "disconnected";
 }
 
+function applyTheme() {
+  if (state.theme === "system") delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = state.theme;
+}
+
 // ---------- rendering ----------
+//
+// render() builds a screen from scratch; it runs when the screen or its
+// layout changes. updateHome() only touches the parts that change every
+// couple of seconds, so animations keep running instead of restarting.
 
 function render() {
+  app.dataset.screen = state.screen;
   if (state.screen === "loading") {
-    app.innerHTML = `<div class="center"><div class="logo big">🍰</div><div class="muted">Loading…</div></div>`;
+    app.innerHTML = `<div class="center screen"><div class="logo big">🍰</div><div class="muted">Loading…</div></div>`;
   } else if (state.screen === "code") {
     renderCode();
   } else if (state.screen === "setup") {
     renderSetup();
+  } else if (state.screen === "settings") {
+    renderSettings();
   } else {
     renderHome();
   }
 }
 
 function header(right = ""): string {
-  return `<header><div class="brand"><span class="logo">🍰</span> CakeVPN</div>${right}</header>`;
+  return `<header><div class="brand"><span class="logo">🍰</span> CakeVPN</div><div class="head-right">${right}</div></header>`;
 }
 
 function renderCode() {
   const locked = state.lockedUntil > Date.now();
-  const wait = Math.ceil((state.lockedUntil - Date.now()) / 1000);
-  const message = locked
-    ? `Too many wrong codes. Try again in ${formatDuration(wait)}.`
-    : state.codeError;
   app.innerHTML = `
     ${header()}
-    <main class="code-screen">
+    <main class="code-screen screen">
       <h1>Enter your code</h1>
       <p class="muted">Type the 5-character code you were given.</p>
       ${state.codeNotice ? `<div class="notice">${esc(state.codeNotice)}</div>` : ""}
@@ -125,10 +165,11 @@ function renderCode() {
         <div class="boxes">
           ${[0, 1, 2, 3, 4].map((i) => `<input class="box" data-i="${i}" maxlength="1" inputmode="text" ${locked || state.busy ? "disabled" : ""}>`).join("")}
         </div>
-        <div class="error ${message ? "" : "hidden"}" id="code-error">${esc(message)}</div>
+        <div class="error ${locked || state.codeError ? "" : "hidden"}" id="code-error"></div>
         <button class="primary" type="submit" ${locked || state.busy ? "disabled" : ""}>${state.busy ? "Checking…" : "Sign in"}</button>
       </form>
     </main>`;
+  updateCodeMessage();
   const boxes = [...app.querySelectorAll<HTMLInputElement>(".box")];
   if (!locked) boxes[0]?.focus();
   boxes.forEach((box, i) => {
@@ -149,18 +190,24 @@ function renderCode() {
       else boxes[text.length].focus();
     });
   });
-  app.querySelector("#code-form")!.addEventListener("submit", (e) => {
+  $("#code-form")!.addEventListener("submit", (e) => {
     e.preventDefault();
     const code = boxes.map((b) => b.value).join("");
     if (code.length === 5) submitCode(code);
   });
 }
 
+function updateCodeMessage() {
+  const locked = state.lockedUntil > Date.now();
+  const wait = Math.ceil((state.lockedUntil - Date.now()) / 1000);
+  setText("#code-error", locked ? `Too many wrong codes. Try again in ${formatDuration(wait)}.` : state.codeError);
+}
+
 function renderSetup() {
   const outdated = state.overview?.helper === "outdated";
   app.innerHTML = `
     ${header()}
-    <main class="center setup">
+    <main class="center setup screen">
       <div class="logo big">🔧</div>
       <h1>${outdated ? "Update needed" : "One-time setup"}</h1>
       <p class="muted">${
@@ -173,91 +220,234 @@ function renderSetup() {
       ${state.actionError ? `<div class="error">${esc(state.actionError)}</div>` : ""}
       ${isWindows ? "" : `<button class="primary" id="install" ${state.busy ? "disabled" : ""}>${state.busy ? "Setting up…" : "Set up"}</button>`}
     </main>`;
-  app.querySelector("#install")?.addEventListener("click", installHelper);
+  $("#install")?.addEventListener("click", installHelper);
+}
+
+const GEAR = `<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.5 7.5 0 0 0 0-2l2.1-1.6-2-3.5-2.5 1a7.7 7.7 0 0 0-1.7-1l-.4-2.7h-4l-.4 2.7a7.7 7.7 0 0 0-1.7 1l-2.5-1-2 3.5L4.6 11a7.5 7.5 0 0 0 0 2l-2.1 1.6 2 3.5 2.5-1a7.7 7.7 0 0 0 1.7 1l.4 2.7h4l.4-2.7a7.7 7.7 0 0 0 1.7-1l2.5 1 2-3.5zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/></svg>`;
+
+function loadBadge(l: Location): string {
+  if (!l.load) return "";
+  return `<span class="load ${l.load.level}" title="How busy this location is">
+      <span class="load-bar"><i style="width:${Math.max(4, l.load.percent)}%"></i></span>
+      <span class="load-pct">${l.load.percent}%</span>
+    </span>`;
+}
+
+function locationRow(l: Location, selected: boolean, best = false): string {
+  const ping = state.pings[l.id];
+  return `
+    <button class="loc ${selected ? "selected" : ""}" data-loc="${best ? "best" : esc(l.id)}" ${l.online ? "" : "disabled"}>
+      ${flag(l.country)}
+      <span class="loc-name">${esc(best ? "Best location" : l.name)}${best ? `<small>${esc(l.name)}</small>` : ""}</span>
+      <span class="loc-meta">${loadBadge(l)}<span class="ping">${ping != null ? `${ping} ms` : ""}</span></span>
+    </button>`;
+}
+
+function pickerHtml(): string {
+  const best = bestLocation();
+  return `${best ? locationRow(best, state.choice === "best", true) : ""}
+    ${(state.account?.locations ?? []).map((l) => locationRow(l, state.choice === l.id)).join("")}`;
+}
+
+function currentLocationHtml(): string {
+  const loc = chosenLocation();
+  return `${loc ? flag(loc.country) : ""}
+    <span class="loc-name">${loc ? esc(loc.name) : "No location online"}${state.choice === "best" ? "<small>Best location</small>" : ""}</span>
+    <span class="loc-meta">${loc ? loadBadge(loc) : ""}<span class="chevron">▾</span></span>`;
 }
 
 function renderHome() {
   const account = state.account!;
+  app.innerHTML = `
+    ${header(`<span class="plan ${account.plan.id}">${esc(planLabel(account))}</span>
+      <button class="icon-btn" id="open-settings" title="Settings">${GEAR}</button>`)}
+    <main class="home screen">
+      <button id="power" class="power">
+        <svg class="ring" viewBox="0 0 120 120" aria-hidden="true">
+          <circle class="ring-track" cx="60" cy="60" r="54"></circle>
+          <circle class="ring-arc" cx="60" cy="60" r="54"></circle>
+        </svg>
+        <span class="power-icon">⏻</span>
+        <span class="power-text" id="power-text"></span>
+      </button>
+      <div class="status-line" id="status-line"></div>
+      <div class="error hidden" id="action-error"></div>
+      <div class="banner" id="banner"><span class="banner-icon"></span><span class="banner-text"></span></div>
+
+      <div class="card">
+        <div class="card-label">Location</div>
+        <button class="loc current" id="toggle-picker">${currentLocationHtml()}</button>
+        <div class="picker ${state.pickerOpen ? "open" : ""}" id="picker"><div class="picker-inner">${pickerHtml()}</div></div>
+      </div>
+
+      <div class="card stats">
+        <div><div class="card-label">Used this month</div><div class="big-number" id="usage"></div></div>
+        <div><div class="card-label">Speed now</div><div class="big-number small" id="speed"></div></div>
+      </div>
+      <div class="muted small center-text">Unlimited traffic on every plan</div>
+    </main>`;
+
+  $("#power")!.addEventListener("click", togglePower);
+  $("#open-settings")!.addEventListener("click", openSettings);
+  $("#toggle-picker")!.addEventListener("click", () => {
+    state.pickerOpen = !state.pickerOpen;
+    $("#picker")!.classList.toggle("open", state.pickerOpen);
+    $("#toggle-picker")!.classList.toggle("open", state.pickerOpen);
+  });
+  $("#picker")!.addEventListener("click", (e) => {
+    const row = (e.target as HTMLElement).closest<HTMLButtonElement>(".loc");
+    if (row && !row.disabled) chooseLocation(row.dataset.loc!);
+  });
+  updateHome();
+}
+
+/** Updates the home screen in place. */
+function updateHome() {
+  if (state.screen !== "home" || !state.account) return;
   const status = state.overview?.status;
   const tstate = tunnelState();
-  const loc = chosenLocation();
-  const since = status?.connectedSince ? Date.now() / 1000 - status.connectedSince : 0;
+  const power = $("#power") as HTMLButtonElement | null;
+  if (!power) return;
+  power.className = `power ${tstate}`;
+  power.disabled = state.busy;
+  setText("#power-text", { disconnected: "Connect", connecting: "Connecting…", connected: "Connected", failed: "Try again" }[tstate]);
 
-  const buttonText = { disconnected: "Connect", connecting: "Connecting…", connected: "Connected", failed: "Try again" }[tstate];
-  const statusLine =
+  const since = status?.connectedSince ? Date.now() / 1000 - status.connectedSince : 0;
+  const line = $("#status-line")!;
+  line.className = `status-line ${tstate}`;
+  setText(
+    "#status-line",
     tstate === "connected"
       ? `Protected · ${formatDuration(since)}`
       : tstate === "connecting"
         ? "Setting up a secure connection…"
         : tstate === "failed"
-          ? esc(status?.error || "Could not connect.")
-          : "Not connected";
-
-  const banner = state.overview?.banner;
-  const locationRow = (l: Location, selected: boolean, label?: string) => {
-    const ping = state.pings[l.id];
-    const load = l.load;
-    return `
-      <button class="loc ${selected ? "selected" : ""}" data-loc="${label ? "best" : esc(l.id)}" ${l.online ? "" : "disabled"}>
-        ${flag(l.country)}
-        <span class="loc-name">${esc(label ?? l.name)}${label ? `<small>${esc(l.name)}</small>` : ""}</span>
-        <span class="loc-meta">
-          ${load ? `<span class="load ${load.level}" title="Load ${load.percent}%"><i style="width:${Math.max(6, load.percent)}%"></i></span>` : ""}
-          <span class="ping">${ping != null ? `${ping} ms` : ""}</span>
-        </span>
-      </button>`;
-  };
-  const best = bestLocation();
-  const picker = state.pickerOpen
-    ? `<div class="picker">
-        ${best ? locationRow(best, state.choice === "best", "Best location") : ""}
-        ${account.locations.map((l) => locationRow(l, state.choice === l.id)).join("")}
-      </div>`
-    : "";
-
-  app.innerHTML = `
-    ${header(`<span class="plan ${account.plan.id}">${esc(planLabel(account))}</span>`)}
-    <main class="home">
-      <button id="power" class="power ${tstate}" ${state.busy ? "disabled" : ""}>
-        <span class="power-icon">⏻</span>
-        <span class="power-text">${buttonText}</span>
-      </button>
-      <div class="status-line ${tstate}">${statusLine}</div>
-      ${state.actionError ? `<div class="error">${esc(state.actionError)}</div>` : ""}
-      ${banner ? `<div class="banner ${banner.kind}">${banner.kind === "wifi" ? "📶" : banner.kind === "load" ? "🔥" : "🐢"} ${esc(banner.message)}</div>` : ""}
-
-      <div class="card">
-        <div class="card-label">Location</div>
-        <button class="loc current" id="toggle-picker">
-          ${loc ? flag(loc.country) : ""}
-          <span class="loc-name">${loc ? esc(loc.name) : "No location online"}${state.choice === "best" ? "<small>Best location</small>" : ""}</span>
-          <span class="chevron">${state.pickerOpen ? "▲" : "▼"}</span>
-        </button>
-        ${picker}
-      </div>
-
-      <div class="card stats">
-        <div><div class="card-label">Used this month</div><div class="big-number">${formatBytes(account.usage.bytes)}</div></div>
-        <div><div class="card-label">Speed now</div><div class="big-number small">${
-          tstate === "connected" ? `↓ ${formatRate(state.speed.down)}<br>↑ ${formatRate(state.speed.up)}` : "—"
-        }</div></div>
-      </div>
-      <div class="muted small center-text">Unlimited traffic on every plan</div>
-    </main>
-    <footer><button class="link" id="sign-out">Sign out</button></footer>`;
-
-  app.querySelector("#power")!.addEventListener("click", togglePower);
-  app.querySelector("#toggle-picker")!.addEventListener("click", () => {
-    state.pickerOpen = !state.pickerOpen;
-    render();
-  });
-  app.querySelectorAll<HTMLButtonElement>(".picker .loc").forEach((el) =>
-    el.addEventListener("click", () => chooseLocation(el.dataset.loc!)),
+          ? status?.error || "Could not connect."
+          : "Not connected",
   );
-  app.querySelector("#sign-out")!.addEventListener("click", signOut);
+
+  const error = $("#action-error")!;
+  error.classList.toggle("hidden", !state.actionError);
+  setText("#action-error", state.actionError);
+
+  const banner = $("#banner")!;
+  const b = state.overview?.banner;
+  banner.className = `banner ${b ? `show ${b.kind}` : ""}`;
+  if (b) {
+    setText("#banner .banner-icon", b.kind === "wifi" ? "📶" : b.kind === "load" ? "🔥" : "🐢");
+    setText("#banner .banner-text", b.message);
+  }
+
+  setText("#usage", formatBytes(state.account.usage.bytes));
+  const speed = $("#speed")!;
+  const speedHtml = tstate === "connected" ? `↓ ${formatRate(state.speed.down)}<br>↑ ${formatRate(state.speed.up)}` : "—";
+  if (speed.innerHTML !== speedHtml) speed.innerHTML = speedHtml;
+}
+
+/** Redraws the location parts after the account, pings or choice changed. */
+function updateLocations() {
+  if (state.screen !== "home") return;
+  const current = $("#toggle-picker");
+  const inner = $("#picker .picker-inner");
+  if (current) current.innerHTML = currentLocationHtml();
+  if (inner) inner.innerHTML = pickerHtml();
+}
+
+function renderSettings() {
+  const account = state.account;
+  const helperVersion = state.overview?.status?.version;
+  const themeButton = (value: Theme, label: string) =>
+    `<button class="seg ${state.theme === value ? "active" : ""}" data-theme="${value}">${label}</button>`;
+  app.innerHTML = `
+    <header>
+      <button class="icon-btn back" id="back" title="Back">‹</button>
+      <div class="brand">Settings</div>
+      <div class="head-right"></div>
+    </header>
+    <main class="settings screen">
+      <div class="section-label">General</div>
+      <div class="card list">
+        <label class="row">
+          <span><b>Open at startup</b><small>Start CakeVPN in the tray when your computer starts</small></span>
+          <input type="checkbox" class="switch" id="set-autostart" ${state.autostart ? "checked" : ""}>
+        </label>
+        <label class="row">
+          <span><b>Connect automatically</b><small>Connect as soon as CakeVPN opens</small></span>
+          <input type="checkbox" class="switch" id="set-autoconnect" ${state.autoConnect ? "checked" : ""}>
+        </label>
+      </div>
+      ${state.settingsError ? `<div class="error">${esc(state.settingsError)}</div>` : ""}
+
+      <div class="section-label">Appearance</div>
+      <div class="segmented" id="theme">
+        ${themeButton("system", "Automatic")}${themeButton("light", "Light")}${themeButton("dark", "Dark")}
+      </div>
+
+      ${
+        account
+          ? `<div class="section-label">Account</div>
+      <div class="card list">
+        <div class="row"><span><b>Plan</b></span><span class="value">${esc(planLabel(account))}</span></div>
+        <div class="row"><span><b>Used this month</b></span><span class="value">${formatBytes(account.usage.bytes)}</span></div>
+        <div class="row"><span><b>Traffic</b></span><span class="value">Unlimited</span></div>
+      </div>
+      <button class="danger-outline" id="sign-out">Sign out of this device</button>`
+          : ""
+      }
+
+      <div class="about muted small">CakeVPN ${esc(state.appVersion)}${helperVersion ? ` · helper ${esc(helperVersion)}` : ""}</div>
+    </main>`;
+
+  $("#back")!.addEventListener("click", closeSettings);
+  $("#set-autostart")!.addEventListener("change", async (e) => {
+    const box = e.target as HTMLInputElement;
+    state.settingsError = "";
+    try {
+      state.autostart = await backend.setAutostart(box.checked);
+    } catch (err) {
+      state.settingsError = asApiError(err).message;
+    }
+    box.checked = state.autostart;
+    if (state.settingsError) render();
+  });
+  $("#set-autoconnect")!.addEventListener("change", (e) => {
+    state.autoConnect = (e.target as HTMLInputElement).checked;
+    saved.set("autoConnect", state.autoConnect ? "1" : "0");
+  });
+  $("#theme")!.addEventListener("click", (e) => {
+    const button = (e.target as HTMLElement).closest<HTMLButtonElement>(".seg");
+    if (!button) return;
+    state.theme = button.dataset.theme as Theme;
+    saved.set("theme", state.theme);
+    applyTheme();
+    app.querySelectorAll(".seg").forEach((el) => el.classList.toggle("active", el === button));
+  });
+  $("#sign-out")?.addEventListener("click", signOut);
 }
 
 // ---------- actions ----------
+
+function setScreen(screen: Screen) {
+  if (state.screen === screen) return;
+  state.screen = screen;
+  render();
+}
+
+async function openSettings() {
+  try {
+    const info = await backend.settingsInfo();
+    state.autostart = info.autostart;
+    state.appVersion = info.version;
+  } catch {
+    /* show the page anyway */
+  }
+  state.settingsError = "";
+  setScreen("settings");
+}
+
+function closeSettings() {
+  setScreen(state.account ? "home" : "code");
+}
 
 async function submitCode(code: string) {
   if (state.busy || state.lockedUntil > Date.now()) return;
@@ -288,7 +478,7 @@ async function togglePower() {
   const tstate = tunnelState();
   state.busy = true;
   state.actionError = "";
-  render();
+  updateHome();
   try {
     if (tstate === "connected" || tstate === "connecting") {
       await backend.disconnect();
@@ -304,20 +494,23 @@ async function togglePower() {
   }
   state.busy = false;
   await refreshOverview();
-  render();
+  if (state.screen === "setup") render();
+  else updateHome();
 }
 
 async function chooseLocation(id: string) {
   state.choice = id;
-  localStorage.setItem("location", id);
+  saved.set("location", id);
   state.pickerOpen = false;
-  render();
+  $("#picker")?.classList.remove("open");
+  $("#toggle-picker")?.classList.remove("open");
+  updateLocations();
   // Switching while connected moves the tunnel right away.
   if (tunnelState() === "connected") {
     const loc = chosenLocation();
     if (loc && loc.id !== state.overview?.locationId) {
       state.busy = true;
-      render();
+      updateHome();
       try {
         await backend.connect(loc.id);
       } catch (e) {
@@ -325,7 +518,7 @@ async function chooseLocation(id: string) {
       }
       state.busy = false;
       await refreshOverview();
-      render();
+      updateHome();
     }
   }
 }
@@ -334,8 +527,7 @@ async function signOut() {
   await backend.signOut();
   state.account = null;
   state.codeNotice = "";
-  state.screen = "code";
-  render();
+  setScreen("code");
 }
 
 async function installHelper() {
@@ -357,8 +549,8 @@ async function installHelper() {
 
 function handleSignedOut(message: string) {
   state.account = null;
-  state.screen = "code";
   state.codeNotice = message;
+  state.screen = "code";
   render();
 }
 
@@ -383,8 +575,8 @@ async function refreshOverview() {
       state.lastBytes = null;
       state.speed = { up: 0, down: 0 };
     }
-    if ((ov.helper === "missing" || ov.helper === "outdated") && state.screen === "home") state.screen = "setup";
-    if (ov.helper === "ok" && state.screen === "setup") state.screen = state.account ? "home" : "code";
+    if ((ov.helper === "missing" || ov.helper === "outdated") && state.screen === "home") setScreen("setup");
+    if (ov.helper === "ok" && state.screen === "setup") setScreen(state.account ? "home" : "code");
   } catch {
     /* keep the last view; the next poll tries again */
   }
@@ -394,6 +586,8 @@ async function refreshAccount() {
   if (!state.account) return;
   try {
     state.account = await backend.refreshAccount();
+    updateLocations();
+    updateHome();
   } catch (e) {
     const err = asApiError(e);
     if (err.error === "signed_out") handleSignedOut("You were signed out because this code was used on another device.");
@@ -405,12 +599,14 @@ async function refreshPings() {
   if (!state.account || tunnelState() === "connected" || tunnelState() === "connecting") return;
   try {
     state.pings = { ...state.pings, ...(await backend.pingLocations()) };
+    updateLocations();
   } catch {
     /* pings are only a hint */
   }
 }
 
 async function start() {
+  applyTheme();
   render();
   try {
     const session = await backend.loadSession();
@@ -424,24 +620,29 @@ async function start() {
     else state.codeNotice = err.message;
   }
   await refreshOverview();
-  if (state.overview?.helper !== "ok" && state.overview) state.screen = "setup";
+  if (state.overview && state.overview.helper !== "ok") state.screen = "setup";
   render();
-  refreshPings().then(render);
+  await refreshPings();
+
+  if (state.autoConnect && state.screen === "home" && tunnelState() === "disconnected") togglePower();
 
   setInterval(async () => {
-    const before = JSON.stringify([state.overview, state.screen]);
     await refreshOverview();
-    // Redraw every tick on the home screen for the timer; elsewhere only on change.
-    // The code screen is left alone so typed letters stay put.
-    if (state.screen === "home" && !state.pickerOpen) render();
-    else if (state.screen === "setup" && before !== JSON.stringify([state.overview, state.screen])) render();
+    if (state.screen === "home") updateHome();
     if (state.screen === "code" && state.lockedUntil > 0) {
-      if (state.lockedUntil <= Date.now()) state.lockedUntil = 0;
-      render();
+      if (state.lockedUntil <= Date.now()) {
+        state.lockedUntil = 0;
+        render();
+      } else {
+        updateCodeMessage();
+      }
     }
   }, 2000);
-  setInterval(() => refreshAccount().then(() => state.screen === "home" && !state.pickerOpen && render()), 60000);
-  setInterval(() => refreshPings(), 30000);
+  // The connected timer ticks every second between the 2-second status polls.
+  setInterval(updateHome, 1000);
+  // Load changes quickly, so the account (with each location's load) is refreshed often.
+  setInterval(refreshAccount, 20000);
+  setInterval(refreshPings, 30000);
 }
 
 start();

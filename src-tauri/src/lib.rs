@@ -14,7 +14,11 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{Manager, State, WindowEvent};
 #[cfg(target_os = "macos")]
 use tauri::RunEvent;
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tokio::sync::Mutex;
+
+/// Passed when CakeVPN starts with the computer, so it starts in the tray.
+const HIDDEN_ARG: &str = "--hidden";
 
 struct AppState {
     data_dir: PathBuf,
@@ -168,11 +172,8 @@ async fn overview(state: State<'_, AppState>) -> Result<Overview, String> {
         Err(e) => return Err(e),
     };
     let status = response.status;
-    let helper_state = if status.protocol != PROTOCOL_VERSION || status.version != env!("CARGO_PKG_VERSION") {
-        "outdated"
-    } else {
-        "ok"
-    };
+    // Only a protocol change needs a new helper; plain app updates keep the installed one.
+    let helper_state = if status.protocol != PROTOCOL_VERSION { "outdated" } else { "ok" };
     let location_id = state.location.lock().await.clone();
 
     // Reading the Wi-Fi name runs a system tool, so it is refreshed every 30 seconds at most.
@@ -244,6 +245,30 @@ async fn ping_locations(state: State<'_, AppState>) -> Result<HashMap<String, Op
     Ok(pings)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsInfo {
+    version: &'static str,
+    autostart: bool,
+}
+
+#[tauri::command]
+fn settings_info(app: tauri::AppHandle) -> SettingsInfo {
+    SettingsInfo {
+        version: env!("CARGO_PKG_VERSION"),
+        autostart: app.autolaunch().is_enabled().unwrap_or(false),
+    }
+}
+
+/// Starts CakeVPN when the computer starts, hidden in the tray.
+#[tauri::command]
+fn set_autostart(enabled: bool, app: tauri::AppHandle) -> Result<bool, String> {
+    let launcher = app.autolaunch();
+    let result = if enabled { launcher.enable() } else { launcher.disable() };
+    result.map_err(|e| format!("Could not change the startup setting: {e}"))?;
+    Ok(launcher.is_enabled().unwrap_or(enabled))
+}
+
 fn show_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -255,7 +280,12 @@ fn show_window(app: &tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec![HIDDEN_ARG])))
         .setup(|app| {
+            // Opened at login: stay in the tray. Opened by the person: show the window.
+            if !std::env::args().any(|a| a == HIDDEN_ARG) {
+                show_window(app.handle());
+            }
             let data_dir = app.path().app_data_dir()?;
             app.manage(AppState {
                 data_dir,
@@ -308,7 +338,9 @@ pub fn run() {
             disconnect,
             overview,
             install_helper,
-            ping_locations
+            ping_locations,
+            settings_info,
+            set_autostart
         ])
         .build(tauri::generate_context!())
         .expect("error while starting CakeVPN");
