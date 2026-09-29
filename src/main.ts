@@ -49,6 +49,12 @@ const state = {
   updateMessage: "",
   lastBytes: null as { at: number; up: number; down: number } | null,
   speed: { up: 0, down: 0 },
+  /** Why CakeVPN moved to another location, shown under the button. */
+  moveNotice: "",
+  /** Account refreshes in a row that found the connected location overloaded. */
+  overloadChecks: 0,
+  /** When CakeVPN last moved away from an overloaded location. */
+  movedAt: 0,
 };
 
 const app = document.getElementById("app")!;
@@ -128,9 +134,35 @@ function score(loc: Location): number {
   return (ping ?? 250) + (loc.load?.percent ?? 50) * 2;
 }
 
+/** Above this load (in percent) CakeVPN sends people to a quieter location. */
+const OVERLOAD_PERCENT = 85;
+
+function overloaded(loc: Location | undefined): boolean {
+  return (loc?.load?.percent ?? 0) > OVERLOAD_PERCENT;
+}
+
+/** The best online location that isn't overloaded, other than `except`. */
+function quieterLocation(except?: Location): Location | undefined {
+  return (state.account?.locations ?? [])
+    .filter((l) => l.online && l.id !== except?.id && !overloaded(l))
+    .sort((a, b) => score(a) - score(b))[0];
+}
+
 function bestLocation(): Location | undefined {
   const online = (state.account?.locations ?? []).filter((l) => l.online);
-  return online.sort((a, b) => score(a) - score(b))[0];
+  return quieterLocation() ?? online.sort((a, b) => score(a) - score(b))[0];
+}
+
+/** Moves the saved choice along when CakeVPN picked a location for someone. */
+function followMove(to: Location) {
+  if (state.choice !== "best") {
+    state.choice = to.id;
+    saved.set("location", to.id);
+  }
+}
+
+function moveMessage(from: Location, to: Location): string {
+  return `${from.name} is very busy right now (${from.load?.percent ?? OVERLOAD_PERCENT}% load), so CakeVPN moved you to ${to.name}.`;
 }
 
 function chosenLocation(): Location | undefined {
@@ -299,6 +331,7 @@ function renderHome() {
       </button>
       <div class="status-line" id="status-line"></div>
       <div class="error hidden" id="action-error"></div>
+      <div class="notice hidden" id="move-notice"></div>
       <div class="banner" id="banner"><span class="banner-icon"></span><span class="banner-text"></span></div>
 
       <div class="card">
@@ -368,6 +401,9 @@ function updateHome() {
   const error = $("#action-error")!;
   error.classList.toggle("hidden", !state.actionError);
   setText("#action-error", state.actionError);
+  const moved = $("#move-notice")!;
+  moved.classList.toggle("hidden", !state.moveNotice);
+  setText("#move-notice", state.moveNotice);
 
   const banner = $("#banner")!;
   const b = state.overview?.banner;
@@ -664,13 +700,21 @@ async function togglePower() {
   const tstate = tunnelState();
   state.busy = true;
   state.actionError = "";
+  state.moveNotice = "";
   updateHome();
   try {
     if (tstate === "connected" || tstate === "connecting") {
       await backend.disconnect();
     } else {
-      const loc = chosenLocation();
+      let loc = chosenLocation();
       if (!loc) throw { message: "No location is online right now." };
+      const quieter = overloaded(loc) ? quieterLocation(loc) : undefined;
+      if (quieter) {
+        state.moveNotice = moveMessage(loc, quieter);
+        followMove(quieter);
+        loc = quieter;
+        updateLocations();
+      }
       await backend.connect(loc.id);
     }
   } catch (e) {
@@ -687,6 +731,7 @@ async function togglePower() {
 async function chooseLocation(id: string) {
   state.choice = id;
   saved.set("location", id);
+  state.moveNotice = "";
   state.pickerOpen = false;
   $("#picker")?.classList.remove("open");
   $("#toggle-picker")?.classList.remove("open");
@@ -774,11 +819,45 @@ async function refreshAccount() {
     state.account = await backend.refreshAccount();
     updateLocations();
     updateHome();
+    await leaveOverloadedLocation();
   } catch (e) {
     const err = asApiError(e);
     if (err.error === "signed_out") handleSignedOut("You were signed out because this code was used on another device.");
     if (err.error === "code_disabled") handleSignedOut("This code has been turned off. Ask for a new one.");
   }
+}
+
+/**
+ * Moves the tunnel off a location that stays above OVERLOAD_PERCENT for two
+ * account refreshes in a row (about 20 seconds), when a quieter one is up.
+ * It moves at most once every 10 minutes so people don't bounce around.
+ */
+async function leaveOverloadedLocation() {
+  const current = (state.account?.locations ?? []).find((l) => l.id === state.overview?.locationId);
+  if (tunnelState() !== "connected" || !overloaded(current)) {
+    state.overloadChecks = 0;
+    return;
+  }
+  state.overloadChecks += 1;
+  if (state.busy || state.overloadChecks < 2 || Date.now() - state.movedAt < 10 * 60 * 1000) return;
+  const target = quieterLocation(current);
+  if (!current || !target) return;
+  state.overloadChecks = 0;
+  state.movedAt = Date.now();
+  followMove(target);
+  state.busy = true;
+  updateLocations();
+  updateHome();
+  try {
+    await backend.connect(target.id);
+    state.moveNotice = moveMessage(current, target);
+  } catch (e) {
+    state.actionError = asApiError(e).message;
+  }
+  state.busy = false;
+  await refreshOverview();
+  updateLocations();
+  updateHome();
 }
 
 async function refreshPings() {

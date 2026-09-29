@@ -21,12 +21,42 @@ use tokio::sync::Mutex;
 /// Passed when CakeVPN starts with the computer, so it starts in the tray.
 const HIDDEN_ARG: &str = "--hidden";
 
+/// Faster than this (bytes per second, both ways together, 4 Mbps) the line
+/// counts as busy: a speed test or a big download fills it, and pings to the
+/// router slow down even on a good Wi-Fi.
+const BUSY_BYTES_PER_SEC: f64 = 500_000.0;
+/// The Wi-Fi is judged on the last 30 seconds of pings, so it waits this long
+/// after the line was busy.
+const BUSY_HOLD: Duration = Duration::from_secs(35);
+
+/// How much has gone through the tunnel, to tell when the line is busy.
+#[derive(Default)]
+struct Traffic {
+    last: Option<(Instant, u64)>,
+    busy_until: Option<Instant>,
+}
+
+impl Traffic {
+    /// Takes the tunnel's byte count and says whether the line is (or just was) busy.
+    fn busy(&mut self, now: Instant, total_bytes: u64) -> bool {
+        if let Some((at, bytes)) = self.last {
+            let secs = now.duration_since(at).as_secs_f64();
+            if total_bytes >= bytes && secs > 0.0 && (total_bytes - bytes) as f64 / secs >= BUSY_BYTES_PER_SEC {
+                self.busy_until = Some(now + BUSY_HOLD);
+            }
+        }
+        self.last = Some((now, total_bytes));
+        self.busy_until.is_some_and(|until| now < until)
+    }
+}
+
 struct AppState {
     data_dir: PathBuf,
     account: Mutex<Option<Account>>,
     /// The location the tunnel was opened to, for the load warning.
     location: Mutex<Option<String>>,
     wifi: Mutex<Option<(Instant, netinfo::Network)>>,
+    traffic: Mutex<Traffic>,
 }
 
 #[derive(Serialize)]
@@ -54,15 +84,18 @@ struct Overview {
 }
 
 /// Decides which warning to show, most useful first: a bad Wi-Fi explains a
-/// slow VPN, so it wins over the server's load.
-fn banner(status: &Status, load: Option<&Load>, wifi_name: Option<&str>) -> Option<Banner> {
+/// slow VPN, so it wins over the server's load. While the line is busy (a
+/// speed test, a big download) slow pings are expected, so the Wi-Fi and
+/// speed warnings wait until it calms down.
+fn banner(status: &Status, load: Option<&Load>, wifi_name: Option<&str>, busy: bool) -> Option<Banner> {
     if status.state != TunnelState::Connected {
         return None;
     }
     let q = &status.quality;
-    let shaky_wifi = q.gateway_loss.is_some_and(|l| l >= 0.05)
-        || q.gateway_jitter_ms.is_some_and(|j| j >= 30.0)
-        || q.gateway_rtt_ms.is_some_and(|r| r >= 50.0);
+    let shaky_wifi = !busy
+        && (q.gateway_loss.is_some_and(|l| l >= 0.05)
+            || q.gateway_jitter_ms.is_some_and(|j| j >= 30.0)
+            || q.gateway_rtt_ms.is_some_and(|r| r >= 50.0));
     if shaky_wifi {
         let message = match wifi_name {
             Some(name) => format!("The Wi-Fi you're connected to ({name}) is unstable."),
@@ -73,7 +106,7 @@ fn banner(status: &Status, load: Option<&Load>, wifi_name: Option<&str>) -> Opti
     if load.is_some_and(|l| l.level == "high") {
         return Some(Banner { kind: "load", message: "The location you're in is experiencing high load.".into() });
     }
-    if q.tunnel_failures >= 2 || q.tunnel_delay_ms.is_some_and(|d| d >= 400) {
+    if !busy && (q.tunnel_failures >= 2 || q.tunnel_delay_ms.is_some_and(|d| d >= 400)) {
         return Some(Banner { kind: "slow", message: "Your connection to the VPN is slow right now.".into() });
     }
     None
@@ -203,7 +236,9 @@ async fn overview(state: State<'_, AppState>) -> Result<Overview, String> {
             .and_then(|a| a.locations.iter().find(|l| Some(&l.id) == location_id.as_ref()))
             .and_then(|l| l.load.clone())
     };
-    let banner = banner(&status, load.as_ref(), wifi_name.as_deref());
+    let busy = status.state == TunnelState::Connected
+        && state.traffic.lock().await.busy(Instant::now(), status.up_bytes + status.down_bytes);
+    let banner = banner(&status, load.as_ref(), wifi_name.as_deref(), busy);
     Ok(Overview { helper: helper_state, status: Some(status), banner, location_id })
 }
 
@@ -336,6 +371,7 @@ pub fn run() {
                 account: Mutex::new(None),
                 location: Mutex::new(None),
                 wifi: Mutex::new(None),
+                traffic: Mutex::new(Traffic::default()),
             });
 
             let open = MenuItem::with_id(app, "open", "Open CakeVPN", true, None::<&str>)?;
@@ -418,13 +454,13 @@ mod tests {
     #[test]
     fn quiet_when_all_is_well() {
         let s = connected(Quality { gateway_rtt_ms: Some(3.0), gateway_jitter_ms: Some(1.0), gateway_loss: Some(0.0), tunnel_delay_ms: Some(40), tunnel_failures: 0 });
-        assert_eq!(banner(&s, Some(&load("low")), Some("Home")), None);
+        assert_eq!(banner(&s, Some(&load("low")), Some("Home"), false), None);
     }
 
     #[test]
     fn lossy_wifi_is_named() {
         let s = connected(Quality { gateway_loss: Some(0.2), gateway_rtt_ms: Some(4.0), gateway_jitter_ms: Some(2.0), ..Default::default() });
-        let b = banner(&s, Some(&load("high")), Some("School Guest")).unwrap();
+        let b = banner(&s, Some(&load("high")), Some("School Guest"), false).unwrap();
         assert_eq!(b.kind, "wifi");
         assert!(b.message.contains("School Guest"));
     }
@@ -432,18 +468,39 @@ mod tests {
     #[test]
     fn busy_location_when_wifi_is_fine() {
         let s = connected(Quality { gateway_loss: Some(0.0), gateway_rtt_ms: Some(4.0), gateway_jitter_ms: Some(2.0), ..Default::default() });
-        assert_eq!(banner(&s, Some(&load("high")), None).unwrap().kind, "load");
+        assert_eq!(banner(&s, Some(&load("high")), None, false).unwrap().kind, "load");
     }
 
     #[test]
     fn slow_tunnel() {
         let s = connected(Quality { tunnel_delay_ms: Some(900), ..Default::default() });
-        assert_eq!(banner(&s, None, None).unwrap().kind, "slow");
+        assert_eq!(banner(&s, None, None, false).unwrap().kind, "slow");
     }
 
     #[test]
     fn nothing_while_disconnected() {
         let s = Status { state: TunnelState::Disconnected, quality: Quality { gateway_loss: Some(1.0), ..Default::default() }, ..Default::default() };
-        assert_eq!(banner(&s, None, None), None);
+        assert_eq!(banner(&s, None, None, false), None);
+    }
+
+    #[test]
+    fn busy_line_is_not_a_bad_wifi() {
+        let s = connected(Quality { gateway_loss: Some(0.1), gateway_rtt_ms: Some(120.0), gateway_jitter_ms: Some(60.0), tunnel_delay_ms: Some(900), ..Default::default() });
+        assert_eq!(banner(&s, None, Some("Home"), true), None);
+        assert_eq!(banner(&s, Some(&load("high")), Some("Home"), true).unwrap().kind, "load");
+    }
+
+    #[test]
+    fn busy_lasts_until_the_ping_window_is_clean() {
+        let mut t = Traffic::default();
+        let start = Instant::now();
+        assert!(!t.busy(start, 0));
+        // A speed test: 50 MB in 2 seconds.
+        assert!(t.busy(start + Duration::from_secs(2), 50_000_000));
+        // Quiet again, but pings from the busy moment are still in the window.
+        assert!(t.busy(start + Duration::from_secs(20), 50_000_100));
+        assert!(!t.busy(start + Duration::from_secs(40), 50_000_200));
+        // Light browsing doesn't count as busy.
+        assert!(!t.busy(start + Duration::from_secs(42), 50_300_000));
     }
 }
