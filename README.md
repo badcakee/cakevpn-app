@@ -19,12 +19,17 @@ their traffic goes through VLESS + Reality + XTLS-Vision to the nearest or least
 The panel side lives in the 3x-ui fork: `sub/cakeController.go` (app API) and
 `web/service/cake*.go`.
 
-## Building
+## Building and releases
 
-GitHub Actions builds both installers: **Actions → Build CakeVPN → Run workflow**.
-Download them from the run's artifacts:
-- `CakeVPN-Windows`: an `.exe` installer
-- `CakeVPN-macOS`: a `.dmg` for Apple Silicon and Intel
+GitHub Actions builds both installers: **Actions → Build CakeVPN → Run workflow**
+(or push a tag like `v1.3.0`). Each run publishes a GitHub release named after the version in
+`src-tauri/tauri.conf.json`, with the Windows `.exe`, the Mac `.dmg`, and the signed update files.
+Bump the version before running it again, or the release for that version is updated in place.
+
+Installed apps check the latest release for updates at start and every 6 hours, and update
+themselves when you press **Update now**. Updates are signed with the key in the
+`TAURI_SIGNING_PRIVATE_KEY` secret; the matching public key is in `tauri.conf.json`. Keep a copy of
+the private key: without it, installed apps can't be updated anymore.
 
 The app talks to `https://147.135.128.62:2096` by default. To use another address, set the repository
 variable `CAKEVPN_API` (Settings → Secrets and variables → Actions → Variables).

@@ -23,6 +23,9 @@ pub struct Settings<'a> {
 /// DNS goes through the tunnel as well, so blocked sites resolve correctly.
 /// IPv6 is refused inside the tunnel, which makes apps use IPv4 right away:
 /// some IPv6 paths through the server stalled for users in the past.
+/// QUIC (UDP 443) is refused too, so browsers and Discord use HTTPS over TCP:
+/// the Oracle exits drop UDP packets over about 1390 bytes, which made
+/// Discord uploads hang, and QUIC inside a TCP tunnel is slower anyway.
 pub fn config(s: &Settings) -> Value {
     let p = s.params;
     let inbound = match s.capture {
@@ -82,6 +85,7 @@ pub fn config(s: &Settings) -> Value {
             "rules": [
                 { "action": "sniff" },
                 { "protocol": "dns", "action": "hijack-dns" },
+                { "network": "udp", "port": 443, "action": "reject" },
                 { "ip_version": 6, "action": "reject" },
                 { "ip_is_private": true, "outbound": "direct" }
             ],
@@ -125,6 +129,8 @@ mod tests {
         assert_eq!(c["outbounds"][0]["flow"], "xtls-rprx-vision");
         assert_eq!(c["outbounds"][0]["tls"]["reality"]["public_key"], p.public_key);
         assert_eq!(c["dns"]["strategy"], "ipv4_only");
+        let rules = c["route"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| r["network"] == "udp" && r["port"] == 443 && r["action"] == "reject"), "QUIC is not refused");
     }
 
     /// Writes both variants for `sing-box check` (see scripts/check-singbox-config.sh).

@@ -4,7 +4,7 @@ mod netinfo;
 mod store;
 
 use api::{Account, ApiError, Load};
-use cakevpn_proto::{Request, Status, TunnelState, PROTOCOL_VERSION};
+use cakevpn_proto::{Request, Status, TunnelState, HELPER_REVISION, PROTOCOL_VERSION};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,6 +15,7 @@ use tauri::{Manager, State, WindowEvent};
 #[cfg(target_os = "macos")]
 use tauri::RunEvent;
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Mutex;
 
 /// Passed when CakeVPN starts with the computer, so it starts in the tray.
@@ -180,8 +181,9 @@ async fn overview(state: State<'_, AppState>) -> Result<Overview, String> {
         Err(e) => return Err(e),
     };
     let status = response.status;
-    // Only a protocol change needs a new helper; plain app updates keep the installed one.
-    let helper_state = if status.protocol != PROTOCOL_VERSION { "outdated" } else { "ok" };
+    // Only a helper change needs a new helper; plain app updates keep the installed one.
+    let helper_state =
+        if status.protocol != PROTOCOL_VERSION || status.revision < HELPER_REVISION { "outdated" } else { "ok" };
     let location_id = state.location.lock().await.clone();
 
     // Reading the Wi-Fi name runs a system tool, so it is refreshed every 30 seconds at most.
@@ -277,6 +279,39 @@ fn set_autostart(enabled: bool, app: tauri::AppHandle) -> Result<bool, String> {
     Ok(launcher.is_enabled().unwrap_or(enabled))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateInfo {
+    version: String,
+    notes: Option<String>,
+}
+
+/// Looks for a newer CakeVPN release on GitHub.
+#[tauri::command]
+async fn check_update(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = updater.check().await.map_err(|e| format!("Could not check for updates: {e}"))?;
+    Ok(update.map(|u| UpdateInfo { version: u.version.clone(), notes: u.body.clone() }))
+}
+
+/// Downloads and installs the newer release, then restarts CakeVPN.
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("Could not check for updates: {e}"))?
+        .ok_or("CakeVPN is already up to date.")?;
+    // The installer replaces the helper on Windows, which would cut the tunnel anyway.
+    let _ = helper::ask(Request::Disconnect).await;
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|e| format!("The update could not be installed: {e}"))?;
+    app.restart()
+}
+
 fn show_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -289,6 +324,7 @@ fn show_window(app: &tauri::AppHandle) {
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec![HIDDEN_ARG])))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // Opened at login: stay in the tray. Opened by the person: show the window.
             if !std::env::args().any(|a| a == HIDDEN_ARG) {
@@ -349,7 +385,9 @@ pub fn run() {
             ping_locations,
             settings_info,
             set_autostart,
-            create_invite
+            create_invite,
+            check_update,
+            install_update
         ])
         .build(tauri::generate_context!())
         .expect("error while starting CakeVPN");

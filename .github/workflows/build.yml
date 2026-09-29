@@ -1,15 +1,23 @@
 name: Build CakeVPN
 
-# Run it from the Actions tab ("Run workflow"), or push a tag like v1.0.0.
+# Run it from the Actions tab ("Run workflow"), or push a tag like v1.3.0.
+# Each run publishes a GitHub release named after the version in
+# src-tauri/tauri.conf.json. The apps check that release for updates.
 on:
   workflow_dispatch:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: write
+
 env:
   # Set the repository variable CAKEVPN_API to your panel's app address,
   # e.g. https://vpn.example.com:2096. Without it the app uses the default in src-tauri/src/api.rs.
   CAKEVPN_API: ${{ vars.CAKEVPN_API }}
+  # Signs the update files so the apps only install updates made here.
+  TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+  TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
 
 jobs:
   windows:
@@ -33,13 +41,20 @@ jobs:
           cargo build --release -p cakevpn-helper --target x86_64-pc-windows-msvc
           cp target/x86_64-pc-windows-msvc/release/cakevpn-helper.exe src-tauri/binaries/cakevpn-helper-x86_64-pc-windows-msvc.exe
       - run: scripts/fetch-sing-box.sh x86_64-pc-windows-msvc
-      - run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
-      - uses: actions/upload-artifact@v4
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          name: CakeVPN-Windows
-          path: target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          tagName: v__VERSION__
+          releaseName: CakeVPN __VERSION__
+          releaseBody: Download CakeVPN for Windows (.exe) or Mac (.dmg) below. Installed apps update themselves.
+          releaseDraft: false
+          prerelease: false
+          args: --target x86_64-pc-windows-msvc --bundles nsis
 
   macos:
+    # After Windows, so the two jobs don't overwrite each other's part of latest.json.
+    needs: windows
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -64,8 +79,13 @@ jobs:
           # Unsigned code must at least be ad-hoc signed to run on Apple Silicon.
           for f in src-tauri/binaries/cakevpn-helper-*-apple-darwin; do codesign --force --sign - "$f"; done
       - run: scripts/fetch-sing-box.sh universal-apple-darwin
-      - run: npm run tauri build -- --target universal-apple-darwin --bundles app,dmg
-      - uses: actions/upload-artifact@v4
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          name: CakeVPN-macOS
-          path: target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          tagName: v__VERSION__
+          releaseName: CakeVPN __VERSION__
+          releaseBody: Download CakeVPN for Windows (.exe) or Mac (.dmg) below. Installed apps update themselves.
+          releaseDraft: false
+          prerelease: false
+          args: --target universal-apple-darwin --bundles app,dmg

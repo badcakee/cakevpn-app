@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 /// Bumped when the app and helper stop understanding each other.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Bumped whenever the helper's behavior changes, so the app can ask for the
+/// helper to be reinstalled on macOS. Windows reinstalls it with every update.
+///
+/// 2: QUIC (UDP 443) is refused in the tunnel.
+pub const HELPER_REVISION: u32 = 2;
+
 pub const WINDOWS_PIPE: &str = r"\\.\pipe\cakevpn-helper";
 pub const UNIX_SOCKET: &str = "/var/run/cakevpn-helper.sock";
 pub const WINDOWS_SERVICE: &str = "CakeVPNHelper";
@@ -108,6 +114,9 @@ pub struct Quality {
 #[serde(rename_all = "camelCase")]
 pub struct Status {
     pub protocol: u32,
+    /// Helpers from before revisions existed send nothing, which reads as 0.
+    #[serde(default)]
+    pub revision: u32,
     pub version: String,
     pub state: TunnelState,
     /// Why the tunnel failed, in words a person can read.

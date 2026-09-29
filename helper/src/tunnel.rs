@@ -1,7 +1,7 @@
 //! Starts and stops sing-box and keeps track of how the tunnel is doing.
 
 use crate::{ping, quality::Tracker, singbox};
-use cakevpn_proto::{ConnectParams, Status, TunnelState, PROTOCOL_VERSION};
+use cakevpn_proto::{ConnectParams, Status, TunnelState, HELPER_REVISION, PROTOCOL_VERSION};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -65,6 +65,7 @@ impl Tunnel {
         let inner = self.inner.lock().await;
         Status {
             protocol: PROTOCOL_VERSION,
+            revision: HELPER_REVISION,
             version: env!("CARGO_PKG_VERSION").to_string(),
             state: inner.state,
             error: inner.error.clone(),

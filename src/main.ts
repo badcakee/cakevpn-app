@@ -43,6 +43,10 @@ const state = {
   inviteError: "",
   /** The invite code made last, highlighted in the list. */
   newInvite: "",
+  /** A newer version found on GitHub, if any. */
+  update: null as { version: string } | null,
+  updating: false,
+  updateMessage: "",
   lastBytes: null as { at: number; up: number; down: number } | null,
   speed: { up: 0, down: 0 },
 };
@@ -102,6 +106,16 @@ function planLabel(account: Account): string {
   // speedMbps includes the invite bonus; older servers leave it out.
   const mbps = account.speedMbps || p.mbps;
   return p.mbps > 0 ? `${p.name} · ${mbps} Mbps` : `${p.name} · Max speed`;
+}
+
+/** A small "i" that shows its text on hover or tap. */
+function infoTip(text: string): string {
+  return `<span class="info" tabindex="0" role="note" aria-label="${esc(text)}" data-tip="${esc(text)}">i</span>`;
+}
+
+function moreSpeedTip(account: Account): string {
+  const r = account.referral;
+  return `More speed: every friend who joins with your invite code adds +${r.mbpsPerFriend} Mbps to your plan, for up to ${r.maxFriends} friends.`;
 }
 
 function invitesOn(account: Account | null): boolean {
@@ -271,6 +285,10 @@ function renderHome() {
     ${header(`<span class="plan ${account.plan.id}">${esc(planLabel(account))}</span>
       <button class="icon-btn" id="open-settings" title="Settings">${GEAR}</button>`)}
     <main class="home screen">
+      <div class="update-bar" id="update-bar">
+        <span id="update-text"></span>
+        <button id="update-now">Update now</button>
+      </div>
       <button id="power" class="power">
         <svg class="ring" viewBox="0 0 120 120" aria-hidden="true">
           <circle class="ring-track" cx="60" cy="60" r="54"></circle>
@@ -296,7 +314,10 @@ function renderHome() {
       <div class="muted small center-text">Unlimited traffic on every plan</div>
       ${
         invitesOn(account) && account.plan.mbps > 0
-          ? `<button class="link invite-link" id="invite-link">🎁 Invite friends · +${account.referral.mbpsPerFriend} Mbps each</button>`
+          ? `<div class="invite-line">
+              <button class="link invite-link" id="invite-link">🎁 Invite friends · +${account.referral.mbpsPerFriend} Mbps each</button>
+              ${infoTip(moreSpeedTip(account))}
+            </div>`
           : ""
       }
     </main>`;
@@ -304,6 +325,7 @@ function renderHome() {
   $("#power")!.addEventListener("click", togglePower);
   $("#open-settings")!.addEventListener("click", () => openSettings());
   $("#invite-link")?.addEventListener("click", () => openSettings(true));
+  $("#update-now")!.addEventListener("click", installUpdate);
   $("#toggle-picker")!.addEventListener("click", () => {
     state.pickerOpen = !state.pickerOpen;
     $("#picker")!.classList.toggle("open", state.pickerOpen);
@@ -351,6 +373,13 @@ function updateHome() {
   if (b) {
     setText("#banner .banner-icon", b.kind === "wifi" ? "📶" : b.kind === "load" ? "🔥" : "🐢");
     setText("#banner .banner-text", b.message);
+  }
+
+  const bar = $("#update-bar")!;
+  bar.classList.toggle("show", !!state.update);
+  if (state.update) {
+    setText("#update-text", state.updating ? "Updating CakeVPN…" : `CakeVPN ${state.update.version} is ready`);
+    ($("#update-now") as HTMLButtonElement).disabled = state.updating;
   }
 
   setText("#usage", formatBytes(state.account.usage.bytes));
@@ -412,7 +441,17 @@ function renderSettings() {
           : ""
       }
 
-      <div class="about muted small">CakeVPN ${esc(state.appVersion)}${helperVersion ? ` · helper ${esc(helperVersion)}` : ""}</div>
+      <div class="about muted small">
+        CakeVPN ${esc(state.appVersion)}${helperVersion ? ` · helper ${esc(helperVersion)}` : ""}
+        <div>${
+          state.update
+            ? `<button class="primary" id="settings-update" ${state.updating ? "disabled" : ""}>${
+                state.updating ? "Updating…" : `Update to ${esc(state.update.version)}`
+              }</button>`
+            : `<button class="link" id="check-update">Check for updates</button>`
+        }</div>
+        ${state.updateMessage ? `<div>${esc(state.updateMessage)}</div>` : ""}
+      </div>
     </main>`;
 
   $("#back")!.addEventListener("click", closeSettings);
@@ -441,6 +480,13 @@ function renderSettings() {
   });
   $("#sign-out")?.addEventListener("click", signOut);
   $("#make-invite")?.addEventListener("click", makeInvite);
+  $("#settings-update")?.addEventListener("click", installUpdate);
+  $("#check-update")?.addEventListener("click", async () => {
+    state.updateMessage = "Checking…";
+    render();
+    await checkForUpdate(true);
+    render();
+  });
   app.querySelectorAll<HTMLButtonElement>(".copy-code").forEach((button) =>
     button.addEventListener("click", () => copyCode(button)),
   );
@@ -468,7 +514,7 @@ function invitesHtml(account: Account): string {
         ${
           capped
             ? `<div class="invite-head">
-                 <div><b>+${r.bonusMbps} Mbps</b><small>${friends} of ${r.maxFriends} friends joined</small></div>
+                 <div><b>+${r.bonusMbps} Mbps ${infoTip(moreSpeedTip(account))}</b><small>${friends} of ${r.maxFriends} friends joined</small></div>
                  <div class="progress"><i style="width:${(friends / Math.max(1, r.maxFriends)) * 100}%"></i></div>
                </div>
                <p class="muted small">Each friend who signs in with your invite code gives you +${r.mbpsPerFriend} Mbps, up to ${r.maxFriends} friends. They get their own free CakeVPN.</p>`
@@ -502,6 +548,34 @@ async function openSettings(toInvites = false) {
   state.inviteError = "";
   setScreen("settings");
   if (toInvites) $("#invites")?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function checkForUpdate(fromButton = false) {
+  try {
+    const found = await backend.checkUpdate();
+    state.update = found ? { version: found.version } : null;
+    state.updateMessage = fromButton && !found ? "You have the newest version." : "";
+  } catch (e) {
+    state.updateMessage = fromButton ? asApiError(e).message : "";
+  }
+  if (state.screen === "home") updateHome();
+}
+
+async function installUpdate() {
+  state.updating = true;
+  state.updateMessage = "";
+  if (state.screen === "settings") render();
+  else updateHome();
+  try {
+    // CakeVPN restarts by itself once the update is installed.
+    await backend.installUpdate();
+  } catch (e) {
+    state.updating = false;
+    state.updateMessage = asApiError(e).message;
+    state.actionError = state.screen === "home" ? state.updateMessage : state.actionError;
+    if (state.screen === "settings") render();
+    else updateHome();
+  }
 }
 
 async function makeInvite() {
@@ -721,6 +795,8 @@ async function start() {
   await refreshPings();
 
   if (state.autoConnect && state.screen === "home" && tunnelState() === "disconnected") togglePower();
+  checkForUpdate();
+  setInterval(checkForUpdate, 6 * 60 * 60 * 1000);
 
   setInterval(async () => {
     await refreshOverview();

@@ -80,6 +80,8 @@ export const backend = {
   settingsInfo: () => invoke<{ version: string; autostart: boolean }>("settings_info"),
   setAutostart: (enabled: boolean) => invoke<boolean>("set_autostart", { enabled }),
   createInvite: () => invoke<Account>("create_invite"),
+  checkUpdate: () => invoke<{ version: string; notes: string | null } | null>("check_update"),
+  installUpdate: () => invoke<void>("install_update"),
 };
 
 /** Tauri hands back command errors as the value the Rust side returned. */
