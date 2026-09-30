@@ -19,6 +19,31 @@ export interface Location {
   country: string;
   online: boolean;
   load: Load | null;
+  /** The speed test can run against this location. */
+  speedTest?: boolean;
+}
+
+/** A message from the panel for every app. `id` changes with every new message. */
+export interface Announcement {
+  id: number;
+  text: string;
+  kind: "info" | "warning";
+}
+
+export interface DayUsage {
+  /** Like "2026-09-30". */
+  day: string;
+  bytes: number;
+}
+
+/** What the person switched on in Settings; sent along with every connect. */
+export interface ConnectOptions {
+  blockAds: boolean;
+  killSwitch: boolean;
+  /** Websites that skip the VPN, like "mybank.com". */
+  bypassDomains: string[];
+  /** Apps that skip the VPN, like "steam.exe". */
+  bypassApps: string[];
 }
 
 export interface Invite {
@@ -42,6 +67,7 @@ export interface Account {
   };
   /** Where this user's traffic leaves from; empty strings when shared or unknown. */
   ips?: { ipv4: string; ipv6: string };
+  announcement?: Announcement | null;
 }
 
 export interface ApiError {
@@ -67,6 +93,8 @@ export interface Overview {
   status: Status | null;
   banner: { kind: "wifi" | "load" | "slow"; message: string } | null;
   locationId: string | null;
+  /** False while the window is hidden and CakeVPN sits in the tray. */
+  windowVisible?: boolean;
 }
 
 export const backend = {
@@ -75,7 +103,7 @@ export const backend = {
   redeem: (code: string) => invoke<Account>("redeem", { code }),
   refreshAccount: () => invoke<Account>("refresh_account"),
   signOut: () => invoke<void>("sign_out"),
-  connect: (locationId: string) => invoke<Status>("connect", { locationId }),
+  connect: (locationId: string, options: ConnectOptions) => invoke<Status>("connect", { locationId, options }),
   disconnect: () => invoke<Status>("disconnect"),
   overview: () => invoke<Overview>("overview"),
   installHelper: () => invoke<void>("install_helper"),
@@ -84,6 +112,12 @@ export const backend = {
   setAutostart: (enabled: boolean) => invoke<boolean>("set_autostart", { enabled }),
   createInvite: () => invoke<Account>("create_invite"),
   deleteInvite: (code: string) => invoke<Account>("delete_invite", { code }),
+  /** The last 30 days, oldest first. */
+  usageHistory: () => invoke<DayUsage[]>("usage_history"),
+  /** Starts a speed test (the server may refuse: once a minute, a few a day) and returns the download Mbps. */
+  speedTestDownload: () => invoke<number>("speed_test_download"),
+  /** The upload half of the test just started, in Mbps. */
+  speedTestUpload: () => invoke<number>("speed_test_upload"),
   checkUpdate: () => invoke<{ version: string; notes: string | null } | null>("check_update"),
   installUpdate: () => invoke<void>("install_update"),
 };

@@ -1025,6 +1025,244 @@ label.row {
   margin-top: 6px;
 }
 
+/* ---------- message from the panel ---------- */
+
+.announce {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  font-size: 13px;
+  text-align: left;
+  background: var(--card);
+  border: 1.5px solid var(--line);
+  box-shadow: var(--shadow);
+  animation: screen-in 0.25s var(--ease);
+}
+
+.announce.hidden {
+  display: none;
+}
+
+.announce.is-warning {
+  border-color: var(--amber);
+}
+
+.announce-text {
+  flex: 1;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
+.announce button {
+  font-size: 18px;
+  line-height: 1;
+  color: var(--muted);
+  padding: 0 2px;
+}
+
+.announce button:hover {
+  color: var(--text);
+}
+
+/* ---------- speed test ---------- */
+
+.speedtest {
+  text-align: center;
+  margin: 8px 0 2px;
+  font-size: 13px;
+}
+
+.pill {
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1.5px solid var(--line);
+  background: var(--card);
+  font-size: 13px;
+  font-weight: 600;
+  transition: border-color 0.2s var(--ease), color 0.2s var(--ease);
+}
+
+.pill:hover:not(:disabled) {
+  border-color: var(--pink);
+  color: var(--pink-dark);
+}
+
+.speedtest-result {
+  font-weight: 700;
+  margin-top: 6px;
+}
+
+.speedtest-result:empty {
+  display: none;
+}
+
+.speedtest-result.error-text {
+  color: var(--red);
+  font-weight: 500;
+}
+
+#protection-line:empty {
+  display: none;
+}
+
+/* ---------- skip the VPN ---------- */
+
+.skip p {
+  margin: 0 0 8px;
+}
+
+.skip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 4px 4px 4px 10px;
+  border-radius: 999px;
+  background: var(--line);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.chip button {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+}
+
+.chip button:hover {
+  background: var(--red);
+  color: #fff;
+}
+
+.skip-add {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.skip-add input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1.5px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+
+.skip-add input:focus {
+  outline: none;
+  border-color: var(--pink);
+}
+
+.small-btn {
+  width: auto;
+  margin: 0;
+  padding: 8px 14px;
+  font-size: 13px;
+}
+
+.notice.reconnect {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.notice.reconnect button {
+  flex: none;
+  background: #7a4a00;
+  color: #fff;
+  font-weight: 600;
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: 8px;
+}
+
+/* ---------- usage graph ---------- */
+
+.usage-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.usage-head b {
+  font-size: 22px;
+}
+
+.usage-plot {
+  position: relative;
+}
+
+.usage-plot svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+/* One series: the brand pink that passes the contrast checks on both card colors. */
+.usage-plot .bar {
+  fill: var(--pink-dark);
+  transition: opacity 0.15s var(--ease);
+}
+
+.usage-plot .hit {
+  fill: transparent;
+}
+
+.usage-plot svg:hover .day:not(.on) .bar {
+  opacity: 0.45;
+}
+
+.usage-plot .base {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+
+.usage-plot .peak {
+  fill: var(--muted);
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.usage-axis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 4px;
+}
+
+.usage-card .link {
+  margin-top: 6px;
+  font-size: 13px;
+}
+
+.usage-list {
+  margin-top: 4px;
+  font-size: 13px;
+}
+
+.usage-list .row {
+  padding: 5px 0;
+}
+
 /* ---------- your IP ---------- */
 
 .your-ip {

@@ -8,6 +8,7 @@ use cakevpn_proto::{Request, Status, TunnelState, HELPER_REVISION, PROTOCOL_VERS
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -59,6 +60,21 @@ struct AppState {
     traffic: Mutex<Traffic>,
     /// The connection details last saved to disk, to save them only when they change.
     saved: Mutex<Option<String>>,
+    /// False while the window is hidden (CakeVPN in the tray), so the page
+    /// can check things less often.
+    visible: AtomicBool,
+    /// The speed test in progress: its download and upload use one ticket.
+    speed: Mutex<Option<api::SpeedTicket>>,
+}
+
+/// What the person switched on in Settings, sent along with every connect.
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct ConnectOptions {
+    block_ads: bool,
+    kill_switch: bool,
+    bypass_domains: Vec<String>,
+    bypass_apps: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -85,6 +101,7 @@ struct Overview {
     status: Option<Status>,
     banner: Option<Banner>,
     location_id: Option<String>,
+    window_visible: bool,
 }
 
 /// Decides which warning to show, most useful first: a bad Wi-Fi explains a
@@ -239,7 +256,7 @@ async fn sign_out(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn connect(location_id: String, state: State<'_, AppState>) -> Result<Status, String> {
+async fn connect(location_id: String, options: Option<ConnectOptions>, state: State<'_, AppState>) -> Result<Status, String> {
     // Use fresh details when the server answers: signing in elsewhere changes them.
     let account = match tokio::time::timeout(SERVER_WAIT, fetch_account(&state)).await {
         Ok(Ok(a)) => a,
@@ -257,7 +274,12 @@ async fn connect(location_id: String, state: State<'_, AppState>) -> Result<Stat
         .find(|l| l.id == location_id)
         .or_else(|| account.locations.first())
         .ok_or("No locations are available right now.")?;
-    let params = location.connect.clone().ok_or("This location is offline right now.")?;
+    let mut params = location.connect.clone().ok_or("This location is offline right now.")?;
+    let options = options.unwrap_or_default();
+    params.block_ads = options.block_ads;
+    params.kill_switch = options.kill_switch;
+    params.bypass_domains = options.bypass_domains;
+    params.bypass_apps = options.bypass_apps;
     *state.location.lock().await = Some(location.id.clone());
     let response = helper::ask(Request::Connect { params }).await?;
     if response.ok {
@@ -265,6 +287,31 @@ async fn connect(location_id: String, state: State<'_, AppState>) -> Result<Stat
     } else {
         Err(response.error.unwrap_or_else(|| "Could not connect.".into()))
     }
+}
+
+/// The last 30 days of traffic for the usage graph.
+#[tauri::command]
+async fn usage_history() -> Result<Vec<api::DayUsage>, ApiError> {
+    let token = store::token().ok_or_else(not_signed_in)?;
+    api::usage_history(&token).await
+}
+
+/// Starts a speed test against the connected location and measures the
+/// download, in Mbps. The server decides whether a test may run now.
+#[tauri::command]
+async fn speed_test_download(state: State<'_, AppState>) -> Result<f64, ApiError> {
+    let token = store::token().ok_or_else(not_signed_in)?;
+    let location = state.location.lock().await.clone().unwrap_or_else(|| "main".into());
+    let ticket = api::speed_ticket(&token, &location).await?;
+    *state.speed.lock().await = Some(ticket.clone());
+    api::speed_download(&ticket).await
+}
+
+/// The upload half of the speed test started by `speed_test_download`.
+#[tauri::command]
+async fn speed_test_upload(state: State<'_, AppState>) -> Result<f64, ApiError> {
+    let ticket = state.speed.lock().await.take().ok_or_else(|| ApiError::new("speed_test", "Start the speed test again."))?;
+    api::speed_upload(&ticket).await
 }
 
 #[tauri::command]
@@ -277,7 +324,13 @@ async fn overview(state: State<'_, AppState>) -> Result<Overview, String> {
     let response = match helper::ask(Request::Status).await {
         Ok(r) => r,
         Err(e) if e == helper::HELPER_MISSING => {
-            return Ok(Overview { helper: "missing", status: None, banner: None, location_id: None })
+            return Ok(Overview {
+                helper: "missing",
+                status: None,
+                banner: None,
+                location_id: None,
+                window_visible: state.visible.load(Ordering::Relaxed),
+            })
         }
         Err(e) => return Err(e),
     };
@@ -287,11 +340,13 @@ async fn overview(state: State<'_, AppState>) -> Result<Overview, String> {
         if status.protocol != PROTOCOL_VERSION || status.revision < HELPER_REVISION { "outdated" } else { "ok" };
     let location_id = state.location.lock().await.clone();
 
-    // Reading the Wi-Fi name runs a system tool, so it is refreshed every 30 seconds at most.
+    let window_visible = state.visible.load(Ordering::Relaxed);
+    // Reading the Wi-Fi name runs a system tool, so it is refreshed every 30
+    // seconds at most, and not at all while the window is hidden.
     let wifi_name = {
         let mut cached = state.wifi.lock().await;
         let stale = cached.as_ref().is_none_or(|(at, _)| at.elapsed() > Duration::from_secs(30));
-        if stale {
+        if stale && (window_visible || cached.is_none()) {
             let net = tokio::task::spawn_blocking(netinfo::network).await.unwrap_or_default();
             *cached = Some((Instant::now(), net));
         }
@@ -307,7 +362,7 @@ async fn overview(state: State<'_, AppState>) -> Result<Overview, String> {
     let busy = status.state == TunnelState::Connected
         && state.traffic.lock().await.busy(Instant::now(), status.up_bytes + status.down_bytes);
     let banner = banner(&status, load.as_ref(), wifi_name.as_deref(), busy);
-    Ok(Overview { helper: helper_state, status: Some(status), banner, location_id })
+    Ok(Overview { helper: helper_state, status: Some(status), banner, location_id, window_visible })
 }
 
 #[tauri::command]
@@ -416,6 +471,9 @@ async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 fn show_window(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        state.visible.store(true, Ordering::Relaxed);
+    }
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -430,7 +488,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // Opened at login: stay in the tray. Opened by the person: show the window.
-            if !std::env::args().any(|a| a == HIDDEN_ARG) {
+            let shown = !std::env::args().any(|a| a == HIDDEN_ARG);
+            if shown {
                 show_window(app.handle());
             }
             let data_dir = app.path().app_data_dir()?;
@@ -441,6 +500,8 @@ pub fn run() {
                 wifi: Mutex::new(None),
                 traffic: Mutex::new(Traffic::default()),
                 saved: Mutex::new(None),
+                visible: AtomicBool::new(shown),
+                speed: Mutex::new(None),
             });
 
             let open = MenuItem::with_id(app, "open", "Open CakeVPN", true, None::<&str>)?;
@@ -473,9 +534,20 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             // Closing the window keeps CakeVPN in the tray, like other VPN apps.
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+            match event {
+                WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    if let Some(state) = window.try_state::<AppState>() {
+                        state.visible.store(false, Ordering::Relaxed);
+                    }
+                }
+                WindowEvent::Focused(true) => {
+                    if let Some(state) = window.try_state::<AppState>() {
+                        state.visible.store(true, Ordering::Relaxed);
+                    }
+                }
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -492,6 +564,9 @@ pub fn run() {
             set_autostart,
             create_invite,
             delete_invite,
+            usage_history,
+            speed_test_download,
+            speed_test_upload,
             check_update,
             install_update
         ])

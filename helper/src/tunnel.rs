@@ -3,16 +3,23 @@
 use crate::{ping, quality::Tracker, singbox};
 use cakevpn_proto::{ConnectParams, Status, TunnelState, HELPER_REVISION, PROTOCOL_VERSION};
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 const TEST_URL: &str = "https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204";
+
+/// With the kill switch on, sing-box is started again when it stops, unless
+/// it keeps stopping: then the tunnel can't be kept up at all.
+const MAX_RESTARTS_PER_MINUTE: usize = 5;
+
+const KILL_SWITCH_WAITING: &str =
+    "Can't reach the VPN server. The kill switch keeps your internet blocked until it's back, or until you disconnect.";
 
 pub struct Paths {
     /// Holds the generated config and sing-box's log.
@@ -29,6 +36,9 @@ struct Inner {
     params: Option<ConnectParams>,
     child: Option<Child>,
     api: Option<(u16, String)>,
+    config_path: Option<PathBuf>,
+    /// When sing-box was started again after stopping (kill switch only).
+    restarts: Vec<Instant>,
     /// Goes up on every connect and disconnect, so old background checks stop.
     generation: u64,
     tracker: Tracker,
@@ -94,37 +104,53 @@ impl Tunnel {
 
         let port = free_local_port().map_err(|e| format!("no free local port: {e}"))?;
         let secret = random_hex(16);
+        let dir = &self.paths.data_dir;
+        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let ads_path = dir.join("ads.srs");
+        if params.block_ads {
+            write_private(&ads_path, singbox::ADS_RULE_SET).map_err(|e| format!("cannot write the ad list: {e}"))?;
+        }
         let config = singbox::config(&singbox::Settings {
             params: &params,
             capture: self.paths.capture,
             api_port: port,
             api_secret: &secret,
+            ads_rule_set: Some(&ads_path),
         });
-        let dir = &self.paths.data_dir;
-        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         let config_path = dir.join("config.json");
         write_private(&config_path, &serde_json::to_vec_pretty(&config).unwrap())
             .map_err(|e| format!("cannot write the tunnel settings: {e}"))?;
-        let log = std::fs::File::create(dir.join("sing-box.log"))
-            .map_err(|e| format!("cannot write the tunnel log: {e}"))?;
 
-        let mut cmd = Command::new(&self.paths.sing_box);
-        cmd.arg("run").arg("-c").arg(&config_path).arg("-D").arg(dir);
-        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::from(log)).kill_on_drop(true);
-        #[cfg(windows)]
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        let child = cmd.spawn().map_err(|e| {
-            inner.state = TunnelState::Failed;
-            format!("cannot start sing-box at {}: {e}", self.paths.sing_box.display())
-        })?;
+        let child = self.spawn(&config_path, true).inspect_err(|_| inner.state = TunnelState::Failed)?;
         inner.child = Some(child);
         inner.api = Some((port, secret));
+        inner.config_path = Some(config_path);
+        inner.restarts.clear();
         inner.params = Some(params);
         drop(inner);
 
         let me = Arc::clone(self);
         tokio::spawn(async move { me.watch(generation).await });
         Ok(())
+    }
+
+    /// Starts sing-box with a config written by `connect`. A fresh start
+    /// empties the log; a restart adds to it.
+    fn spawn(&self, config_path: &Path, fresh: bool) -> Result<Child, String> {
+        let dir = &self.paths.data_dir;
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(fresh)
+            .append(!fresh)
+            .open(dir.join("sing-box.log"))
+            .map_err(|e| format!("cannot write the tunnel log: {e}"))?;
+        let mut cmd = Command::new(&self.paths.sing_box);
+        cmd.arg("run").arg("-c").arg(config_path).arg("-D").arg(dir);
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::from(log)).kill_on_drop(true);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        cmd.spawn().map_err(|e| format!("cannot start sing-box at {}: {e}", self.paths.sing_box.display()))
     }
 
     pub async fn disconnect(&self) {
@@ -169,6 +195,18 @@ impl Tunnel {
         }
         if let Some(child) = inner.child.as_mut() {
             if let Ok(Some(_)) = child.try_wait() {
+                if kill_switch_on(&inner) {
+                    // Start it again right away, so traffic doesn't go around the VPN.
+                    let now = Instant::now();
+                    inner.restarts.retain(|at| now.duration_since(*at) < Duration::from_secs(60));
+                    if inner.restarts.len() < MAX_RESTARTS_PER_MINUTE {
+                        if let Some(Ok(child)) = inner.config_path.clone().map(|path| self.spawn(&path, false)) {
+                            inner.child = Some(child);
+                            inner.restarts.push(now);
+                            return inner.api.clone().ok_or(());
+                        }
+                    }
+                }
                 drop(inner);
                 let why = self.log_tail();
                 let message = if why.is_empty() {
@@ -217,12 +255,31 @@ impl Tunnel {
             }
         }
         if !reached {
-            self.fail(
-                generation,
-                "Could not reach the VPN server. Check your internet, or try another location.".into(),
-            )
-            .await;
-            return;
+            if !kill_switch_on(&*self.inner.lock().await) {
+                self.fail(
+                    generation,
+                    "Could not reach the VPN server. Check your internet, or try another location.".into(),
+                )
+                .await;
+                return;
+            }
+            // Kill switch: the tunnel stays up, so nothing goes around it, and keeps trying.
+            self.inner.lock().await.error = Some(KILL_SWITCH_WAITING.into());
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let Ok((port, secret)) = self.still_current(generation).await else { return };
+                if let Some(ms) = delay_test(port, &secret).await {
+                    let mut inner = self.inner.lock().await;
+                    if inner.generation != generation {
+                        return;
+                    }
+                    inner.tracker.tunnel_sample(Some(ms));
+                    inner.state = TunnelState::Connected;
+                    inner.since = Some(now_secs());
+                    inner.error = None;
+                    break;
+                }
+            }
         }
 
         // 3. Measure every 2 seconds while connected.
@@ -271,6 +328,10 @@ impl Tunnel {
             }
         }
     }
+}
+
+fn kill_switch_on(inner: &Inner) -> bool {
+    inner.params.as_ref().is_some_and(|p| p.kill_switch)
 }
 
 async fn stop_child(inner: &mut Inner) {

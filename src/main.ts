@@ -1,4 +1,4 @@
-import { Account, asApiError, backend, Location, Overview } from "./backend";
+import { Account, asApiError, backend, ConnectOptions, DayUsage, Location, Overview } from "./backend";
 
 // ---------- state ----------
 
@@ -21,6 +21,15 @@ const saved = {
     }
   },
 };
+
+function savedList(key: string): string[] {
+  try {
+    const list = JSON.parse(saved.get(key) || "[]");
+    return Array.isArray(list) ? list.filter((x) => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
 
 const state = {
   screen: "loading" as Screen,
@@ -53,6 +62,25 @@ const state = {
   moveNotice: "",
   /** The server can't be reached (some networks block it); the saved account is in use. */
   offline: false,
+  /** Protection settings; they take effect at the next connect. */
+  options: {
+    blockAds: saved.get("blockAds") === "1",
+    killSwitch: saved.get("killSwitch") === "1",
+    bypassDomains: savedList("bypassDomains"),
+    bypassApps: savedList("bypassApps"),
+  } as ConnectOptions,
+  /** The options the current connection was made with, to offer a reconnect after changes. */
+  appliedOptions: "",
+  skipError: "",
+  /** The id of the panel message this person closed. */
+  closedAnnouncement: Number(saved.get("closedAnnouncement") || 0),
+  speedTest: { phase: "" as "" | "down" | "up", down: null as number | null, up: null as number | null, error: "" },
+  /** The last 30 days for the usage graph; null until Settings asked for it. */
+  history: null as DayUsage[] | null,
+  historyError: "",
+  historyList: false,
+  /** When things were last checked (ms), for the one ticker that paces everything. */
+  last: { overview: 0, pings: 0, update: 0 },
   /** When the account was last asked for, to ask less often while offline. */
   lastRefresh: 0,
   /** Since when (ms) the connected location has been overloaded; 0 when it isn't. */
@@ -323,6 +351,11 @@ function renderHome() {
     ${header(`<span class="plan ${account.plan.id}">${esc(planLabel(account))}</span>
       <button class="icon-btn" id="open-settings" title="Settings">${GEAR}</button>`)}
     <main class="home screen">
+      <div class="announce hidden" id="announce">
+        <span class="announce-icon" id="announce-icon"></span>
+        <span class="announce-text" id="announce-text"></span>
+        <button id="announce-close" title="Close" aria-label="Close this message">×</button>
+      </div>
       <div class="update-bar" id="update-bar">
         <span id="update-text"></span>
         <button id="update-now">Update now</button>
@@ -352,6 +385,11 @@ function renderHome() {
         <div><div class="card-label">Used this month</div><div class="big-number" id="usage"></div></div>
         <div><div class="card-label">Speed now</div><div class="big-number small" id="speed"></div></div>
       </div>
+      <div class="speedtest hidden" id="speedtest">
+        <button class="pill" id="run-speedtest">Run a speed test</button>
+        <div class="speedtest-result" id="speedtest-result"></div>
+      </div>
+      <div class="muted small center-text" id="protection-line"></div>
       <div class="muted small center-text">Unlimited traffic on every plan</div>
       ${
         invitesOn(account) && account.plan.mbps > 0
@@ -367,6 +405,8 @@ function renderHome() {
   $("#open-settings")!.addEventListener("click", () => openSettings());
   $("#invite-link")?.addEventListener("click", () => openSettings(true));
   $("#update-now")!.addEventListener("click", installUpdate);
+  $("#announce-close")!.addEventListener("click", closeAnnouncement);
+  $("#run-speedtest")!.addEventListener("click", runSpeedTest);
   updateLocations();
   $("#toggle-picker")!.addEventListener("click", () => {
     state.pickerOpen = !state.pickerOpen;
@@ -399,7 +439,8 @@ function updateHome() {
     tstate === "connected"
       ? `Protected · ${formatDuration(since)}`
       : tstate === "connecting"
-        ? "Setting up a secure connection…"
+        ? // With the kill switch on, the helper says why it is still trying.
+          status?.error || "Setting up a secure connection…"
         : tstate === "failed"
           ? status?.error || "Could not connect."
           : "Not connected",
@@ -421,6 +462,36 @@ function updateHome() {
     setText("#banner .banner-icon", b.kind === "wifi" ? "📶" : b.kind === "load" ? "🔥" : "🐢");
     setText("#banner .banner-text", b.message);
   }
+
+  // The panel's message, until this person closes it.
+  const message = state.account.announcement;
+  const showMessage = !!message && message.id !== state.closedAnnouncement;
+  const announce = $("#announce")!;
+  announce.className = `announce ${!showMessage ? "hidden" : message!.kind === "warning" ? "is-warning" : ""}`;
+  if (showMessage) {
+    setText("#announce-icon", message!.kind === "warning" ? "⚠️" : "📣");
+    setText("#announce-text", message!.text);
+  }
+
+  // The speed test runs against the location this computer is connected to.
+  const test = state.speedTest;
+  const connectedTo = state.account.locations.find((l) => l.id === state.overview?.locationId);
+  const canTest = tstate === "connected" && !!connectedTo?.speedTest;
+  $("#speedtest")!.classList.toggle("hidden", !canTest && !test.phase);
+  const run = $("#run-speedtest") as HTMLButtonElement;
+  run.disabled = !!test.phase;
+  setText("#run-speedtest", test.phase === "down" ? "Testing download…" : test.phase === "up" ? "Testing upload…" : "Run a speed test");
+  setText(
+    "#speedtest-result",
+    test.error
+      ? test.error
+      : test.down !== null
+        ? `↓ ${formatMbps(test.down)}${test.up !== null ? ` · ↑ ${formatMbps(test.up)}` : ""}`
+        : "",
+  );
+  $("#speedtest-result")!.classList.toggle("error-text", !!test.error);
+
+  setText("#protection-line", tstate === "connected" ? protectionText() : "");
 
   const bar = $("#update-bar")!;
   bar.classList.toggle("show", !!state.update);
@@ -479,6 +550,40 @@ function renderSettings() {
       </div>
       ${state.settingsError ? `<div class="error">${esc(state.settingsError)}</div>` : ""}
 
+      <div class="section-label">Protection</div>
+      <div class="card list">
+        <label class="row">
+          <span><b>Block ads and trackers</b><small>Stops known ad and tracking sites, in every app on this computer</small></span>
+          <input type="checkbox" class="switch" id="set-ads" ${state.options.blockAds ? "checked" : ""}>
+        </label>
+        <label class="row">
+          <span><b>Kill switch</b><small>If the VPN drops, your internet stays blocked until it reconnects or you disconnect</small></span>
+          <input type="checkbox" class="switch" id="set-kill" ${state.options.killSwitch ? "checked" : ""}>
+        </label>
+      </div>
+
+      <div class="section-label">Skip the VPN</div>
+      <div class="card skip">
+        <p class="muted small">These websites and apps use your normal internet instead of the VPN.</p>
+        ${skipListHtml("domain", state.options.bypassDomains)}
+        <form class="skip-add" id="add-domain">
+          <input type="text" id="new-domain" placeholder="Website, like mybank.com" autocomplete="off" spellcheck="false">
+          <button class="outline small-btn">Add</button>
+        </form>
+        ${skipListHtml("app", state.options.bypassApps)}
+        <form class="skip-add" id="add-app">
+          <input type="text" id="new-app" placeholder="${isWindows ? "App, like steam.exe" : "App, like Steam"}" autocomplete="off" spellcheck="false">
+          <button class="outline small-btn">Add</button>
+        </form>
+        ${state.skipError ? `<div class="error">${esc(state.skipError)}</div>` : ""}
+      </div>
+      ${
+        optionsChanged()
+          ? `<div class="notice reconnect">Reconnect to use your new settings.
+               <button id="reconnect" ${state.busy ? "disabled" : ""}>Reconnect now</button></div>`
+          : ""
+      }
+
       <div class="section-label">Appearance</div>
       <div class="segmented" id="theme">
         ${themeButton("system", "Automatic")}${themeButton("light", "Light")}${themeButton("dark", "Dark")}
@@ -498,6 +603,8 @@ function renderSettings() {
           account.ips?.ipv6 ? esc(account.ips.ipv6) : "Shared"
         }</span></div>
       </div>
+      <div class="section-label">Last 30 days</div>
+      <div class="card usage-card" id="usage-card">${usageChartHtml()}</div>
       <button class="danger-outline" id="sign-out">Sign out of this device</button>`
           : ""
       }
@@ -513,7 +620,7 @@ function renderSettings() {
             : `<button class="outline" id="check-update" ${state.updateMessage === "Checking…" ? "disabled" : ""}>Check for updates</button>`
         }
         ${state.updateMessage ? `<div class="muted small update-message">${esc(state.updateMessage)}</div>` : ""}
-        <div class="muted small">CakeVPN also checks by itself every 10 minutes.</div>
+        <div class="muted small">CakeVPN also checks by itself a few times a day, and shows a banner when an update is ready.</div>
       </div>
 
       <div class="about muted small">
@@ -545,6 +652,27 @@ function renderSettings() {
     applyTheme();
     app.querySelectorAll(".seg").forEach((el) => el.classList.toggle("active", el === button));
   });
+  $("#set-ads")!.addEventListener("change", (e) => {
+    state.options.blockAds = (e.target as HTMLInputElement).checked;
+    saveOptions();
+  });
+  $("#set-kill")!.addEventListener("change", (e) => {
+    state.options.killSwitch = (e.target as HTMLInputElement).checked;
+    saveOptions();
+  });
+  $("#add-domain")!.addEventListener("submit", (e) => {
+    e.preventDefault();
+    addSkipped("domain", ($("#new-domain") as HTMLInputElement).value);
+  });
+  $("#add-app")!.addEventListener("submit", (e) => {
+    e.preventDefault();
+    addSkipped("app", ($("#new-app") as HTMLInputElement).value);
+  });
+  app.querySelectorAll<HTMLButtonElement>(".skip-remove").forEach((button) =>
+    button.addEventListener("click", () => removeSkipped(button.dataset.kind as "domain" | "app", button.dataset.value!)),
+  );
+  $("#reconnect")?.addEventListener("click", reconnect);
+  wireUsageChart();
   $("#sign-out")?.addEventListener("click", signOut);
   $("#make-invite")?.addEventListener("click", makeInvite);
   $("#settings-update")?.addEventListener("click", installUpdate);
@@ -560,6 +688,208 @@ function renderSettings() {
   app.querySelectorAll<HTMLButtonElement>(".delete-code").forEach((button) =>
     button.addEventListener("click", () => deleteInvite(button.dataset.code!)),
   );
+}
+
+// ---------- protection settings ----------
+
+const MAX_SKIPPED = { domain: 100, app: 50 };
+
+function saveOptions() {
+  saved.set("blockAds", state.options.blockAds ? "1" : "0");
+  saved.set("killSwitch", state.options.killSwitch ? "1" : "0");
+  saved.set("bypassDomains", JSON.stringify(state.options.bypassDomains));
+  saved.set("bypassApps", JSON.stringify(state.options.bypassApps));
+  state.skipError = "";
+  if (state.screen === "settings") render();
+}
+
+/** The settings changed since this connection was made. */
+function optionsChanged(): boolean {
+  return tunnelState() === "connected" && !!state.appliedOptions && state.appliedOptions !== JSON.stringify(state.options);
+}
+
+/** "https://www.MyBank.com/login" → "mybank.com"; "" when it isn't a website name. */
+function cleanDomain(text: string): string {
+  const name = text
+    .trim()
+    .toLowerCase()
+    .replace(/^[a-z]+:\/\//, "")
+    .replace(/[/?#:].*$/, "")
+    .replace(/^www\./, "")
+    .replace(/\.$/, "");
+  const labels = name.split(".");
+  const ok =
+    name.length <= 253 &&
+    labels.length >= 2 &&
+    labels.every((l) => /^[a-z0-9-]{1,63}$/.test(l) && !l.startsWith("-") && !l.endsWith("-"));
+  return ok ? name : "";
+}
+
+/** A program's file name, never a path. */
+function cleanApp(text: string): string {
+  const name = text.trim();
+  return name.length > 0 && name.length <= 100 && /^[\p{L}\p{N} ._+()-]+$/u.test(name) ? name : "";
+}
+
+function addSkipped(kind: "domain" | "app", text: string) {
+  const list = kind === "domain" ? state.options.bypassDomains : state.options.bypassApps;
+  const value = kind === "domain" ? cleanDomain(text) : cleanApp(text);
+  if (!value) {
+    state.skipError =
+      kind === "domain"
+        ? "Type a website name like mybank.com."
+        : `Type the app's name like ${isWindows ? "steam.exe" : "Steam"}, without the folder it is in.`;
+    render();
+    return;
+  }
+  if (list.length >= MAX_SKIPPED[kind]) {
+    state.skipError = `That's the most ${kind === "domain" ? "websites" : "apps"} that can skip the VPN.`;
+    render();
+    return;
+  }
+  if (!list.some((x) => x.toLowerCase() === value.toLowerCase())) list.push(value);
+  saveOptions();
+}
+
+function removeSkipped(kind: "domain" | "app", value: string) {
+  if (kind === "domain") state.options.bypassDomains = state.options.bypassDomains.filter((x) => x !== value);
+  else state.options.bypassApps = state.options.bypassApps.filter((x) => x !== value);
+  saveOptions();
+}
+
+function skipListHtml(kind: "domain" | "app", list: string[]): string {
+  if (!list.length) return "";
+  return `<div class="skip-list">${list
+    .map(
+      (value) =>
+        `<span class="chip">${kind === "app" ? "▣ " : ""}${esc(value)}<button class="skip-remove" data-kind="${kind}" data-value="${esc(value)}" title="Remove" aria-label="Remove ${esc(value)}">×</button></span>`,
+    )
+    .join("")}</div>`;
+}
+
+/** Connects again to the same location, so new settings take effect. */
+async function reconnect() {
+  const id = state.overview?.locationId ?? chosenLocation()?.id;
+  if (!id) return;
+  state.busy = true;
+  render();
+  try {
+    await connectTo(id);
+  } catch (e) {
+    state.settingsError = asApiError(e).message;
+  }
+  state.busy = false;
+  await refreshOverview();
+  render();
+}
+
+// ---------- usage graph ----------
+
+async function loadHistory() {
+  try {
+    state.history = await backend.usageHistory();
+    state.historyError = "";
+  } catch (e) {
+    state.historyError = asApiError(e).message;
+  }
+  const card = $("#usage-card");
+  if (card && state.screen === "settings") {
+    card.innerHTML = usageChartHtml();
+    wireUsageChart();
+  }
+}
+
+function dayLabel(day: string, long = false): string {
+  const date = new Date(`${day}T00:00:00`);
+  return date.toLocaleDateString(undefined, long ? { weekday: "short", day: "numeric", month: "short" } : { day: "numeric", month: "short" });
+}
+
+/**
+ * One column per day. A single series needs no legend; the peak is labeled,
+ * pointing at a day shows it in the line above, and the list has every value.
+ */
+function usageChartHtml(): string {
+  const days = state.history;
+  if (!days) {
+    return `<p class="muted small">${state.historyError ? esc(state.historyError) : "Loading…"}</p>`;
+  }
+  const total = days.reduce((sum, d) => sum + d.bytes, 0);
+  if (total === 0) {
+    return `<p class="muted small">Nothing used in the last 30 days yet.</p>`;
+  }
+  const W = 300;
+  const H = 96;
+  const top = 16; // room for the peak's label
+  const slot = W / days.length;
+  const width = Math.min(8, slot - 2); // thin columns, 2px of card between them
+  const peak = Math.max(...days.map((d) => d.bytes));
+  const peakIndex = days.findIndex((d) => d.bytes === peak);
+  const columns = days
+    .map((d, i) => {
+      const x = i * slot + (slot - width) / 2;
+      const h = d.bytes > 0 ? Math.max(2, ((H - top) * d.bytes) / peak) : 0;
+      const r = Math.min(3, h, width / 2);
+      const y = H - h;
+      // Rounded at the top, square on the baseline.
+      const bar =
+        h > 0
+          ? `<path class="bar" d="M${x},${H} V${y + r} Q${x},${y} ${x + r},${y} H${x + width - r} Q${x + width},${y} ${x + width},${y + r} V${H} Z"/>`
+          : "";
+      return `<g class="day" data-i="${i}">${bar}<rect class="hit" x="${i * slot}" y="0" width="${slot}" height="${H}"/></g>`;
+    })
+    .join("");
+  // The peak's value sits on its cap, kept inside the plot at the edges.
+  const peakX = Math.min(W - 28, Math.max(28, peakIndex * slot + slot / 2));
+  const rows = [...days]
+    .reverse()
+    .filter((d) => d.bytes > 0)
+    .map((d) => `<div class="row"><span>${esc(dayLabel(d.day, true))}</span><span class="value">${formatBytes(d.bytes)}</span></div>`)
+    .join("");
+  return `
+    <div class="usage-head"><b id="usage-value">${formatBytes(total)}</b><span class="muted small" id="usage-when">in the last 30 days</span></div>
+    <div class="usage-plot">
+      <svg viewBox="0 0 ${W} ${H + 1}" role="img" aria-label="Data used per day over the last 30 days; ${formatBytes(total)} in total">
+        <text class="peak" x="${peakX}" y="${top - 5}" text-anchor="middle">${formatBytes(peak)}</text>
+        ${columns}
+        <line class="base" x1="0" y1="${H + 0.5}" x2="${W}" y2="${H + 0.5}"/>
+      </svg>
+    </div>
+    <div class="usage-axis muted small"><span>${esc(dayLabel(days[0].day))}</span><span>Today</span></div>
+    <button class="link" id="usage-toggle">${state.historyList ? "Hide the numbers" : "Show the numbers"}</button>
+    ${state.historyList ? `<div class="usage-list list">${rows}</div>` : ""}`;
+}
+
+function wireUsageChart() {
+  const plot = document.querySelector<HTMLElement>(".usage-plot");
+  const days = state.history;
+  $("#usage-toggle")?.addEventListener("click", () => {
+    state.historyList = !state.historyList;
+    const card = $("#usage-card");
+    if (card) {
+      card.innerHTML = usageChartHtml();
+      wireUsageChart();
+    }
+  });
+  if (!plot || !days) return;
+  const total = days.reduce((sum, d) => sum + d.bytes, 0);
+  // Pointing at a day puts it in the line above the plot, where the total was.
+  const show = (group: Element) => {
+    const d = days[Number((group as HTMLElement).dataset.i)];
+    plot.querySelectorAll(".day.on").forEach((g) => g.classList.remove("on"));
+    group.classList.add("on");
+    setText("#usage-value", formatBytes(d.bytes));
+    setText("#usage-when", `on ${dayLabel(d.day, true)}`);
+  };
+  const hide = () => {
+    plot.querySelectorAll(".day.on").forEach((g) => g.classList.remove("on"));
+    setText("#usage-value", formatBytes(total));
+    setText("#usage-when", "in the last 30 days");
+  };
+  plot.querySelectorAll(".day").forEach((group) => {
+    group.addEventListener("pointerenter", () => show(group));
+    group.addEventListener("click", () => show(group));
+  });
+  plot.addEventListener("pointerleave", hide);
 }
 
 function invitesHtml(account: Account): string {
@@ -623,11 +953,15 @@ async function openSettings(toInvites = false) {
   }
   state.settingsError = "";
   state.inviteError = "";
+  state.skipError = "";
   setScreen("settings");
+  // The usage graph is only asked for while Settings is open.
+  if (state.account) loadHistory();
   if (toInvites) $("#invites")?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 async function checkForUpdate(fromButton = false) {
+  state.last.update = Date.now();
   try {
     const found = await backend.checkUpdate();
     state.update = found ? { version: found.version } : null;
@@ -750,6 +1084,60 @@ async function submitCode(code: string) {
   render();
 }
 
+/** Connects with the protection settings as they are now. */
+async function connectTo(locationId: string) {
+  const options = state.options;
+  await backend.connect(locationId, options);
+  state.appliedOptions = JSON.stringify(options);
+  state.speedTest = { phase: "", down: null, up: null, error: "" };
+}
+
+/** "Ads blocked · Kill switch on · 2 skip the VPN", for the connection as it was made. */
+function protectionText(): string {
+  let applied: ConnectOptions;
+  try {
+    applied = JSON.parse(state.appliedOptions || "null") ?? state.options;
+  } catch {
+    applied = state.options;
+  }
+  const skipped = applied.bypassDomains.length + applied.bypassApps.length;
+  return [
+    applied.blockAds && "Ads blocked",
+    applied.killSwitch && "Kill switch on",
+    skipped > 0 && `${skipped} skip${skipped === 1 ? "s" : ""} the VPN`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function formatMbps(mbps: number): string {
+  return `${mbps >= 100 ? Math.round(mbps) : mbps.toFixed(1)} Mbps`;
+}
+
+function closeAnnouncement() {
+  const id = state.account?.announcement?.id ?? 0;
+  state.closedAnnouncement = id;
+  saved.set("closedAnnouncement", String(id));
+  updateHome();
+}
+
+/** Download, then upload. The server allows one test a minute and a few a day. */
+async function runSpeedTest() {
+  if (state.speedTest.phase) return;
+  state.speedTest = { phase: "down", down: null, up: null, error: "" };
+  updateHome();
+  try {
+    state.speedTest.down = await backend.speedTestDownload();
+    state.speedTest.phase = "up";
+    updateHome();
+    state.speedTest.up = await backend.speedTestUpload();
+  } catch (e) {
+    state.speedTest.error = asApiError(e).message;
+  }
+  state.speedTest.phase = "";
+  updateHome();
+}
+
 async function togglePower() {
   const tstate = tunnelState();
   state.busy = true;
@@ -769,7 +1157,7 @@ async function togglePower() {
         loc = quieter;
         updateLocations();
       }
-      await backend.connect(loc.id);
+      await connectTo(loc.id);
     }
   } catch (e) {
     const err = asApiError(e);
@@ -797,7 +1185,7 @@ async function chooseLocation(id: string) {
       state.busy = true;
       updateHome();
       try {
-        await backend.connect(loc.id);
+        await connectTo(loc.id);
       } catch (e) {
         state.actionError = asApiError(e).message;
       }
@@ -869,10 +1257,7 @@ async function refreshOverview() {
 
 async function refreshAccount() {
   if (!state.account) return;
-  // While the server can't be reached and the VPN is off, ask only every 30 seconds.
-  const now = Date.now();
-  if (state.offline && tunnelState() !== "connected" && now - state.lastRefresh < 30_000) return;
-  state.lastRefresh = now;
+  state.lastRefresh = Date.now();
   try {
     state.account = await backend.refreshAccount();
     state.offline = false;
@@ -913,7 +1298,7 @@ async function leaveOverloadedLocation() {
   updateLocations();
   updateHome();
   try {
-    await backend.connect(target.id);
+    await connectTo(target.id);
     state.moveNotice = moveMessage(current, target);
   } catch (e) {
     state.actionError = asApiError(e).message;
@@ -957,25 +1342,74 @@ async function start() {
 
   if (state.autoConnect && state.screen === "home" && tunnelState() === "disconnected") togglePower();
   checkForUpdate();
-  setInterval(checkForUpdate, 10 * 60 * 1000);
+  state.last.overview = state.last.pings = Date.now();
+  setInterval(tick, 1000);
+  // Coming back to the window catches up right away.
+  window.addEventListener("focus", () => tick(true));
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) tick(true);
+  });
+}
 
-  setInterval(async () => {
-    await refreshOverview();
-    if (state.screen === "home") updateHome();
-    if (state.screen === "code" && state.lockedUntil > 0) {
-      if (state.lockedUntil <= Date.now()) {
-        state.lockedUntil = 0;
-        render();
-      } else {
-        updateCodeMessage();
+/** False while CakeVPN sits in the tray or the window is minimized. */
+function windowVisible(): boolean {
+  return !document.hidden && state.overview?.windowVisible !== false;
+}
+
+/** How often each thing is checked (ms): often while someone is looking, rarely in the tray. */
+const PACE = {
+  overview: { visible: 2_000, hidden: 10_000 },
+  account: { visible: 10_000, hiddenConnected: 60_000, hidden: 5 * 60_000, unreachable: 30_000 },
+  pings: 30_000,
+  update: 3 * 60 * 60_000,
+  updateOnReturn: 30 * 60_000,
+};
+
+let ticking = false;
+
+/**
+ * Runs every second and does whatever is due. One ticker instead of several
+ * timers keeps the app quiet in the tray: nothing but a status check every 10
+ * seconds there, and the account once a minute while connected.
+ */
+async function tick(returned = false) {
+  if (ticking) return;
+  ticking = true;
+  try {
+    const now = Date.now();
+    let visible = windowVisible() || returned;
+    if (now - state.last.overview >= (visible ? PACE.overview.visible : PACE.overview.hidden) || returned) {
+      state.last.overview = now;
+      await refreshOverview();
+      visible = windowVisible();
+      if (state.screen === "code" && state.lockedUntil > 0) {
+        if (state.lockedUntil <= Date.now()) {
+          state.lockedUntil = 0;
+          render();
+        } else {
+          updateCodeMessage();
+        }
       }
     }
-  }, 2000);
-  // The connected timer ticks every second between the 2-second status polls.
-  setInterval(updateHome, 1000);
-  // The account carries each location's load, which the servers measure every 5 seconds.
-  setInterval(refreshAccount, 5000);
-  setInterval(refreshPings, 30000);
+    // The connected timer counts every second, but only while someone can see it.
+    if (visible && state.screen === "home") updateHome();
+
+    const connected = tunnelState() === "connected";
+    let accountEvery = visible ? PACE.account.visible : connected ? PACE.account.hiddenConnected : PACE.account.hidden;
+    // A server that can't be reached (and no VPN to reach it through) is asked less often.
+    if (state.offline && !connected) accountEvery = Math.max(accountEvery, PACE.account.unreachable);
+    if (now - state.lastRefresh >= accountEvery) await refreshAccount();
+
+    if (visible && now - state.last.pings >= PACE.pings) {
+      state.last.pings = now;
+      await refreshPings();
+    }
+    if (now - state.last.update >= PACE.update || (returned && now - state.last.update >= PACE.updateOnReturn)) {
+      await checkForUpdate();
+    }
+  } finally {
+    ticking = false;
+  }
 }
 
 start();

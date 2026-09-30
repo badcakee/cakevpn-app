@@ -14,7 +14,12 @@ pub const PROTOCOL_VERSION: u32 = 1;
 ///
 /// 2: QUIC (UDP 443) is refused in the tunnel.
 /// 3: IPv6 is let through for users with their own IPv6 exit.
-pub const HELPER_REVISION: u32 = 3;
+/// 4: ad blocking, the kill switch and split tunneling.
+pub const HELPER_REVISION: u32 = 4;
+
+/// Most websites and apps one person can set to skip the VPN.
+pub const MAX_BYPASS_DOMAINS: usize = 100;
+pub const MAX_BYPASS_APPS: usize = 50;
 
 pub const WINDOWS_PIPE: &str = r"\\.\pipe\cakevpn-helper";
 pub const UNIX_SOCKET: &str = "/var/run/cakevpn-helper.sock";
@@ -36,6 +41,40 @@ pub struct ConnectParams {
     /// The user has their own IPv6 exit here, so IPv6 may go through the tunnel.
     #[serde(default)]
     pub ipv6: bool,
+    /// Blocks ads and trackers by name, for every app on the computer.
+    #[serde(default)]
+    pub block_ads: bool,
+    /// While the server can't be reached, the tunnel stays up and keeps
+    /// trying, so nothing leaves outside the VPN until the person disconnects.
+    #[serde(default)]
+    pub kill_switch: bool,
+    /// Websites (domain names, which include their subdomains) that skip the VPN.
+    #[serde(default)]
+    pub bypass_domains: Vec<String>,
+    /// Apps (process names, like "steam.exe") that skip the VPN.
+    #[serde(default)]
+    pub bypass_apps: Vec<String>,
+}
+
+/// A domain name like "mybank.com": letters, digits, dashes and dots, with at least one dot.
+pub fn is_domain(d: &str) -> bool {
+    d.len() <= 253
+        && d.contains('.')
+        && d.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        })
+}
+
+/// A program's file name like "steam.exe" or "Discord", never a path.
+pub fn is_app_name(a: &str) -> bool {
+    !a.is_empty()
+        && a.len() <= 100
+        && a.trim() == a
+        && a.chars().all(|c| c.is_alphanumeric() || " ._-+()".contains(c))
 }
 
 impl ConnectParams {
@@ -76,6 +115,12 @@ impl ConnectParams {
             ["chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq"];
         if !FINGERPRINTS.contains(&self.fingerprint.as_str()) {
             return Err("unsupported fingerprint".into());
+        }
+        if self.bypass_domains.len() > MAX_BYPASS_DOMAINS || !self.bypass_domains.iter().all(|d| is_domain(d)) {
+            return Err("bad website in the skip list".into());
+        }
+        if self.bypass_apps.len() > MAX_BYPASS_APPS || !self.bypass_apps.iter().all(|a| is_app_name(a)) {
+            return Err("bad app in the skip list".into());
         }
         Ok(())
     }
@@ -158,7 +203,19 @@ mod tests {
             short_id: "26bd688ca4".into(),
             fingerprint: "chrome".into(),
             ipv6: false,
+            block_ads: false,
+            kill_switch: false,
+            bypass_domains: vec![],
+            bypass_apps: vec![],
         }
+    }
+
+    #[test]
+    fn accepts_skip_lists() {
+        let mut p = good();
+        p.bypass_domains = vec!["mybank.com".into(), "play.donutsmp.net".into(), "xn--80ak6aa92e.com".into()];
+        p.bypass_apps = vec!["steam.exe".into(), "Discord".into(), "Microsoft Teams (work)".into()];
+        assert_eq!(p.validate(), Ok(()));
     }
 
     #[test]
@@ -178,6 +235,15 @@ mod tests {
             Box::new(|p| p.public_key = "abc\"".into()),
             Box::new(|p| p.short_id = "xyz".into()),
             Box::new(|p| p.fingerprint = "random".into()),
+            Box::new(|p| p.bypass_domains = vec!["localhost".into()]),
+            Box::new(|p| p.bypass_domains = vec!["evil.com\",\"outbound\":\"x".into()]),
+            Box::new(|p| p.bypass_domains = vec!["Upper.com".into()]),
+            Box::new(|p| p.bypass_domains = vec!["-bad.com".into()]),
+            Box::new(|p| p.bypass_domains = (0..=MAX_BYPASS_DOMAINS).map(|i| format!("site{i}.com")).collect()),
+            Box::new(|p| p.bypass_apps = vec!["/usr/bin/curl".into()]),
+            Box::new(|p| p.bypass_apps = vec![r"C:\evil.exe".into()]),
+            Box::new(|p| p.bypass_apps = vec!["".into()]),
+            Box::new(|p| p.bypass_apps = vec!["app\"".into()]),
         ];
         for change in cases {
             let mut p = good();
