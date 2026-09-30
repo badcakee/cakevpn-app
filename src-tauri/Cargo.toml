@@ -15,30 +15,20 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 cakevpn-proto = { path = "../proto" }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-updater = "2"
 tauri-plugin-notification = "2"
+tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["net", "io-util", "time", "sync", "process", "macros"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 futures-util = { version = "0.3", default-features = false }
 bytes = "1"
+keyring = "3"
 getrandom = "0.3"
 ring = "0.17"
 gethostname = "1"
-
-# A computer: tray, start at login, updates, keyboard shortcut, and the
-# system keychain for the sign-in.
-[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-tauri-plugin-autostart = "2"
-tauri-plugin-updater = "2"
-tauri-plugin-global-shortcut = "2"
-keyring = "3"
-
-# Android: the tunnel runs inside the app (see src/phone.rs).
-[target.'cfg(target_os = "android")'.dependencies]
-cakevpn-helper = { path = "../helper" }
-tun2proxy = { version = "0.8.4", default-features = false }
-libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }

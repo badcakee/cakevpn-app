@@ -4,10 +4,6 @@
 #
 #   scripts/fetch-sing-box.sh x86_64-pc-windows-msvc
 #   scripts/fetch-sing-box.sh universal-apple-darwin
-#   scripts/fetch-sing-box.sh android [arm64-v8a x86_64 ...]
-#
-# For Android it goes into the app as libsingbox.so, per processor type
-# (Android only runs an app's programs from its unpacked library folder).
 set -euo pipefail
 
 VERSION=${SING_BOX_VERSION:-1.14.2}
@@ -41,24 +37,6 @@ case "$TARGET" in
     cp "$arm" "$OUT/sing-box-aarch64-apple-darwin"
     cp "$intel" "$OUT/sing-box-x86_64-apple-darwin"
     for f in "$OUT"/sing-box-*-apple-darwin; do codesign --force --sign - "$f"; done
-    ;;
-  android)
-    shift
-    abis=("${@:-arm64-v8a}")
-    for abi in "${abis[@]}"; do
-      case "$abi" in
-        arm64-v8a) arch=android-arm64 ;;
-        armeabi-v7a) arch=android-arm ;;
-        x86_64) arch=android-amd64 ;;
-        *) echo "unsupported Android processor type $abi" >&2; exit 1 ;;
-      esac
-      dir=$ROOT/src-tauri/gen/android/app/src/main/singbox/$abi
-      mkdir -p "$dir"
-      cp "$(fetch_tar "$arch")" "$dir/libsingbox.so"
-      chmod 755 "$dir/libsingbox.so"
-      ls -la "$dir/libsingbox.so"
-    done
-    exit 0
     ;;
   x86_64-unknown-linux-gnu)
     cp "$(fetch_tar linux-amd64)" "$OUT/sing-box-$TARGET"

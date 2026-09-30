@@ -1,21 +1,7 @@
 mod api;
-#[cfg(desktop)]
-mod desktop;
-#[cfg(desktop)]
-mod helper;
-#[cfg(mobile)]
-#[path = "helper_phone.rs"]
 mod helper;
 mod netinfo;
-#[cfg(mobile)]
-mod phone;
 mod store;
-
-// What differs between a computer and a phone, under the same names.
-#[cfg(desktop)]
-use desktop as platform;
-#[cfg(mobile)]
-use phone as platform;
 
 use api::{Account, ApiError, Load};
 use cakevpn_proto::{PingTarget, Request, Status, TunnelState, HELPER_REVISION, PROTOCOL_VERSION};
@@ -25,11 +11,18 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Manager, State};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::tray::TrayIconBuilder;
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 #[cfg(target_os = "macos")]
 use tauri::RunEvent;
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Mutex;
+
+/// Passed when CakeVPN starts with the computer, so it starts in the tray.
+const HIDDEN_ARG: &str = "--hidden";
 
 /// Faster than this (bytes per second, both ways together, 4 Mbps) the line
 /// counts as busy: a speed test or a big download fills it, and pings to the
@@ -70,7 +63,7 @@ struct WifiSeen {
     signal_at: Option<Instant>,
 }
 
-pub(crate) struct AppState {
+struct AppState {
     data_dir: PathBuf,
     account: Mutex<Option<Account>>,
     /// The location the tunnel was opened to, for the load warning.
@@ -87,14 +80,14 @@ pub(crate) struct AppState {
     saved: Mutex<Option<String>>,
     /// False while the window is hidden (CakeVPN in the tray), so the page
     /// can check things less often.
-    pub(crate) visible: AtomicBool,
+    visible: AtomicBool,
     /// Closing the window keeps CakeVPN in the tray (true) or quits it.
-    pub(crate) close_to_tray: AtomicBool,
+    close_to_tray: AtomicBool,
     /// The speed test in progress: its download and upload use one ticket.
     speed: Mutex<Option<api::SpeedTicket>>,
     /// Bytes of the update downloaded so far, and its size (0 while unknown).
-    pub(crate) update_done: Arc<AtomicU64>,
-    pub(crate) update_total: Arc<AtomicU64>,
+    update_done: Arc<AtomicU64>,
+    update_total: Arc<AtomicU64>,
 }
 
 /// How far the update download is, for the progress bar.
@@ -401,16 +394,7 @@ async fn sign_out(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn connect(
-    location_id: String,
-    options: Option<ConnectOptions>,
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<Status, String> {
-    #[cfg(mobile)]
-    phone::allow_vpn(&app).await?;
-    #[cfg(desktop)]
-    let _ = &app;
+async fn connect(location_id: String, options: Option<ConnectOptions>, state: State<'_, AppState>) -> Result<Status, String> {
     // Use fresh details when the server answers: signing in elsewhere changes them.
     let account = match tokio::time::timeout(SERVER_WAIT, fetch_account(&state)).await {
         Ok(Ok(a)) => a,
@@ -607,11 +591,7 @@ async fn install_helper() -> Result<(), String> {
         }
         Err("The CakeVPN service still isn't running. Restart your PC and install CakeVPN again.".into())
     }
-    #[cfg(target_os = "android")]
-    {
-        Ok(())
-    }
-    #[cfg(not(any(target_os = "macos", windows, target_os = "android")))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         Err("The CakeVPN helper is not running.".into())
     }
@@ -674,33 +654,68 @@ struct SettingsInfo {
 
 #[tauri::command]
 fn settings_info(app: tauri::AppHandle) -> SettingsInfo {
-    SettingsInfo { version: env!("CARGO_PKG_VERSION"), autostart: platform::autostart_enabled(&app) }
+    SettingsInfo {
+        version: env!("CARGO_PKG_VERSION"),
+        autostart: app.autolaunch().is_enabled().unwrap_or(false),
+    }
 }
 
 /// Starts CakeVPN when the computer starts, hidden in the tray.
 #[tauri::command]
 fn set_autostart(enabled: bool, app: tauri::AppHandle) -> Result<bool, String> {
-    platform::set_autostart(&app, enabled)
+    let launcher = app.autolaunch();
+    let result = if enabled { launcher.enable() } else { launcher.disable() };
+    result.map_err(|e| format!("Could not change the startup setting: {e}"))?;
+    Ok(launcher.is_enabled().unwrap_or(enabled))
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct UpdateInfo {
-    pub(crate) version: String,
-    pub(crate) notes: Option<String>,
+struct UpdateInfo {
+    version: String,
+    notes: Option<String>,
 }
 
 /// Looks for a newer CakeVPN release on GitHub.
 #[tauri::command]
 async fn check_update(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
-    platform::check_update(&app).await
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = match updater.check().await {
+        Ok(update) => update,
+        // The newest release has no build for this kind of computer (yet): nothing to update to.
+        Err(e) if e.to_string().contains("platforms") => None,
+        Err(e) => return Err(format!("Could not check for updates: {e}")),
+    };
+    Ok(update.map(|u| UpdateInfo { version: u.version.clone(), notes: u.body.clone() }))
 }
 
-/// Installs the newer release: on a computer by itself, on a phone by
-/// opening the download for Android's installer.
+/// Downloads and installs the newer release, then restarts CakeVPN.
 #[tauri::command]
 async fn install_update(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    platform::install_update(&app, &state).await
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("Could not check for updates: {e}"))?
+        .ok_or("CakeVPN is already up to date.")?;
+    // The installer replaces the helper on Windows, which would cut the tunnel anyway.
+    let _ = helper::ask(Request::Disconnect).await;
+    let (done, total) = (Arc::clone(&state.update_done), Arc::clone(&state.update_total));
+    done.store(0, Ordering::Relaxed);
+    total.store(0, Ordering::Relaxed);
+    update
+        .download_and_install(
+            move |chunk, size| {
+                done.fetch_add(chunk as u64, Ordering::Relaxed);
+                if let Some(size) = size {
+                    total.store(size, Ordering::Relaxed);
+                }
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| format!("The update could not be installed: {e}"))?;
+    app.restart()
 }
 
 #[tauri::command]
@@ -726,7 +741,16 @@ fn notify(app: AppHandle, title: String, body: String) {
 /// Sets the keyboard shortcut that turns the VPN on and off ("Control+Alt+Shift+V"), or none.
 #[tauri::command]
 fn set_shortcut(app: AppHandle, accelerator: Option<String>) -> Result<(), String> {
-    platform::set_shortcut(&app, accelerator)
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
+    let shortcuts = app.global_shortcut();
+    shortcuts.unregister_all().map_err(|e| e.to_string())?;
+    if let Some(accelerator) = accelerator.filter(|a| !a.is_empty()) {
+        let shortcut: Shortcut = accelerator.parse().map_err(|_| "That key combination can't be used.".to_string())?;
+        shortcuts
+            .register(shortcut)
+            .map_err(|_| "That key combination is already used by another app.".to_string())?;
+    }
+    Ok(())
 }
 
 /// What closing the window does: keep CakeVPN in the tray, or quit it.
@@ -738,40 +762,86 @@ fn set_close_to_tray(state: State<'_, AppState>, enabled: bool) {
 /// The tray menu, as the window describes it (in its language) whenever it changes.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(mobile, allow(dead_code))]
-pub(crate) struct TrayModel {
-    pub(crate) status: String,
-    pub(crate) toggle: String,
-    pub(crate) locations_label: String,
-    pub(crate) locations: Vec<TrayLocation>,
-    pub(crate) open: String,
-    pub(crate) quit: String,
-    pub(crate) tooltip: String,
+struct TrayModel {
+    status: String,
+    toggle: String,
+    locations_label: String,
+    locations: Vec<TrayLocation>,
+    open: String,
+    quit: String,
+    tooltip: String,
 }
 
 #[derive(Deserialize)]
-#[cfg_attr(mobile, allow(dead_code))]
-pub(crate) struct TrayLocation {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) chosen: bool,
-    pub(crate) enabled: bool,
+struct TrayLocation {
+    id: String,
+    name: String,
+    chosen: bool,
+    enabled: bool,
 }
 
 #[tauri::command]
 fn set_tray(app: AppHandle, model: TrayModel) -> Result<(), String> {
-    platform::set_tray(&app, model)
+    let tray = app.tray_by_id("main").ok_or("no tray icon")?;
+    let build = || -> tauri::Result<Menu<tauri::Wry>> {
+        let status = MenuItem::with_id(&app, "status", &model.status, false, None::<&str>)?;
+        let toggle = MenuItem::with_id(&app, "toggle", &model.toggle, true, None::<&str>)?;
+        let places = Submenu::with_id(&app, "locations", &model.locations_label, !model.locations.is_empty())?;
+        for l in &model.locations {
+            places.append(&CheckMenuItem::with_id(&app, format!("loc:{}", l.id), &l.name, l.enabled, l.chosen, None::<&str>)?)?;
+        }
+        let open = MenuItem::with_id(&app, "open", &model.open, true, None::<&str>)?;
+        let quit = MenuItem::with_id(&app, "quit", &model.quit, true, None::<&str>)?;
+        let line = || PredefinedMenuItem::separator(&app);
+        Menu::with_items(&app, &[&status, &toggle, &places, &line()?, &open, &line()?, &quit])
+    };
+    tray.set_menu(Some(build().map_err(|e| e.to_string())?)).map_err(|e| e.to_string())?;
+    tray.set_tooltip(Some(&model.tooltip)).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Disconnects and leaves: leaving would otherwise keep the tunnel up with no way to see it.
+fn quit(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = helper::ask(Request::Disconnect).await;
+        app.exit(0);
+    });
+}
+
+fn show_window(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        state.visible.store(true, Ordering::Relaxed);
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default().plugin(tauri_plugin_notification::init());
-    let builder = platform::plugins(builder);
-    let app = builder
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec![HIDDEN_ARG])))
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        let _ = app.emit("tray-action", "toggle");
+                    }
+                })
+                .build(),
+        )
         .setup(|app| {
-            let shown = platform::starts_shown();
+            // Opened at login: stay in the tray. Opened by the person: show the window.
+            let shown = !std::env::args().any(|a| a == HIDDEN_ARG);
+            if shown {
+                show_window(app.handle());
+            }
             let data_dir = app.path().app_data_dir()?;
-            store::use_dir(&data_dir);
             app.manage(AppState {
                 data_dir,
                 account: Mutex::new(None),
@@ -788,8 +858,53 @@ pub fn run() {
                 update_done: Arc::new(AtomicU64::new(0)),
                 update_total: Arc::new(AtomicU64::new(0)),
             });
-            platform::setup(app, shown)?;
+
+            // Until the window describes it (in its language), the menu is the simplest one.
+            let open = MenuItem::with_id(app, "open", "Open CakeVPN", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit CakeVPN", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open, &PredefinedMenuItem::separator(app)?, &quit_item])?;
+            let mut tray = TrayIconBuilder::with_id("main").tooltip("CakeVPN").menu(&menu);
+            if let Some(icon) = app.default_window_icon() {
+                tray = tray.icon(icon.clone());
+            }
+            // Connecting, disconnecting and choosing a location are done by the
+            // window, like its own buttons, so it gets told what was picked.
+            tray.on_menu_event(|app, event| match event.id.as_ref() {
+                "open" => show_window(app),
+                "quit" => quit(app),
+                "toggle" => {
+                    let _ = app.emit("tray-action", "toggle");
+                }
+                id if id.starts_with("loc:") => {
+                    let _ = app.emit("tray-action", id);
+                }
+                _ => {}
+            })
+            .build(app)?;
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Closing the window keeps CakeVPN in the tray, like other VPN apps.
+            match event {
+                WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    let to_tray = window.try_state::<AppState>().is_none_or(|s| s.close_to_tray.load(Ordering::Relaxed));
+                    if !to_tray {
+                        quit(window.app_handle());
+                        return;
+                    }
+                    let _ = window.hide();
+                    if let Some(state) = window.try_state::<AppState>() {
+                        state.visible.store(false, Ordering::Relaxed);
+                    }
+                }
+                WindowEvent::Focused(true) => {
+                    if let Some(state) = window.try_state::<AppState>() {
+                        state.visible.store(true, Ordering::Relaxed);
+                    }
+                }
+                _ => {}
+            }
         })
         .invoke_handler(tauri::generate_handler![
             load_session,
@@ -824,7 +939,7 @@ pub fn run() {
     app.run(|app, event| {
         #[cfg(target_os = "macos")]
         if let RunEvent::Reopen { .. } = event {
-            desktop::show_window(app);
+            show_window(app);
         }
         #[cfg(not(target_os = "macos"))]
         let _ = (app, event);

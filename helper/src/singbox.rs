@@ -15,9 +15,6 @@ pub enum Capture {
     Tun,
     /// Only a local SOCKS/HTTP port. Used to test the helper without touching routes.
     LocalPort(u16),
-    /// Android: the phone's own VPN interface (see `tunnel::Attach`) passes
-    /// everything to a local port picked for each connection.
-    Device,
 }
 
 pub struct Settings<'a> {
@@ -27,8 +24,6 @@ pub struct Settings<'a> {
     pub api_secret: &'a str,
     /// Where ADS_RULE_SET was written; needed when `params.block_ads` is on.
     pub ads_rule_set: Option<&'a Path>,
-    /// The local port for `Capture::Device`.
-    pub device_port: u16,
 }
 
 /// The tunnel sends all TCP and UDP through the VPN, like a normal network.
@@ -40,7 +35,6 @@ pub struct Settings<'a> {
 /// Discord uploads hang, and QUIC inside a TCP tunnel is slower anyway.
 pub fn config(s: &Settings) -> Value {
     let p = s.params;
-    let device = s.capture == Capture::Device;
     // Users with their own IPv6 exit get IPv6 too, but IPv4 stays first: all
     // IPv6 leaves through one Oracle VM, so it shouldn't carry everything.
     let dns_strategy = if p.ipv6 { "prefer_ipv4" } else { "ipv4_only" };
@@ -54,8 +48,7 @@ pub fn config(s: &Settings) -> Value {
         rules.push(json!({ "domain_suffix": p.bypass_domains, "outbound": "direct" }));
         dns_rules.push(json!({ "domain_suffix": p.bypass_domains, "server": "local" }));
     }
-    // On Android, apps skip the VPN by being left out of the VPN itself.
-    if !p.bypass_apps.is_empty() && !device {
+    if !p.bypass_apps.is_empty() {
         rules.push(json!({ "process_name": p.bypass_apps, "outbound": "direct" }));
         dns_rules.push(json!({ "process_name": p.bypass_apps, "server": "local" }));
     }
@@ -95,20 +88,6 @@ pub fn config(s: &Settings) -> Value {
             "listen": "127.0.0.1",
             "listen_port": port
         }),
-        Capture::Device => json!({
-            "type": "mixed",
-            "tag": "device-in",
-            "listen": "127.0.0.1",
-            "listen_port": s.device_port
-        }),
-    };
-    // sing-box on Android has no system resolver to ask (it runs as a plain
-    // program there), so names outside the VPN go to Cloudflare directly.
-    // The app's own traffic is left out of the phone's VPN, so this doesn't loop.
-    let local_dns = if device {
-        json!({ "type": "udp", "tag": "local", "server": "1.1.1.1" })
-    } else {
-        json!({ "type": "local", "tag": "local" })
     };
 
     json!({
@@ -116,7 +95,7 @@ pub fn config(s: &Settings) -> Value {
         "dns": {
             "servers": [
                 { "type": "https", "tag": "remote", "server": "1.1.1.1", "detour": "proxy" },
-                local_dns
+                { "type": "local", "tag": "local" }
             ],
             "rules": dns_rules,
             "final": "remote",
@@ -145,8 +124,8 @@ pub fn config(s: &Settings) -> Value {
             "rules": rules,
             "rule_set": rule_sets,
             "final": "proxy",
-            "auto_detect_interface": !device,
-            "find_process": !p.bypass_apps.is_empty() && !device,
+            "auto_detect_interface": true,
+            "find_process": !p.bypass_apps.is_empty(),
             "default_domain_resolver": "local"
         },
         "experimental": {
@@ -181,7 +160,7 @@ mod tests {
     }
 
     fn settings(p: &ConnectParams) -> Settings<'_> {
-        Settings { params: p, capture: Capture::Tun, api_port: 9095, api_secret: "s", ads_rule_set: Some(Path::new("/x/ads.srs")), device_port: 0 }
+        Settings { params: p, capture: Capture::Tun, api_port: 9095, api_secret: "s", ads_rule_set: Some(Path::new("/x/ads.srs")) }
     }
 
     #[test]
@@ -233,25 +212,6 @@ mod tests {
     }
 
     #[test]
-    fn android_takes_traffic_on_a_local_port() {
-        let mut p = params();
-        p.bypass_apps = vec!["com.example.bank".into()];
-        let mut s = settings(&p);
-        s.capture = Capture::Device;
-        s.device_port = 40000;
-        let c = config(&s);
-        assert_eq!(c["inbounds"][0]["type"], "mixed");
-        assert_eq!(c["inbounds"][0]["listen"], "127.0.0.1");
-        assert_eq!(c["inbounds"][0]["listen_port"], 40000);
-        assert_eq!(c["route"]["auto_detect_interface"], false);
-        assert_eq!(c["route"]["find_process"], false);
-        assert_eq!(c["dns"]["servers"][1]["type"], "udp");
-        let rules = c["route"]["rules"].as_array().unwrap();
-        assert!(!rules.iter().any(|r| r.get("process_name").is_some()), "Android leaves skipped apps out of the VPN instead");
-        assert!(rules.iter().any(|r| r["action"] == "hijack-dns"));
-    }
-
-    #[test]
     fn ipv6_only_for_users_with_their_own_address() {
         let mut p = params();
         let without = config(&settings(&p));
@@ -281,9 +241,8 @@ mod tests {
             ("local", &p, Capture::LocalPort(11095)),
             ("tun-ipv6", &v6, Capture::Tun),
             ("tun-all-options", &all, Capture::Tun),
-            ("android", &all, Capture::Device),
         ] {
-            let c = config(&Settings { params, capture, api_port: 9095, api_secret: "s", ads_rule_set: Some(Path::new(&ads)), device_port: 11096 });
+            let c = config(&Settings { params, capture, api_port: 9095, api_secret: "s", ads_rule_set: Some(Path::new(&ads)) });
             std::fs::write(format!("{dir}/{name}.json"), serde_json::to_string_pretty(&c).unwrap()).unwrap();
         }
     }

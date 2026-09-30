@@ -1,83 +1,32 @@
 //! What the app remembers between runs: the sign-in token (in the system
-//! keychain on a computer; on Android in the app's private folder, which
-//! only CakeVPN can read), a random id for this device and a sealed copy of
-//! the account (both in the app's data folder).
+//! keychain), a random id for this device and a sealed copy of the account
+//! (both in the app's data folder).
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305, NONCE_LEN};
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::path::Path;
 
-/// The app's data folder, set once at start.
-static DIR: OnceLock<PathBuf> = OnceLock::new();
+const KEYRING_SERVICE: &str = "CakeVPN";
+const KEYRING_USER: &str = "device-token";
 
-pub fn use_dir(dir: &Path) {
-    let _ = DIR.set(dir.to_path_buf());
-}
-
-#[cfg(desktop)]
-mod secret {
-    const KEYRING_SERVICE: &str = "CakeVPN";
-    const KEYRING_USER: &str = "device-token";
-
-    fn entry() -> Option<keyring::Entry> {
-        keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).ok()
-    }
-
-    pub fn get() -> Option<String> {
-        entry()?.get_password().ok()
-    }
-
-    pub fn set(token: &str) -> Result<(), String> {
-        entry()
-            .ok_or("the system keychain is not available")?
-            .set_password(token)
-            .map_err(|e| format!("could not save the sign-in: {e}"))
-    }
-
-    pub fn clear() {
-        if let Some(e) = entry() {
-            let _ = e.delete_credential();
-        }
-    }
-}
-
-#[cfg(mobile)]
-mod secret {
-    use std::path::PathBuf;
-
-    fn path() -> Option<PathBuf> {
-        super::DIR.get().map(|d| d.join("sign-in"))
-    }
-
-    pub fn get() -> Option<String> {
-        std::fs::read_to_string(path()?).ok().map(|t| t.trim().to_string())
-    }
-
-    pub fn set(token: &str) -> Result<(), String> {
-        let path = path().ok_or("the app's folder is not known yet")?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&path, token).map_err(|e| format!("could not save the sign-in: {e}"))
-    }
-
-    pub fn clear() {
-        if let Some(path) = path() {
-            let _ = std::fs::remove_file(path);
-        }
-    }
+fn entry() -> Option<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).ok()
 }
 
 pub fn token() -> Option<String> {
-    secret::get().filter(|t| !t.is_empty())
+    entry()?.get_password().ok().filter(|t| !t.is_empty())
 }
 
 pub fn save_token(token: &str) -> Result<(), String> {
-    secret::set(token)
+    entry()
+        .ok_or("the system keychain is not available")?
+        .set_password(token)
+        .map_err(|e| format!("could not save the sign-in: {e}"))
 }
 
 pub fn clear_token() {
-    secret::clear()
+    if let Some(e) = entry() {
+        let _ = e.delete_credential();
+    }
 }
 
 const ACCOUNT_FILE: &str = "account.sealed";
@@ -140,19 +89,12 @@ pub fn device_id(data_dir: &Path) -> String {
     id
 }
 
-/// A name the panel shows next to the code, like "Mia-PC (Windows)" or "Pixel 8 (Android)".
+/// A name the panel shows next to the code, like "Mia-PC (Windows)".
 pub fn device_name() -> String {
-    #[cfg(mobile)]
-    if let Some(model) = crate::phone::model() {
-        let mut name = format!("{model} (Android)");
-        name.truncate(60);
-        return name;
-    }
     let host = gethostname::gethostname().to_string_lossy().trim_end_matches(".local").to_string();
     let os = match std::env::consts::OS {
         "macos" => "Mac",
         "windows" => "Windows",
-        "android" => "Android",
         other => other,
     };
     let mut name = format!("{host} ({os})");
