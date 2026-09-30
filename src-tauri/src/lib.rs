@@ -162,32 +162,50 @@ fn slow_tunnel_from(ping_ms: Option<u32>) -> u32 {
     SLOW_TUNNEL_MS.max(ping_ms.unwrap_or(0).saturating_mul(6) + 250)
 }
 
-/// Since when the checks have been slow without a quick one in between.
+/// Since when a check has been slow without a quick one in between, and when
+/// it was last looked at.
 #[derive(Default)]
-struct Slowness {
-    tunnel: Option<Instant>,
-    direct: Option<Instant>,
+struct SlowSince {
+    since: Option<Instant>,
+    looked: Option<Instant>,
 }
 
-impl Slowness {
-    /// Notes whether a check is slow now, and tells whether it has been for long enough to say so.
-    fn lasting(since: &mut Option<Instant>, slow_now: bool, now: Instant) -> bool {
+/// The app looks at the checks every 10 seconds or more often. A longer
+/// break means it wasn't looking (the window was minimized, the computer
+/// slept), and what it saw before the break says nothing about now.
+const LOOKED_AWAY: Duration = Duration::from_secs(15);
+
+impl SlowSince {
+    /// Notes whether the check is slow now, and tells whether it has been,
+    /// every time the app looked, for long enough to say so.
+    fn lasting(&mut self, slow_now: bool, now: Instant) -> bool {
+        if self.looked.is_some_and(|looked| now.duration_since(looked) > LOOKED_AWAY) {
+            self.since = None;
+        }
+        self.looked = Some(now);
         if !slow_now {
-            *since = None;
+            self.since = None;
             return false;
         }
-        now.duration_since(*since.get_or_insert(now)) >= SLOW_FOR
+        now.duration_since(*self.since.get_or_insert(now)) >= SLOW_FOR
     }
+}
+
+/// The checks through the VPN and outside it.
+#[derive(Default)]
+struct Slowness {
+    tunnel: SlowSince,
+    direct: SlowSince,
 }
 
 /// Decides which warning to show. One only appears when something is
 /// actually wrong for the person: the VPN isn't getting through or has been
-/// slow for a while, or the connection is slow even outside the VPN. Then it
-/// names the cause, nearest first: the Wi-Fi (its signal is weak, or pings
-/// to the router are lost or slow), the internet connection (the same check
-/// fails or crawls outside the tunnel too), a busy location, or the VPN
-/// itself. Without such trouble, it says when names are looked up outside
-/// the VPN, and when the location is busy.
+/// slow for a while, or the connection is slow even outside the VPN. It then
+/// says plainly whose side it is on: "Your Wi-Fi is unstable" when it is the
+/// person's own connection (a weak signal, pings to the router lost or slow,
+/// or the same check failing or crawling outside the tunnel too), or "The
+/// VPN is unstable" when it is the location. Without such trouble, it says
+/// when names are looked up outside the VPN, and when the location is busy.
 ///
 /// While the line is full slow answers are expected, so it takes more to
 /// count as a problem.
@@ -207,7 +225,15 @@ fn banner(status: &Status, around: &Around) -> Option<Banner> {
     // not, and neither is a router that takes 40 ms to answer on average.
     let lagging = q.gateway_bad.is_some_and(|bad| bad >= if busy { 0.5 } else { 0.27 })
         || (!busy && q.gateway_rtt_ms.is_some_and(|rtt| rtt >= 40.0));
-    let name = around.wifi.wifi_name.as_deref().map(|n| format!(" ({n})")).unwrap_or_default();
+    // Their own connection is called Wi-Fi when they are on one.
+    let own_side = || {
+        let wifi = &around.wifi;
+        if wifi.wifi_name.is_none() && wifi.signal.is_none() {
+            return Banner { kind: "internet", message: "Your internet is unstable.".into() };
+        }
+        let name = wifi.wifi_name.as_deref().map(|n| format!(" ({n})")).unwrap_or_default();
+        Banner { kind: "wifi", message: format!("Your Wi-Fi{name} is unstable.") }
+    };
 
     // A weak signal is named when it shows: the router answers late, or
     // websites do. On its own it may belong to a Wi-Fi this computer isn't
@@ -219,18 +245,8 @@ fn banner(status: &Status, around: &Around) -> Option<Banner> {
                 || q.gateway_bad.is_some_and(|bad| bad >= 0.13)
                 || q.direct_delay_ms.is_some_and(|d| d >= 300)));
     match around.wifi.signal {
-        Some(netinfo::Signal::VeryWeak) if felt => {
-            return Some(Banner {
-                kind: "wifi",
-                message: format!("Your Wi-Fi signal{name} is very weak. That is what makes things slow, not the VPN: move closer to the router."),
-            });
-        }
-        Some(netinfo::Signal::Weak) if trouble || lagging => {
-            return Some(Banner {
-                kind: "wifi",
-                message: format!("Your Wi-Fi signal{name} is weak, which slows things down. It is not the VPN: moving closer to the router helps."),
-            });
-        }
+        Some(netinfo::Signal::VeryWeak) if felt => return Some(own_side()),
+        Some(netinfo::Signal::Weak) if trouble || lagging => return Some(own_side()),
         _ => {}
     }
 
@@ -245,38 +261,11 @@ fn banner(status: &Status, around: &Around) -> Option<Banner> {
         return high_load
             .then(|| Banner { kind: "load", message: "The location you're in is experiencing high load.".into() });
     }
-    if lagging {
-        let message = if around.wifi.wifi_name.is_some() {
-            format!("The problem is your Wi-Fi{name}, not the VPN: it keeps dropping or lagging.")
-        } else {
-            "The problem is your Wi-Fi or network, not the VPN: it keeps dropping or lagging.".to_string()
-        };
-        return Some(Banner { kind: "wifi", message });
+    // The router lags, or websites fail or crawl outside the VPN as well: not the VPN.
+    if lagging || direct_down || (!not_through && direct_slow) {
+        return Some(own_side());
     }
-    if direct_down {
-        return Some(Banner {
-            kind: "internet",
-            message: "The problem is your internet connection, not the VPN: websites aren't reachable without the VPN either.".into(),
-        });
-    }
-    if !not_through && direct_slow {
-        return Some(Banner {
-            kind: "internet",
-            message: "Your internet connection is slow right now, with or without the VPN.".into(),
-        });
-    }
-    if high_load {
-        return Some(Banner {
-            kind: "load",
-            message: "This location is very busy right now, which slows it down. Try another location.".into(),
-        });
-    }
-    let message = if not_through {
-        "The problem is on the VPN's side, not your Wi-Fi: this location isn't answering right now. Try another location."
-    } else {
-        "The problem is on the VPN's side, not your Wi-Fi: this location is slow right now. Try another location."
-    };
-    Some(Banner { kind: "vpn", message: message.into() })
+    Some(Banner { kind: "vpn", message: "The VPN is unstable.".into() })
 }
 
 fn not_signed_in() -> ApiError {
@@ -526,8 +515,8 @@ async fn overview(state: State<'_, AppState>) -> Result<Overview, String> {
         let now = Instant::now();
         let measuring = connected && !busy;
         (
-            Slowness::lasting(&mut slow.tunnel, measuring && q.tunnel_delay_ms.is_some_and(|d| d >= slow_tunnel_from(ping_ms)), now),
-            Slowness::lasting(&mut slow.direct, measuring && q.direct_delay_ms.is_some_and(|d| d >= SLOW_DIRECT_MS), now),
+            slow.tunnel.lasting(measuring && q.tunnel_delay_ms.is_some_and(|d| d >= slow_tunnel_from(ping_ms)), now),
+            slow.direct.lasting(measuring && q.direct_delay_ms.is_some_and(|d| d >= SLOW_DIRECT_MS), now),
         )
     };
     let dns_outside = dns_outside(&state, &status).await;
@@ -915,15 +904,18 @@ mod tests {
         let s = connected(Quality { tunnel_failures: 2, direct_failures: 2, ..wifi(0.4) });
         let b = seen(&s, Some(&load("high")), Some("School Guest"), false).unwrap();
         assert_eq!(b.kind, "wifi");
-        assert!(b.message.contains("School Guest") && b.message.contains("not the VPN"), "{}", b.message);
+        assert_eq!(b.message, "Your Wi-Fi (School Guest) is unstable.");
     }
 
     #[test]
     fn internet_down_is_not_the_vpns_fault() {
         let s = connected(Quality { tunnel_failures: 3, direct_failures: 3, ..wifi(0.0) });
+        // On a Wi-Fi, their own connection is called the Wi-Fi...
         let b = seen(&s, None, Some("Home"), false).unwrap();
-        assert_eq!(b.kind, "internet");
-        assert!(b.message.contains("not the VPN"), "{}", b.message);
+        assert_eq!((b.kind, b.message.as_str()), ("wifi", "Your Wi-Fi (Home) is unstable."));
+        // ...and on a cable, the internet.
+        let b = seen(&s, None, None, false).unwrap();
+        assert_eq!((b.kind, b.message.as_str()), ("internet", "Your internet is unstable."));
     }
 
     #[test]
@@ -932,11 +924,11 @@ mod tests {
         let s = connected(Quality { tunnel_failures: 2, direct_delay_ms: Some(25), ..wifi(0.0) });
         let b = seen(&s, None, Some("Home"), false).unwrap();
         assert_eq!(b.kind, "vpn");
-        assert!(b.message.contains("VPN's side") && b.message.contains("isn't answering"), "{}", b.message);
+        assert_eq!(b.message, "The VPN is unstable.");
         let slow = connected(Quality { tunnel_delay_ms: Some(900), direct_delay_ms: Some(25), ..wifi(0.0) });
         let b = seen(&slow, None, Some("Home"), false).unwrap();
         assert_eq!(b.kind, "vpn");
-        assert!(b.message.contains("slow"), "{}", b.message);
+        assert_eq!(b.message, "The VPN is unstable.");
     }
 
     #[test]
@@ -951,8 +943,7 @@ mod tests {
         assert_eq!(seen(&fine, Some(&load("high")), None, false).unwrap().kind, "load");
         let slow = connected(Quality { tunnel_delay_ms: Some(900), direct_delay_ms: Some(30), ..wifi(0.0) });
         let b = seen(&slow, Some(&load("high")), None, false).unwrap();
-        assert_eq!(b.kind, "load");
-        assert!(b.message.contains("Try another location"), "{}", b.message);
+        assert_eq!((b.kind, b.message.as_str()), ("vpn", "The VPN is unstable."));
     }
 
     #[test]
@@ -960,14 +951,13 @@ mod tests {
         // The check through the VPN stays under its limit, but without the VPN websites crawl too.
         let s = connected(Quality { tunnel_delay_ms: Some(550), direct_delay_ms: Some(520), ..wifi(0.0) });
         let b = seen(&s, None, Some("Home"), false).unwrap();
-        assert_eq!(b.kind, "internet");
-        assert!(b.message.contains("with or without the VPN"), "{}", b.message);
+        assert_eq!((b.kind, b.message.as_str()), ("wifi", "Your Wi-Fi (Home) is unstable."));
         // The router itself answers late: it is the Wi-Fi.
         let mut q = Quality { tunnel_delay_ms: Some(550), direct_delay_ms: Some(520), ..wifi(0.1) };
         q.gateway_rtt_ms = Some(65.0);
         let b = seen(&connected(q), None, Some("Home"), false).unwrap();
         assert_eq!(b.kind, "wifi");
-        assert!(b.message.contains("Home") && b.message.contains("not the VPN"), "{}", b.message);
+        assert_eq!(b.message, "Your Wi-Fi (Home) is unstable.");
     }
 
     #[test]
@@ -985,14 +975,14 @@ mod tests {
         let sluggish = connected(Quality { tunnel_delay_ms: Some(400), direct_delay_ms: Some(330), ..wifi(0.0) });
         let b = say(&sluggish, netinfo::Signal::VeryWeak).unwrap();
         assert_eq!(b.kind, "wifi");
-        assert!(b.message.contains("very weak") && b.message.contains("(Home)"), "{}", b.message);
+        assert_eq!(b.message, "Your Wi-Fi (Home) is unstable.");
 
         // Only weak: said once something is really slow, and then before blaming the VPN.
         assert_eq!(say(&sluggish, netinfo::Signal::Weak), None);
         let slow = connected(Quality { tunnel_delay_ms: Some(900), direct_delay_ms: Some(200), ..wifi(0.0) });
         let b = say(&slow, netinfo::Signal::Weak).unwrap();
         assert_eq!(b.kind, "wifi");
-        assert!(b.message.contains("is weak") && b.message.contains("not the VPN"), "{}", b.message);
+        assert_eq!(b.message, "Your Wi-Fi (Home) is unstable.");
 
         // A fine signal changes nothing: that one is on the VPN's side.
         assert_eq!(say(&slow, netinfo::Signal::Fine).unwrap().kind, "vpn");
@@ -1017,17 +1007,35 @@ mod tests {
     #[test]
     fn one_slow_check_is_not_a_slow_vpn() {
         let start = Instant::now();
-        let mut since = None;
+        let at = |secs| start + Duration::from_secs(secs);
+        let mut slow = SlowSince::default();
         // Slow once, then quick again: never said.
-        assert!(!Slowness::lasting(&mut since, true, start));
-        assert!(!Slowness::lasting(&mut since, false, start + Duration::from_secs(10)));
+        assert!(!slow.lasting(true, start));
+        assert!(!slow.lasting(false, at(10)));
         // Slow check after slow check: said once it has lasted three checks.
-        assert!(!Slowness::lasting(&mut since, true, start + Duration::from_secs(20)));
-        assert!(!Slowness::lasting(&mut since, true, start + Duration::from_secs(30)));
-        assert!(Slowness::lasting(&mut since, true, start + Duration::from_secs(46)));
+        assert!(!slow.lasting(true, at(20)));
+        assert!(!slow.lasting(true, at(30)));
+        assert!(slow.lasting(true, at(40)) || slow.lasting(true, at(46)));
         // A quick one ends it at once.
-        assert!(!Slowness::lasting(&mut since, false, start + Duration::from_secs(50)));
-        assert!(!Slowness::lasting(&mut since, true, start + Duration::from_secs(60)));
+        assert!(!slow.lasting(false, at(50)));
+        assert!(!slow.lasting(true, at(60)));
+    }
+
+    #[test]
+    fn a_window_that_was_minimized_starts_counting_afresh() {
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let mut slow = SlowSince::default();
+        // One slow check is seen, then the window is minimized and nothing is looked at for minutes.
+        assert!(!slow.lasting(true, start));
+        // Back again, and the check happens to be slow at that moment too:
+        // that is two checks minutes apart, not a slow VPN.
+        assert!(!slow.lasting(true, at(300)));
+        assert!(!slow.lasting(true, at(301)));
+        assert!(!slow.lasting(true, at(310)));
+        // Only if it stays slow while being watched is it said.
+        assert!(!slow.lasting(true, at(320)));
+        assert!(slow.lasting(true, at(326)));
     }
 
     #[test]
