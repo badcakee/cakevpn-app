@@ -1,6 +1,6 @@
 import { Account, asApiError, backend, ConnectOptions, DayUsage, Location, Overview } from "./backend";
+import { attachMap, drawMap, mapHtml, markCountries, setPlaces, showPlace } from "./map";
 import { placeOf } from "./places";
-import { WORLD_HEIGHT, WORLD_PATH, WORLD_WIDTH } from "./worldmap";
 
 // ---------- state ----------
 
@@ -388,11 +388,12 @@ function renderSetup() {
 
 const GEAR = `<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.5 7.5 0 0 0 0-2l2.1-1.6-2-3.5-2.5 1a7.7 7.7 0 0 0-1.7-1l-.4-2.7h-4l-.4 2.7a7.7 7.7 0 0 0-1.7 1l-2.5-1-2 3.5L4.6 11a7.5 7.5 0 0 0 0 2l-2.1 1.6 2 3.5 2.5-1a7.7 7.7 0 0 0 1.7 1l.4 2.7h4l.4-2.7a7.7 7.7 0 0 0 1.7-1l2.5 1 2-3.5zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/></svg>`;
 
-/** How busy a location is, as a small bar. The number is in its hover note. */
+/** How busy a location is: a small bar and the percentage. */
 function loadBadge(l: Location): string {
   if (!l.load) return "";
-  return `<span class="load ${l.load.level}" title="Load ${l.load.percent}%: how busy this location's server is, from everyone using it">
+  return `<span class="load ${l.load.level}" title="How busy this location's server is, from everyone using it">
       <span class="load-bar"><i style="width:${Math.max(4, l.load.percent)}%"></i></span>
+      <span class="load-pct">${l.load.percent}%</span>
     </span>`;
 }
 
@@ -408,8 +409,8 @@ function locationRow(l: Location, selected: boolean, best = false): string {
   return `
     <button class="loc ${selected ? "selected" : ""} ${live ? "live" : ""}" data-loc="${best ? "best" : esc(l.id)}" ${l.online ? "" : "disabled"}>
       ${flag(l.country)}
-      <span class="loc-name">${esc(best ? "Best location" : l.name)}<small>${esc(best ? l.name : city ?? "")}${
-        live ? `<span class="live-note">${city ? " · " : ""}Connected</span>` : ""
+      <span class="loc-name">${esc(best ? "Best location" : l.name)}<small>${
+        live ? `<span class="live-note">Connected</span>` : esc(best ? l.name : (city ?? ""))
       }</small></span>
       <span class="loc-meta">${loadBadge(l)}<span class="ping">${pingText(l)}</span></span>
     </button>`;
@@ -426,6 +427,7 @@ function locationsHtml(): string {
  * The pins on the map, one per location that has a known place. The one the
  * VPN is connected to pulses; the chosen one is filled. With a few locations
  * every pin is named; with many, only the chosen one, so names don't pile up.
+ * The map puts each pin at its place and keeps it the same size at any zoom.
  */
 function pinsHtml(): string {
   const locations = state.account?.locations ?? [];
@@ -441,23 +443,21 @@ function pinsHtml(): string {
       const isShown = l.id === shown?.id;
       const ping = pingText(l);
       const classes = ["pin", isShown ? "chosen" : "", l.id === connected ? "connected" : "", l.online ? "" : "offline"].join(" ");
-      // Names go to the side with more room: the country, then the city and the ping under it.
-      const left = place.x > WORLD_WIDTH * 0.8;
-      const x = left ? -17 : 17;
+      // The country, then the city and the ping under it.
       const where = [place.city, ping].filter(Boolean).join(" · ");
       const label =
         nameAll || isShown
-          ? `<text class="pin-label" text-anchor="${left ? "end" : "start"}">
-              <tspan x="${x}" y="-1">${esc(l.name)}</tspan>
-              <tspan class="pin-where" x="${x}" y="20">${esc(where)}</tspan>
+          ? `<text class="pin-label" text-anchor="start">
+              <tspan x="12" y="-1">${esc(l.name)}</tspan>
+              <tspan class="pin-where" x="12" y="13">${esc(where)}</tspan>
             </text>`
           : "";
       const note = `${l.name} (${place.city})${ping ? ` · ${ping}` : ""}${l.load ? ` · Load ${l.load.percent}%` : ""}${l.online ? "" : " · offline"}`;
-      return `<g class="${classes}" data-loc="${esc(l.id)}" transform="translate(${place.x.toFixed(1)},${place.y.toFixed(1)})">
+      return `<g class="${classes}" data-loc="${esc(l.id)}" data-x="${place.x.toFixed(2)}" data-y="${place.y.toFixed(2)}">
         <title>${esc(note)}</title>
-        <circle class="pin-pulse" r="11"></circle>
-        <circle class="pin-hit" r="22"></circle>
-        <circle class="pin-dot" r="8"></circle>
+        <circle class="pin-pulse" r="7"></circle>
+        <circle class="pin-hit" r="15"></circle>
+        <circle class="pin-dot" r="5"></circle>
         ${label}
       </g>`;
     })
@@ -519,10 +519,7 @@ function renderHome() {
 
         <section class="stage">
           <div class="card map-card">
-            <svg class="world" id="world" viewBox="0 0 ${WORLD_WIDTH} ${WORLD_HEIGHT}" role="img" aria-label="Map of the CakeVPN locations">
-              <path class="land" d="${WORLD_PATH}"></path>
-              <g id="map-pins">${pinsHtml()}</g>
-            </svg>
+            ${mapHtml(pinsHtml())}
             <div class="your-ip" id="your-ip"></div>
           </div>
           <div class="card locations" id="locations">${locationsHtml()}</div>
@@ -542,15 +539,32 @@ function renderHome() {
     if (row && !row.disabled) chooseLocation(row.dataset.loc!);
   });
   // A pin on the map picks its location, like its row in the list.
-  $("#map-pins")!.addEventListener("click", (e) => {
-    const pin = (e.target as Element).closest<SVGGElement>(".pin");
-    if (pin && !pin.classList.contains("offline")) chooseLocation(pin.dataset.loc!);
-  });
+  attachMap(chooseLocation);
   updateHome();
 }
 
 /** What the map and list last showed, so they are redrawn when the VPN's state or the choice changes. */
 let shownPlaces = "";
+/** The location the map last moved to: null for the whole world, undefined before its first look. */
+let mapFollows: string | null | undefined;
+
+/**
+ * The map goes to the location the VPN connects to, and back to the whole
+ * world when the VPN is turned off. While the VPN is still connecting, or
+ * moving to another location, it stays where it is.
+ */
+function followConnection() {
+  const tstate = tunnelState();
+  if (tstate === "connecting") return;
+  const to = tstate === "connected" ? (state.overview?.locationId ?? null) : null;
+  if (to === mapFollows) return;
+  const first = mapFollows === undefined;
+  mapFollows = to;
+  const location = to ? state.account?.locations.find((l) => l.id === to) : undefined;
+  const place = location ? placeOf(location) : null;
+  if (place) showPlace(place, { glide: !first });
+  else if (!first) showPlace(null, { onlyIfAutomatic: true });
+}
 
 /** Updates the home screen in place. */
 function updateHome() {
@@ -560,6 +574,7 @@ function updateHome() {
     shownPlaces = places;
     updateLocations();
   }
+  followConnection();
   const status = state.overview?.status;
   const tstate = tunnelState();
   const power = $("#power") as HTMLButtonElement | null;
@@ -657,7 +672,13 @@ function updateLocations() {
   const list = $("#locations");
   const pins = $("#map-pins");
   if (list) list.innerHTML = locationsHtml();
-  if (pins) pins.innerHTML = pinsHtml();
+  if (pins) {
+    pins.innerHTML = pinsHtml();
+    setPlaces((state.account?.locations ?? []).flatMap((l) => placeOf(l) ?? []));
+    const connected = tunnelState() === "connected" ? state.account?.locations.find((l) => l.id === state.overview?.locationId) : undefined;
+    markCountries(shownLocation()?.country, connected?.country);
+    drawMap();
+  }
   // The addresses belong to the main location; other locations use their own.
   const main = shownLocation()?.id === "main";
   setText("#your-ip", main ? ipsText(state.account) : "");

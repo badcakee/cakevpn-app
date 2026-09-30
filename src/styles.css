@@ -11,6 +11,9 @@
   --red: #e5484d;
   --shadow: 0 6px 24px rgba(120, 60, 40, 0.08);
   --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  /* The map: the chosen location's country, and the one the VPN is connected to. */
+  --land-chosen: #f7aeb9;
+  --land-connected: #93ceab;
   color-scheme: light;
 }
 
@@ -22,6 +25,8 @@
     --muted: #b09a93;
     --line: #3a2d2a;
     --shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  --land-chosen: #934b58;
+  --land-connected: #2f6a4b;
     color-scheme: dark;
   }
 }
@@ -33,6 +38,8 @@
   --muted: #b09a93;
   --line: #3a2d2a;
   --shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  --land-chosen: #934b58;
+  --land-connected: #2f6a4b;
   color-scheme: dark;
 }
 
@@ -1293,14 +1300,23 @@ label.row {
 
 /* ---------- the wide window: controls on the left, the map on the right ---------- */
 
+/* The home screen fills the window and never scrolls as a whole: the left
+   column scrolls by itself when warnings make it too tall. */
+#app[data-screen="home"] {
+  height: 100%;
+}
+
 .home {
   padding: 4px 20px 14px;
+  min-height: 0;
 }
 
 .home-grid {
   flex: 1;
+  min-height: 0;
   margin-top: 8px;
   display: grid;
+  grid-template-rows: minmax(0, 1fr);
   grid-template-columns: 280px minmax(0, 1fr);
   gap: 18px;
 }
@@ -1310,6 +1326,12 @@ label.row {
   flex-direction: column;
   align-items: stretch;
   min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  /* Room for the cards' shadows, which the scrolling box would cut off. */
+  margin: -10px -12px -12px;
+  padding: 10px 12px 12px;
 }
 
 .side .power {
@@ -1327,6 +1349,7 @@ label.row {
   flex-direction: column;
   gap: 12px;
   min-width: 0;
+  min-height: 0;
 }
 
 .stage .card {
@@ -1344,25 +1367,45 @@ label.row {
 
 /* ---------- world map ---------- */
 
-/* The map takes the height the list leaves and sits in the middle of it. */
+/* The map fills the height the list leaves. It can be zoomed and dragged. */
 .map-card {
   flex: 1;
-  display: flex;
-  flex-direction: column;
-  padding: 10px 12px 8px;
+  position: relative;
+  min-height: 150px;
+  padding: 0;
+  overflow: hidden;
+  cursor: grab;
+  touch-action: none;
+}
+
+.map-card.dragging {
+  cursor: grabbing;
 }
 
 .world {
-  display: block;
+  position: absolute;
+  inset: 0;
   width: 100%;
-  height: auto;
-  margin: auto 0;
-  overflow: visible;
+  height: 100%;
+  display: block;
 }
 
-.world .land {
+/* Borders are a hairline in the card's color, the same at any zoom. */
+.world .country {
   fill: var(--line);
+  stroke: var(--card);
+  stroke-width: 0.6px;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
   transition: fill 0.3s var(--ease);
+}
+
+.world .country.chosen {
+  fill: var(--land-chosen);
+}
+
+.world .country.connected {
+  fill: var(--land-connected);
 }
 
 .pin {
@@ -1382,16 +1425,16 @@ label.row {
 .pin-dot {
   fill: var(--muted);
   stroke: var(--card);
-  stroke-width: 3;
+  stroke-width: 2;
   transition: fill 0.2s var(--ease), r 0.2s var(--ease);
 }
 
 .pin:hover:not(.offline) .pin-dot {
-  r: 10;
+  r: 6.5;
 }
 
 .pin.chosen .pin-dot {
-  fill: var(--pink);
+  fill: var(--pink-dark);
 }
 
 .pin.connected .pin-dot {
@@ -1422,11 +1465,11 @@ label.row {
 
 /* Names wear the text color, with a halo in the card's color so they read over the land. */
 .pin-label {
-  font-size: 22px;
+  font-size: 13px;
   font-weight: 650;
   fill: var(--text);
   stroke: var(--card);
-  stroke-width: 5px;
+  stroke-width: 3px;
   stroke-linejoin: round;
   paint-order: stroke;
   pointer-events: none;
@@ -1434,9 +1477,60 @@ label.row {
 
 /* The city and the ping, under the name. */
 .pin-where {
-  font-size: 18px;
+  font-size: 11px;
   font-weight: 500;
   fill: var(--muted);
+}
+
+/* Zoom buttons, in the map's corner. */
+.map-zoom {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  border-radius: 10px;
+  background: var(--card);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.14);
+  overflow: hidden;
+  cursor: default;
+}
+
+.map-zoom button {
+  width: 28px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 17px;
+  line-height: 1;
+  color: var(--muted);
+  transition: background-color 0.2s var(--ease), color 0.2s var(--ease);
+}
+
+.map-zoom button + button {
+  border-top: 1px solid var(--line);
+}
+
+.map-zoom button:hover:not(:disabled) {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.map-zoom button:disabled {
+  opacity: 0.35;
+}
+
+/* The addresses sit on the map's lower edge. */
+.map-card .your-ip {
+  position: absolute;
+  left: 10px;
+  bottom: 8px;
+  max-width: calc(100% - 60px);
+  padding: 2px 8px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--card) 85%, transparent);
+  cursor: text;
 }
 
 /* ---------- location list under the map ---------- */
@@ -1462,6 +1556,15 @@ label.row {
 
 .load-bar {
   width: 30px;
+}
+
+.load-pct {
+  min-width: 30px;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: right;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
 }
 
 /* The location the VPN is connected to says so, in green. */

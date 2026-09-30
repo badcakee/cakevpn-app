@@ -52,12 +52,24 @@ impl Traffic {
     }
 }
 
+/// What was last read about the Wi-Fi, and when. Reading it runs system
+/// tools, so it is done seldom: the name every 30 seconds, the signal every
+/// minute and only while connected.
+#[derive(Default)]
+struct WifiSeen {
+    network: netinfo::Network,
+    name_at: Option<Instant>,
+    signal_at: Option<Instant>,
+}
+
 struct AppState {
     data_dir: PathBuf,
     account: Mutex<Option<Account>>,
     /// The location the tunnel was opened to, for the load warning.
     location: Mutex<Option<String>>,
-    wifi: Mutex<Option<(Instant, netinfo::Network)>>,
+    wifi: Mutex<WifiSeen>,
+    /// How far each location last measured, for judging what "slow" is there.
+    pings: Mutex<HashMap<String, u32>>,
     traffic: Mutex<Traffic>,
     /// The connection details last saved to disk, to save them only when they change.
     saved: Mutex<Option<String>>,
@@ -116,43 +128,97 @@ struct Overview {
     window_visible: bool,
 }
 
+/// What the app knows besides the helper's own checks.
+struct Around<'a> {
+    load: Option<&'a Load>,
+    wifi: &'a netinfo::Network,
+    /// The line is full (a speed test, a big download), so slow answers are expected.
+    busy: bool,
+    /// How far the connected location is, in milliseconds.
+    ping_ms: Option<u32>,
+}
+
+/// A check outside the VPN slower than this means the connection itself is slow.
+const SLOW_DIRECT_MS: u32 = 500;
+/// A check through the VPN slower than this is slow for a location nearby.
+const SLOW_TUNNEL_MS: u32 = 600;
+
 /// Decides which warning to show. One only appears when something is
-/// actually wrong for the person: the VPN isn't getting through, or is very
-/// slow. Then it names the cause, nearest first: the Wi-Fi (pings to the
+/// actually wrong for the person: the VPN isn't getting through or is very
+/// slow, or the connection is slow even outside the VPN. Then it names the
+/// cause, nearest first: the Wi-Fi (its signal is weak, or pings to the
 /// router are lost or slow), the internet connection (the same check fails
-/// outside the tunnel too), a busy location, or the VPN itself. A busy
-/// location is also mentioned when nothing is wrong yet.
+/// or crawls outside the tunnel too), a busy location, or the VPN itself. A
+/// busy location is also mentioned when nothing is wrong yet.
 ///
-/// While the line is full (a speed test, a big download) slow answers are
-/// expected, so it takes more to count as a problem.
-fn banner(status: &Status, load: Option<&Load>, wifi_name: Option<&str>, busy: bool) -> Option<Banner> {
+/// While the line is full slow answers are expected, so it takes more to
+/// count as a problem.
+fn banner(status: &Status, around: &Around) -> Option<Banner> {
     if status.state != TunnelState::Connected {
         return None;
     }
     let q = &status.quality;
+    let busy = around.busy;
     let not_through = q.tunnel_failures >= if busy { 4 } else { 2 };
-    let slow = !busy && q.tunnel_delay_ms.is_some_and(|d| d >= 600);
-    let high_load = load.is_some_and(|l| l.level == "high");
-    if !not_through && !slow {
+    // Each check makes several round trips, so a far location answers later
+    // than a near one without anything being wrong.
+    let slow_from = SLOW_TUNNEL_MS.max(around.ping_ms.unwrap_or(0).saturating_mul(6) + 250);
+    let slow = !busy && q.tunnel_delay_ms.is_some_and(|d| d >= slow_from);
+    let direct_down = q.direct_failures >= 2;
+    let direct_slow = !busy && q.direct_delay_ms.is_some_and(|d| d >= SLOW_DIRECT_MS);
+    let trouble = not_through || slow || direct_down || direct_slow;
+
+    // One lost or slow ping now and then is normal; over a quarter of them is
+    // not, and neither is a router that takes 40 ms to answer on average.
+    let lagging = q.gateway_bad.is_some_and(|bad| bad >= if busy { 0.5 } else { 0.27 })
+        || (!busy && q.gateway_rtt_ms.is_some_and(|rtt| rtt >= 40.0));
+    let name = around.wifi.wifi_name.as_deref().map(|n| format!(" ({n})")).unwrap_or_default();
+
+    // A weak signal is named when it shows: the router answers late, or
+    // websites do. On its own it may belong to a Wi-Fi this computer isn't
+    // using (one on a cable, say).
+    let felt = trouble
+        || lagging
+        || (!busy
+            && (q.gateway_rtt_ms.is_some_and(|rtt| rtt >= 20.0)
+                || q.gateway_bad.is_some_and(|bad| bad >= 0.13)
+                || q.direct_delay_ms.is_some_and(|d| d >= 300)));
+    match around.wifi.signal {
+        Some(netinfo::Signal::VeryWeak) if felt => {
+            return Some(Banner {
+                kind: "wifi",
+                message: format!("Your Wi-Fi signal{name} is very weak. That is what makes things slow, not the VPN: move closer to the router."),
+            });
+        }
+        Some(netinfo::Signal::Weak) if trouble || lagging => {
+            return Some(Banner {
+                kind: "wifi",
+                message: format!("Your Wi-Fi signal{name} is weak, which slows things down. It is not the VPN: moving closer to the router helps."),
+            });
+        }
+        _ => {}
+    }
+
+    let high_load = around.load.is_some_and(|l| l.level == "high");
+    if !trouble {
         return high_load
             .then(|| Banner { kind: "load", message: "The location you're in is experiencing high load.".into() });
     }
-
-    // One lost or slow ping now and then is normal; over a quarter of them is not.
-    if q.gateway_bad.is_some_and(|bad| bad >= if busy { 0.5 } else { 0.27 }) {
-        let message = match wifi_name {
-            Some(name) => format!("The problem is your Wi-Fi ({name}), not the VPN: it keeps dropping or lagging."),
-            None => "The problem is your Wi-Fi or network, not the VPN: it keeps dropping or lagging.".to_string(),
+    if lagging {
+        let message = if around.wifi.wifi_name.is_some() {
+            format!("The problem is your Wi-Fi{name}, not the VPN: it keeps dropping or lagging.")
+        } else {
+            "The problem is your Wi-Fi or network, not the VPN: it keeps dropping or lagging.".to_string()
         };
         return Some(Banner { kind: "wifi", message });
     }
-    if q.direct_failures >= 2 {
+    if direct_down {
         return Some(Banner {
             kind: "internet",
             message: "The problem is your internet connection, not the VPN: websites aren't reachable without the VPN either.".into(),
         });
     }
-    if !not_through && q.direct_delay_ms.is_some_and(|d| d >= 600) {
+    if !not_through && direct_slow {
         return Some(Banner {
             kind: "internet",
             message: "Your internet connection is slow right now, with or without the VPN.".into(),
@@ -380,16 +446,26 @@ async fn overview(state: State<'_, AppState>) -> Result<Overview, String> {
     let location_id = state.location.lock().await.clone();
 
     let window_visible = state.visible.load(Ordering::Relaxed);
-    // Reading the Wi-Fi name runs a system tool, so it is refreshed every 30
-    // seconds at most, and not at all while the window is hidden.
-    let wifi_name = {
-        let mut cached = state.wifi.lock().await;
-        let stale = cached.as_ref().is_none_or(|(at, _)| at.elapsed() > Duration::from_secs(30));
-        if stale && (window_visible || cached.is_none()) {
-            let net = tokio::task::spawn_blocking(netinfo::network).await.unwrap_or_default();
-            *cached = Some((Instant::now(), net));
+    let connected = status.state == TunnelState::Connected;
+    // Reading about the Wi-Fi runs system tools, so it is done seldom, and
+    // not at all while the window is hidden.
+    let wifi = {
+        let mut seen = state.wifi.lock().await;
+        let older = |at: Option<Instant>, secs| at.is_none_or(|at| at.elapsed() > Duration::from_secs(secs));
+        let signal = connected && older(seen.signal_at, 60);
+        if (window_visible || seen.name_at.is_none()) && (signal || older(seen.name_at, 30)) {
+            let mut network = tokio::task::spawn_blocking(move || netinfo::network(signal)).await.unwrap_or_default();
+            let now = Instant::now();
+            if signal {
+                seen.signal_at = Some(now);
+            } else {
+                // The signal read earlier still holds until its minute is over.
+                network.signal = seen.network.signal.filter(|_| connected);
+            }
+            seen.name_at = Some(now);
+            seen.network = network;
         }
-        cached.as_ref().and_then(|(_, n)| n.wifi_name.clone())
+        seen.network.clone()
     };
     let load = {
         let account = state.account.lock().await;
@@ -398,9 +474,12 @@ async fn overview(state: State<'_, AppState>) -> Result<Overview, String> {
             .and_then(|a| a.locations.iter().find(|l| Some(&l.id) == location_id.as_ref()))
             .and_then(|l| l.load.clone())
     };
-    let busy = status.state == TunnelState::Connected
-        && state.traffic.lock().await.busy(Instant::now(), status.up_bytes + status.down_bytes);
-    let banner = banner(&status, load.as_ref(), wifi_name.as_deref(), busy);
+    let busy = connected && state.traffic.lock().await.busy(Instant::now(), status.up_bytes + status.down_bytes);
+    let ping_ms = match &location_id {
+        Some(id) => state.pings.lock().await.get(id).copied(),
+        None => None,
+    };
+    let banner = banner(&status, &Around { load: load.as_ref(), wifi: &wifi, busy, ping_ms });
     Ok(Overview { helper: helper_state, status: Some(status), banner, location_id, window_visible })
 }
 
@@ -456,7 +535,9 @@ async fn ping_locations(state: State<'_, AppState>) -> Result<HashMap<String, Op
         match r.status.state {
             TunnelState::Connected => {
                 let targets = targets.into_iter().map(|(id, host, port)| PingTarget { id, host, port }).collect();
-                return Ok(helper::ask(Request::Ping { targets }).await?.pings.unwrap_or_default());
+                let pings = helper::ask(Request::Ping { targets }).await?.pings.unwrap_or_default();
+                remember_pings(&state, &pings).await;
+                return Ok(pings);
             }
             // Routes are changing; a measurement now would mean nothing.
             TunnelState::Connecting => return Ok(HashMap::new()),
@@ -467,7 +548,18 @@ async fn ping_locations(state: State<'_, AppState>) -> Result<HashMap<String, Op
     for (id, host, port) in targets {
         pings.insert(id, netinfo::tcp_ping(&host, port).await);
     }
+    remember_pings(&state, &pings).await;
     Ok(pings)
+}
+
+/// Keeps the newest answer per location; one that didn't answer keeps its last.
+async fn remember_pings(state: &AppState, pings: &HashMap<String, Option<u32>>) {
+    let mut known = state.pings.lock().await;
+    for (id, ms) in pings {
+        if let Some(ms) = ms {
+            known.insert(id.clone(), *ms);
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -578,7 +670,8 @@ pub fn run() {
                 data_dir,
                 account: Mutex::new(None),
                 location: Mutex::new(None),
-                wifi: Mutex::new(None),
+                wifi: Mutex::new(WifiSeen::default()),
+                pings: Mutex::new(HashMap::new()),
                 traffic: Mutex::new(Traffic::default()),
                 saved: Mutex::new(None),
                 visible: AtomicBool::new(shown),
@@ -676,6 +769,12 @@ mod tests {
         Status { state: TunnelState::Connected, quality: q, ..Default::default() }
     }
 
+    /// The banner for someone near the location, whose Wi-Fi signal is unknown.
+    fn seen(status: &Status, load: Option<&Load>, wifi_name: Option<&str>, busy: bool) -> Option<Banner> {
+        let wifi = netinfo::Network { wifi_name: wifi_name.map(str::to_string), signal: None };
+        banner(status, &Around { load, wifi: &wifi, busy, ping_ms: Some(20) })
+    }
+
     fn load(level: &str) -> Load {
         Load { percent: 90, level: level.into() }
     }
@@ -688,26 +787,26 @@ mod tests {
     #[test]
     fn quiet_when_all_is_well() {
         let s = connected(Quality { tunnel_delay_ms: Some(40), direct_delay_ms: Some(20), ..wifi(0.0) });
-        assert_eq!(banner(&s, Some(&load("low")), Some("Home"), false), None);
+        assert_eq!(seen(&s, Some(&load("low")), Some("Home"), false), None);
     }
 
     #[test]
     fn shaky_pings_alone_are_not_a_warning() {
         // The router drops half its pings, but the VPN works: nothing is wrong for the person.
         let s = connected(Quality { tunnel_delay_ms: Some(60), ..wifi(0.5) });
-        assert_eq!(banner(&s, Some(&load("low")), Some("Home"), false), None);
+        assert_eq!(seen(&s, Some(&load("low")), Some("Home"), false), None);
     }
 
     #[test]
     fn one_bad_ping_does_not_blame_the_wifi() {
         let s = connected(Quality { tunnel_failures: 2, direct_delay_ms: Some(30), ..wifi(1.0 / 15.0) });
-        assert_eq!(banner(&s, None, Some("Home"), false).unwrap().kind, "vpn");
+        assert_eq!(seen(&s, None, Some("Home"), false).unwrap().kind, "vpn");
     }
 
     #[test]
     fn bad_wifi_is_named_when_the_vpn_suffers() {
         let s = connected(Quality { tunnel_failures: 2, direct_failures: 2, ..wifi(0.4) });
-        let b = banner(&s, Some(&load("high")), Some("School Guest"), false).unwrap();
+        let b = seen(&s, Some(&load("high")), Some("School Guest"), false).unwrap();
         assert_eq!(b.kind, "wifi");
         assert!(b.message.contains("School Guest") && b.message.contains("not the VPN"), "{}", b.message);
     }
@@ -715,7 +814,7 @@ mod tests {
     #[test]
     fn internet_down_is_not_the_vpns_fault() {
         let s = connected(Quality { tunnel_failures: 3, direct_failures: 3, ..wifi(0.0) });
-        let b = banner(&s, None, Some("Home"), false).unwrap();
+        let b = seen(&s, None, Some("Home"), false).unwrap();
         assert_eq!(b.kind, "internet");
         assert!(b.message.contains("not the VPN"), "{}", b.message);
     }
@@ -724,11 +823,11 @@ mod tests {
     fn vpn_problem_is_called_a_vpn_problem() {
         // The Wi-Fi is fine and the internet works outside the tunnel.
         let s = connected(Quality { tunnel_failures: 2, direct_delay_ms: Some(25), ..wifi(0.0) });
-        let b = banner(&s, None, Some("Home"), false).unwrap();
+        let b = seen(&s, None, Some("Home"), false).unwrap();
         assert_eq!(b.kind, "vpn");
         assert!(b.message.contains("VPN's side") && b.message.contains("isn't answering"), "{}", b.message);
         let slow = connected(Quality { tunnel_delay_ms: Some(900), direct_delay_ms: Some(25), ..wifi(0.0) });
-        let b = banner(&slow, None, Some("Home"), false).unwrap();
+        let b = seen(&slow, None, Some("Home"), false).unwrap();
         assert_eq!(b.kind, "vpn");
         assert!(b.message.contains("slow"), "{}", b.message);
     }
@@ -736,23 +835,79 @@ mod tests {
     #[test]
     fn slow_everywhere_is_the_internet() {
         let s = connected(Quality { tunnel_delay_ms: Some(900), direct_delay_ms: Some(800), ..wifi(0.0) });
-        assert_eq!(banner(&s, None, None, false).unwrap().kind, "internet");
+        assert_eq!(seen(&s, None, None, false).unwrap().kind, "internet");
     }
 
     #[test]
     fn busy_location_with_and_without_trouble() {
         let fine = connected(Quality { tunnel_delay_ms: Some(50), ..wifi(0.0) });
-        assert_eq!(banner(&fine, Some(&load("high")), None, false).unwrap().kind, "load");
+        assert_eq!(seen(&fine, Some(&load("high")), None, false).unwrap().kind, "load");
         let slow = connected(Quality { tunnel_delay_ms: Some(900), direct_delay_ms: Some(30), ..wifi(0.0) });
-        let b = banner(&slow, Some(&load("high")), None, false).unwrap();
+        let b = seen(&slow, Some(&load("high")), None, false).unwrap();
         assert_eq!(b.kind, "load");
         assert!(b.message.contains("Try another location"), "{}", b.message);
     }
 
     #[test]
+    fn slow_outside_the_vpn_is_said_even_when_the_vpn_check_passes() {
+        // The check through the VPN stays under its limit, but without the VPN websites crawl too.
+        let s = connected(Quality { tunnel_delay_ms: Some(550), direct_delay_ms: Some(520), ..wifi(0.0) });
+        let b = seen(&s, None, Some("Home"), false).unwrap();
+        assert_eq!(b.kind, "internet");
+        assert!(b.message.contains("with or without the VPN"), "{}", b.message);
+        // The router itself answers late: it is the Wi-Fi.
+        let mut q = Quality { tunnel_delay_ms: Some(550), direct_delay_ms: Some(520), ..wifi(0.1) };
+        q.gateway_rtt_ms = Some(65.0);
+        let b = seen(&connected(q), None, Some("Home"), false).unwrap();
+        assert_eq!(b.kind, "wifi");
+        assert!(b.message.contains("Home") && b.message.contains("not the VPN"), "{}", b.message);
+    }
+
+    #[test]
+    fn weak_signal_is_named_when_it_shows() {
+        let say = |s: &Status, signal| {
+            let net = netinfo::Network { wifi_name: Some("Home".into()), signal: Some(signal) };
+            banner(s, &Around { load: None, wifi: &net, busy: false, ping_ms: Some(20) })
+        };
+
+        // All is quick: a weak signal is not worth a warning, and it may not even be the Wi-Fi in use.
+        let fine = connected(Quality { tunnel_delay_ms: Some(60), direct_delay_ms: Some(40), ..wifi(0.0) });
+        assert_eq!(say(&fine, netinfo::Signal::VeryWeak), None);
+
+        // Very weak, and websites outside the VPN already take a while.
+        let sluggish = connected(Quality { tunnel_delay_ms: Some(400), direct_delay_ms: Some(330), ..wifi(0.0) });
+        let b = say(&sluggish, netinfo::Signal::VeryWeak).unwrap();
+        assert_eq!(b.kind, "wifi");
+        assert!(b.message.contains("very weak") && b.message.contains("(Home)"), "{}", b.message);
+
+        // Only weak: said once something is really slow, and then before blaming the VPN.
+        assert_eq!(say(&sluggish, netinfo::Signal::Weak), None);
+        let slow = connected(Quality { tunnel_delay_ms: Some(900), direct_delay_ms: Some(200), ..wifi(0.0) });
+        let b = say(&slow, netinfo::Signal::Weak).unwrap();
+        assert_eq!(b.kind, "wifi");
+        assert!(b.message.contains("is weak") && b.message.contains("not the VPN"), "{}", b.message);
+
+        // A fine signal changes nothing: that one is on the VPN's side.
+        assert_eq!(say(&slow, netinfo::Signal::Fine).unwrap().kind, "vpn");
+    }
+
+    #[test]
+    fn a_far_location_may_answer_later() {
+        // 650 ms is slow for a location 20 ms away, and normal for one 120 ms away.
+        let s = connected(Quality { tunnel_delay_ms: Some(650), direct_delay_ms: Some(40), ..wifi(0.0) });
+        let wifi_info = netinfo::Network::default();
+        let say = |ping_ms| banner(&s, &Around { load: None, wifi: &wifi_info, busy: false, ping_ms });
+        assert_eq!(say(Some(20)).unwrap().kind, "vpn");
+        assert_eq!(say(Some(120)), None);
+        assert_eq!(say(None).unwrap().kind, "vpn");
+        let very = connected(Quality { tunnel_delay_ms: Some(1200), direct_delay_ms: Some(40), ..wifi(0.0) });
+        assert_eq!(banner(&very, &Around { load: None, wifi: &wifi_info, busy: false, ping_ms: Some(120) }).unwrap().kind, "vpn");
+    }
+
+    #[test]
     fn nothing_while_disconnected() {
         let s = Status { state: TunnelState::Disconnected, quality: Quality { tunnel_failures: 9, ..wifi(1.0) }, ..Default::default() };
-        assert_eq!(banner(&s, None, None, false), None);
+        assert_eq!(seen(&s, None, None, false), None);
     }
 
     #[test]
@@ -776,11 +931,11 @@ mod tests {
     fn busy_line_needs_more_to_count_as_trouble() {
         // A speed test: answers are slow, a couple of checks time out, pings lag.
         let s = connected(Quality { tunnel_delay_ms: Some(900), tunnel_failures: 3, ..wifi(0.4) });
-        assert_eq!(banner(&s, None, Some("Home"), true), None);
-        assert_eq!(banner(&s, Some(&load("high")), Some("Home"), true).unwrap().kind, "load");
+        assert_eq!(seen(&s, None, Some("Home"), true), None);
+        assert_eq!(seen(&s, Some(&load("high")), Some("Home"), true).unwrap().kind, "load");
         // Nothing gets through for a good while: that is a real problem, even then.
         let stuck = connected(Quality { tunnel_failures: 4, direct_delay_ms: Some(30), ..wifi(0.1) });
-        assert_eq!(banner(&stuck, None, Some("Home"), true).unwrap().kind, "vpn");
+        assert_eq!(seen(&stuck, None, Some("Home"), true).unwrap().kind, "vpn");
     }
 
     #[test]
