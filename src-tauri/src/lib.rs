@@ -5,15 +5,16 @@ mod store;
 
 use api::{Account, ApiError, Load};
 use cakevpn_proto::{PingTarget, Request, Status, TunnelState, HELPER_REVISION, PROTOCOL_VERSION};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
-use tauri::{Manager, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri_plugin_notification::NotificationExt;
 #[cfg(target_os = "macos")]
 use tauri::RunEvent;
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
@@ -80,6 +81,8 @@ struct AppState {
     /// False while the window is hidden (CakeVPN in the tray), so the page
     /// can check things less often.
     visible: AtomicBool,
+    /// Closing the window keeps CakeVPN in the tray (true) or quits it.
+    close_to_tray: AtomicBool,
     /// The speed test in progress: its download and upload use one ticket.
     speed: Mutex<Option<api::SpeedTicket>>,
     /// Bytes of the update downloaded so far, and its size (0 while unknown).
@@ -723,6 +726,89 @@ fn update_progress(state: State<'_, AppState>) -> UpdateProgress {
     }
 }
 
+/// Whether this computer is on a Wi-Fi, and which, for connecting by itself on untrusted ones.
+#[tauri::command]
+async fn current_network() -> netinfo::CurrentNetwork {
+    tokio::task::spawn_blocking(netinfo::current_network).await.unwrap_or_default()
+}
+
+/// A desktop notification.
+#[tauri::command]
+fn notify(app: AppHandle, title: String, body: String) {
+    let _ = app.notification().builder().title(title).body(body).show();
+}
+
+/// Sets the keyboard shortcut that turns the VPN on and off ("Control+Alt+Shift+V"), or none.
+#[tauri::command]
+fn set_shortcut(app: AppHandle, accelerator: Option<String>) -> Result<(), String> {
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
+    let shortcuts = app.global_shortcut();
+    shortcuts.unregister_all().map_err(|e| e.to_string())?;
+    if let Some(accelerator) = accelerator.filter(|a| !a.is_empty()) {
+        let shortcut: Shortcut = accelerator.parse().map_err(|_| "That key combination can't be used.".to_string())?;
+        shortcuts
+            .register(shortcut)
+            .map_err(|_| "That key combination is already used by another app.".to_string())?;
+    }
+    Ok(())
+}
+
+/// What closing the window does: keep CakeVPN in the tray, or quit it.
+#[tauri::command]
+fn set_close_to_tray(state: State<'_, AppState>, enabled: bool) {
+    state.close_to_tray.store(enabled, Ordering::Relaxed);
+}
+
+/// The tray menu, as the window describes it (in its language) whenever it changes.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrayModel {
+    status: String,
+    toggle: String,
+    locations_label: String,
+    locations: Vec<TrayLocation>,
+    open: String,
+    quit: String,
+    tooltip: String,
+}
+
+#[derive(Deserialize)]
+struct TrayLocation {
+    id: String,
+    name: String,
+    chosen: bool,
+    enabled: bool,
+}
+
+#[tauri::command]
+fn set_tray(app: AppHandle, model: TrayModel) -> Result<(), String> {
+    let tray = app.tray_by_id("main").ok_or("no tray icon")?;
+    let build = || -> tauri::Result<Menu<tauri::Wry>> {
+        let status = MenuItem::with_id(&app, "status", &model.status, false, None::<&str>)?;
+        let toggle = MenuItem::with_id(&app, "toggle", &model.toggle, true, None::<&str>)?;
+        let places = Submenu::with_id(&app, "locations", &model.locations_label, !model.locations.is_empty())?;
+        for l in &model.locations {
+            places.append(&CheckMenuItem::with_id(&app, format!("loc:{}", l.id), &l.name, l.enabled, l.chosen, None::<&str>)?)?;
+        }
+        let open = MenuItem::with_id(&app, "open", &model.open, true, None::<&str>)?;
+        let quit = MenuItem::with_id(&app, "quit", &model.quit, true, None::<&str>)?;
+        let line = || PredefinedMenuItem::separator(&app);
+        Menu::with_items(&app, &[&status, &toggle, &places, &line()?, &open, &line()?, &quit])
+    };
+    tray.set_menu(Some(build().map_err(|e| e.to_string())?)).map_err(|e| e.to_string())?;
+    tray.set_tooltip(Some(&model.tooltip)).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Disconnects and leaves: leaving would otherwise keep the tunnel up with no way to see it.
+fn quit(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = helper::ask(Request::Disconnect).await;
+        app.exit(0);
+    });
+}
+
 fn show_window(app: &tauri::AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
         state.visible.store(true, Ordering::Relaxed);
@@ -739,6 +825,16 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec![HIDDEN_ARG])))
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        let _ = app.emit("tray-action", "toggle");
+                    }
+                })
+                .build(),
+        )
         .setup(|app| {
             // Opened at login: stay in the tray. Opened by the person: show the window.
             let shown = !std::env::args().any(|a| a == HIDDEN_ARG);
@@ -757,33 +853,30 @@ pub fn run() {
                 traffic: Mutex::new(Traffic::default()),
                 saved: Mutex::new(None),
                 visible: AtomicBool::new(shown),
+                close_to_tray: AtomicBool::new(true),
                 speed: Mutex::new(None),
                 update_done: Arc::new(AtomicU64::new(0)),
                 update_total: Arc::new(AtomicU64::new(0)),
             });
 
+            // Until the window describes it (in its language), the menu is the simplest one.
             let open = MenuItem::with_id(app, "open", "Open CakeVPN", true, None::<&str>)?;
-            let stop = MenuItem::with_id(app, "disconnect", "Disconnect", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Quit CakeVPN", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &stop, &PredefinedMenuItem::separator(app)?, &quit])?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit CakeVPN", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open, &PredefinedMenuItem::separator(app)?, &quit_item])?;
             let mut tray = TrayIconBuilder::with_id("main").tooltip("CakeVPN").menu(&menu);
             if let Some(icon) = app.default_window_icon() {
                 tray = tray.icon(icon.clone());
             }
+            // Connecting, disconnecting and choosing a location are done by the
+            // window, like its own buttons, so it gets told what was picked.
             tray.on_menu_event(|app, event| match event.id.as_ref() {
                 "open" => show_window(app),
-                "disconnect" => {
-                    tauri::async_runtime::spawn(async {
-                        let _ = helper::ask(Request::Disconnect).await;
-                    });
+                "quit" => quit(app),
+                "toggle" => {
+                    let _ = app.emit("tray-action", "toggle");
                 }
-                "quit" => {
-                    let app = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        // Leaving would otherwise keep the tunnel up with no way to see it.
-                        let _ = helper::ask(Request::Disconnect).await;
-                        app.exit(0);
-                    });
+                id if id.starts_with("loc:") => {
+                    let _ = app.emit("tray-action", id);
                 }
                 _ => {}
             })
@@ -795,6 +888,11 @@ pub fn run() {
             match event {
                 WindowEvent::CloseRequested { api, .. } => {
                     api.prevent_close();
+                    let to_tray = window.try_state::<AppState>().is_none_or(|s| s.close_to_tray.load(Ordering::Relaxed));
+                    if !to_tray {
+                        quit(window.app_handle());
+                        return;
+                    }
                     let _ = window.hide();
                     if let Some(state) = window.try_state::<AppState>() {
                         state.visible.store(false, Ordering::Relaxed);
@@ -824,6 +922,11 @@ pub fn run() {
             delete_invite,
             usage_history,
             dns_check,
+            current_network,
+            notify,
+            set_shortcut,
+            set_close_to_tray,
+            set_tray,
             speed_test_download,
             speed_test_upload,
             check_update,

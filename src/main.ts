@@ -1,4 +1,6 @@
+import { listen } from "@tauri-apps/api/event";
 import { Account, asApiError, backend, ConnectOptions, DayUsage, Location, Overview } from "./backend";
+import { LANGUAGES, locale, pickLanguage, setLanguage, t, watch } from "./i18n";
 import { attachMap, drawMap, mapHtml, markCountries, setPlaces, showPlace } from "./map";
 import { placeOf } from "./places";
 
@@ -6,6 +8,7 @@ import { placeOf } from "./places";
 
 type Screen = "loading" | "code" | "home" | "setup" | "settings";
 type Theme = "system" | "light" | "dark";
+type SettingsTab = "general" | "connection" | "notifications" | "protection" | "skip" | "account" | "invites" | "about";
 
 const saved = {
   get: (key: string) => {
@@ -42,6 +45,10 @@ function savedList(key: string): string[] {
     return [];
   }
 }
+
+const isMac = navigator.userAgent.includes("Mac");
+/** Control+Option+V on a Mac; with Shift on Windows, where Ctrl+Alt is also AltGr for typing. */
+const DEFAULT_SHORTCUT = isMac ? "Control+Alt+V" : "Control+Alt+Shift+V";
 
 const state = {
   screen: "loading" as Screen,
@@ -88,14 +95,41 @@ const state = {
   /** The id of the panel message this person closed. */
   closedAnnouncement: Number(saved.get("closedAnnouncement") || 0),
   speedTest: { phase: "" as "" | "down" | "up", down: null as number | null, up: null as number | null, error: "" },
-  /** Where name lookups go, checked when Settings opens while connected. */
-  dnsPath: "" as "" | "checking" | "vpn" | "outside" | "unknown",
+  /** "auto" follows the computer's language. */
+  lang: saved.get("lang") || "auto",
+  settingsTab: (saved.get("settingsTab") as SettingsTab) || "general",
+  /** Connect by itself on Wi-Fi networks that aren't trusted. */
+  autoWifi: saved.get("autoWifi") === "1",
+  trustedWifi: savedList("trustedWifi"),
+  /** The network this computer is on, read for the setting above. */
+  network: null as { onWifi: boolean; name: string | null } | null,
+  /** A network where the person turned the VPN off: not turned on again by itself there. */
+  declinedNetwork: "",
+  /** Connect again by itself when the connection drops. */
+  autoReconnect: saved.get("autoReconnect") !== "0",
+  /** Closing the window keeps CakeVPN in the tray, or quits it. */
+  closeToTray: saved.get("closeToTray") !== "0",
+  /** The keyboard shortcut that turns the VPN on and off; "" for none. */
+  shortcut: saved.get("shortcut") ?? DEFAULT_SHORTCUT,
+  recordingShortcut: false,
+  shortcutError: "",
+  notifyConnection: saved.get("notifyConnection") !== "0",
+  notifyUpdates: saved.get("notifyUpdates") !== "0",
+  /** Until when a change of the tunnel was asked for by the person or by CakeVPN itself, so it isn't taken for a drop. */
+  expectedUntil: 0,
+  /** The connection dropped by itself, and CakeVPN is bringing it back. */
+  dropped: false,
+  lastConnectedId: "",
+  /** When CakeVPN reconnected by itself lately, to stop after a few tries. */
+  reconnects: [] as number[],
+  /** The update version a notification was shown for. */
+  notifiedUpdate: "",
   /** The last 30 days for the usage graph; null until Settings asked for it. */
   history: null as DayUsage[] | null,
   historyError: "",
   historyList: false,
   /** When things were last checked (ms), for the one ticker that paces everything. */
-  last: { overview: 0, pings: 0, update: 0 },
+  last: { overview: 0, pings: 0, update: 0, network: 0 },
   /** When the account was last asked for, to ask less often while offline. */
   lastRefresh: 0,
   /** Since when (ms) the connected location has been overloaded; 0 when it isn't. */
@@ -388,7 +422,8 @@ function renderSetup() {
   $("#install")?.addEventListener("click", installHelper);
 }
 
-const GEAR = `<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.5 7.5 0 0 0 0-2l2.1-1.6-2-3.5-2.5 1a7.7 7.7 0 0 0-1.7-1l-.4-2.7h-4l-.4 2.7a7.7 7.7 0 0 0-1.7 1l-2.5-1-2 3.5L4.6 11a7.5 7.5 0 0 0 0 2l-2.1 1.6 2 3.5 2.5-1a7.7 7.7 0 0 0 1.7 1l.4 2.7h4l.4-2.7a7.7 7.7 0 0 0 1.7-1l2.5 1 2-3.5zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/></svg>`;
+// Eight even teeth around the middle, so it stands straight.
+const GEAR = `<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" fill-rule="evenodd" d="M9.62 4.68 L10.09 1.98 L13.91 1.98 L14.38 4.68 L15.50 5.14 L17.73 3.56 L20.44 6.27 L18.86 8.50 L19.32 9.62 L22.02 10.09 L22.02 13.91 L19.32 14.38 L18.86 15.50 L20.44 17.73 L17.73 20.44 L15.50 18.86 L14.38 19.32 L13.91 22.02 L10.09 22.02 L9.62 19.32 L8.50 18.86 L6.27 20.44 L3.56 17.73 L5.14 15.50 L4.68 14.38 L1.98 13.91 L1.98 10.09 L4.68 9.62 L5.14 8.50 L3.56 6.27 L6.27 3.56 L8.50 5.14 Z M15.2 12 A3.2 3.2 0 1 0 8.8 12 A3.2 3.2 0 1 0 15.2 12 Z"/></svg>`;
 
 /** How busy a location is: a small bar and the percentage. */
 function loadBadge(l: Location): string {
@@ -454,7 +489,7 @@ function pinsHtml(): string {
               <tspan class="pin-where" x="12" y="13">${esc(where)}</tspan>
             </text>`
           : "";
-      const note = `${l.name} (${place.city})${ping ? ` · ${ping}` : ""}${l.load ? ` · Load ${l.load.percent}%` : ""}${l.online ? "" : " · offline"}`;
+      const note = `${l.name} (${place.city})${ping ? ` · ${ping}` : ""}${l.load ? ` · ${t("Load {n}%", { n: l.load.percent })}` : ""}${l.online ? "" : ` · ${t("offline")}`}`;
       return `<g class="${classes}" data-loc="${esc(l.id)}" data-x="${place.x.toFixed(2)}" data-y="${place.y.toFixed(2)}">
         <title>${esc(note)}</title>
         <circle class="pin-pulse" r="7"></circle>
@@ -670,6 +705,7 @@ function ipsText(account: Account | null): string {
 
 /** Redraws the location parts after the account, pings or choice changed. */
 function updateLocations() {
+  syncTray();
   if (state.screen !== "home") return;
   const list = $("#locations");
   const pins = $("#map-pins");
@@ -686,113 +722,306 @@ function updateLocations() {
   setText("#your-ip", main ? ipsText(state.account) : "");
 }
 
-function renderSettings() {
-  const account = state.account;
-  const helperVersion = state.overview?.status?.version;
+/** Small line icons for the Settings tabs. */
+const TAB_ICONS: Record<SettingsTab, string> = {
+  general: '<path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/>',
+  connection: '<path d="M5 12.5a10 10 0 0 1 14 0M8 15.5a6 6 0 0 1 8 0"/><circle cx="12" cy="19" r="1.2"/><path d="M2 9.5a14 14 0 0 1 20 0"/>',
+  notifications: '<path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20a2 2 0 0 0 4 0"/>',
+  protection: '<path d="M12 3l7 3v5c0 5-3 8-7 10-4-2-7-5-7-10V6z"/><path d="M9 12l2 2 4-4"/>',
+  skip: '<path d="M4 12h9M13 12l-4-4M13 12l-4 4"/><path d="M17 5v14"/>',
+  account: '<circle cx="12" cy="8" r="4"/><path d="M4 20c1.5-4 4.5-6 8-6s6.5 2 8 6"/>',
+  invites: '<rect x="4" y="9" width="16" height="11" rx="2"/><path d="M12 9v11M4 13h16M12 9c-2-4-6-3-5 0M12 9c2-4 6-3 5 0"/>',
+  about: '<circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16v.5"/>',
+};
+
+function settingsTabs(): { id: SettingsTab; label: string }[] {
+  const tabs: { id: SettingsTab; label: string }[] = [
+    { id: "general", label: "General" },
+    { id: "connection", label: "Connection" },
+    { id: "notifications", label: "Notifications" },
+    { id: "protection", label: "Protection" },
+    { id: "skip", label: "Skip the VPN" },
+  ];
+  if (state.account) tabs.push({ id: "account", label: "Account" });
+  if (invitesOn(state.account)) tabs.push({ id: "invites", label: "Invite friends" });
+  tabs.push({ id: "about", label: "Updates & about" });
+  return tabs;
+}
+
+function switchRow(id: string, title: string, note: string, on: boolean): string {
+  return `<label class="row">
+      <span><b>${title}</b><small>${note}</small></span>
+      <input type="checkbox" class="switch" id="${id}" ${on ? "checked" : ""}>
+    </label>`;
+}
+
+/** "⌃⌥V" on a Mac, "Ctrl+Alt+Shift+V" on Windows. */
+function shortcutLabel(accelerator: string): string {
+  if (!accelerator) return "Off";
+  const parts = accelerator.split("+");
+  if (isMac) {
+    const mac: Record<string, string> = { Control: "⌃", Alt: "⌥", Shift: "⇧", Super: "⌘" };
+    return parts.map((p) => mac[p] ?? p).join("");
+  }
+  const win: Record<string, string> = { Control: "Ctrl", Super: "Win" };
+  return parts.map((p) => win[p] ?? p).join("+");
+}
+
+/** The shortcut for a key press, or "" when it isn't one: it needs a modifier and a letter, digit or F-key. */
+function acceleratorOf(e: KeyboardEvent): string {
+  const key = /^Key([A-Z])$/.exec(e.code)?.[1] ?? /^Digit([0-9])$/.exec(e.code)?.[1] ?? (/^F([1-9]|1[0-2])$/.test(e.code) ? e.code : "");
+  const mods = [e.ctrlKey && "Control", e.altKey && "Alt", e.shiftKey && "Shift", e.metaKey && "Super"].filter(Boolean) as string[];
+  if (!key || !mods.length || (mods.length === 1 && mods[0] === "Shift")) return "";
+  return [...mods, key].join("+");
+}
+
+function generalTab(): string {
   const themeButton = (value: Theme, label: string) =>
     `<button class="seg ${state.theme === value ? "active" : ""}" data-theme="${value}">${label}</button>`;
+  const closeButton = (value: boolean, label: string) =>
+    `<button class="seg ${state.closeToTray === value ? "active" : ""}" data-close="${value ? "tray" : "quit"}">${label}</button>`;
+  return `
+    <div class="card list">
+      <div class="row">
+        <span><b>Language</b><small>The language CakeVPN is shown in</small></span>
+        <select id="set-lang" class="select" data-keep>
+          <option value="auto" ${state.lang === "auto" ? "selected" : ""}>${esc(t("Same as this computer"))}</option>
+          ${LANGUAGES.map((l) => `<option value="${l.code}" ${state.lang === l.code ? "selected" : ""}>${esc(l.name)}</option>`).join("")}
+        </select>
+      </div>
+      <div class="row">
+        <span><b>Appearance</b><small>Light, dark, or the same as this computer</small></span>
+        <div class="segmented small" id="theme">${themeButton("system", "Automatic")}${themeButton("light", "Light")}${themeButton("dark", "Dark")}</div>
+      </div>
+    </div>
+    <div class="card list">
+      ${switchRow("set-autostart", "Open at startup", "Start CakeVPN in the tray when your computer starts", state.autostart)}
+      <div class="row">
+        <span><b>Closing the window</b><small>What the window's close button does</small></span>
+        <div class="segmented small" id="close">${closeButton(true, "Keep in the tray")}${closeButton(false, "Quit CakeVPN")}</div>
+      </div>
+      <div class="row">
+        <span><b>Keyboard shortcut</b><small>${
+          state.recordingShortcut ? "Press the keys you want, like Ctrl + Alt + V. Esc to cancel." : "Turns the VPN on and off from any app"
+        }</small></span>
+        <span class="shortcut">
+          <kbd class="${state.recordingShortcut ? "recording" : ""}" data-keep>${state.recordingShortcut ? "…" : esc(shortcutLabel(state.shortcut))}</kbd>
+          ${
+            state.recordingShortcut
+              ? ""
+              : `<button class="outline small-btn" id="shortcut-change">${state.shortcut ? "Change" : "Set"}</button>
+                 ${state.shortcut ? `<button class="link" id="shortcut-off">Turn off</button>` : ""}`
+          }
+        </span>
+      </div>
+      ${state.shortcutError ? `<div class="error">${esc(state.shortcutError)}</div>` : ""}
+    </div>
+    ${state.settingsError ? `<div class="error">${esc(state.settingsError)}</div>` : ""}`;
+}
+
+function connectionTab(): string {
+  const net = state.network;
+  const here = net?.onWifi && net.name ? net.name : "";
+  const trusted = state.trustedWifi;
+  return `
+    <div class="card list">
+      ${switchRow("set-autoconnect", "Connect when CakeVPN opens", "Turns the VPN on as soon as CakeVPN starts", state.autoConnect)}
+      ${switchRow("set-reconnect", "Reconnect by itself", "If the connection drops, CakeVPN connects again", state.autoReconnect)}
+    </div>
+    <div class="card list">
+      ${switchRow("set-autowifi", "Connect on public Wi-Fi", "Turns the VPN on by itself on any Wi-Fi that isn't in your trusted list, like in a café or hotel", state.autoWifi)}
+      <div class="row column">
+        <span><b>Trusted Wi-Fi networks</b><small>On these, CakeVPN doesn't turn on by itself</small></span>
+        <div class="skip-list" data-keep>${
+          trusted.length
+            ? trusted
+                .map((n) => `<span class="chip">📶 ${esc(n)}<button class="trust-remove" data-name="${esc(n)}" title="Remove" aria-label="Remove">×</button></span>`)
+                .join("")
+            : `<span class="muted small">${esc(t("None yet"))}</span>`
+        }</div>
+        ${
+          here && !trusted.includes(here)
+            ? `<button class="outline small-btn" id="trust-here">${esc(t("Trust {wifi}", { wifi: here }))}</button>`
+            : net?.onWifi && !here
+              ? `<span class="muted small">This Mac doesn't tell apps the Wi-Fi's name, so every Wi-Fi counts as public.</span>`
+              : ""
+        }
+      </div>
+    </div>`;
+}
+
+function notificationsTab(): string {
+  return `
+    <div class="card list">
+      ${switchRow("set-notify-connection", "The connection", "When the VPN drops, comes back, turns on by itself on public Wi-Fi, or moves you to another location", state.notifyConnection)}
+      ${switchRow("set-notify-updates", "Updates", "When a new version of CakeVPN is ready", state.notifyUpdates)}
+    </div>
+    <p class="muted small">Notifications only appear while the CakeVPN window isn't in front of you.</p>
+    <button class="outline" id="test-notification">Send a test notification</button>`;
+}
+
+function reconnectNotice(): string {
+  return optionsChanged()
+    ? `<div class="notice reconnect">Reconnect to use your new settings.
+         <button id="reconnect" ${state.busy ? "disabled" : ""}>Reconnect now</button></div>`
+    : "";
+}
+
+function protectionTab(): string {
+  return `
+    <div class="card list">
+      ${switchRow("set-ads", "Block ads and trackers", "Stops known ad and tracking sites, in every app on this computer", state.options.blockAds)}
+      ${switchRow("set-kill", "Kill switch", "If the VPN drops, your internet stays blocked until it reconnects or you disconnect", state.options.killSwitch)}
+    </div>
+    ${reconnectNotice()}`;
+}
+
+function skipTab(): string {
+  return `
+    <div class="card skip">
+      <p class="muted small">These websites and apps use your normal internet instead of the VPN.</p>
+      ${skipListHtml("domain", state.options.bypassDomains)}
+      <form class="skip-add" id="add-domain">
+        <input type="text" id="new-domain" placeholder="Website, like mybank.com" autocomplete="off" spellcheck="false">
+        <button class="outline small-btn">Add</button>
+      </form>
+      ${skipListHtml("app", state.options.bypassApps)}
+      <form class="skip-add" id="add-app">
+        <input type="text" id="new-app" placeholder="${isWindows ? "App, like steam.exe" : "App, like Steam"}" autocomplete="off" spellcheck="false">
+        <button class="outline small-btn">Add</button>
+      </form>
+      ${state.skipError ? `<div class="error">${esc(state.skipError)}</div>` : ""}
+    </div>
+    ${reconnectNotice()}`;
+}
+
+function accountTab(): string {
+  const account = state.account;
+  if (!account) return "";
+  return `
+    <div class="account-grid">
+      <div class="card list">
+        <div class="row"><span><b>Plan</b></span><span class="value">${esc(planLabel(account))}</span></div>
+        <div class="row"><span><b>Used this month</b></span><span class="value">${formatBytes(account.usage.bytes)}</span></div>
+        <div class="row"><span><b>Traffic</b></span><span class="value">Unlimited</span></div>
+        ${account.ips?.ipv4 ? `<div class="row"><span><b>Your IPv4</b></span><span class="value ip" data-keep>${esc(account.ips.ipv4)}</span></div>` : ""}
+        <div class="row"><span><b>Your IPv6</b></span><span class="value ip" ${account.ips?.ipv6 ? "data-keep" : ""}>${
+          account.ips?.ipv6 ? esc(account.ips.ipv6) : "Shared"
+        }</span></div>
+      </div>
+      <div class="card usage-card" id="usage-card">
+        <div class="card-label">Last 30 days</div>
+        <div id="usage-chart">${usageChartHtml()}</div>
+      </div>
+    </div>
+    <button class="danger-outline" id="sign-out">Sign out of this device</button>`;
+}
+
+function aboutTab(): string {
+  const helperVersion = state.overview?.status?.version;
+  return `
+    <div class="card updates">
+      <div class="row"><span><b>Version</b></span><span class="value" data-keep>${esc(state.appVersion)}</span></div>
+      ${
+        state.update
+          ? `<button class="primary" id="settings-update" ${state.updating ? "disabled" : ""}>${
+              state.updating ? esc(updatingText()) : esc(t("Update to {version}", { version: state.update.version }))
+            }</button>
+            ${state.updating ? `<div class="progress-track"><i id="settings-update-fill" style="width:${Math.round((state.updateProgress ?? 0) * 100)}%"></i></div>` : ""}`
+          : `<button class="outline" id="check-update" ${state.updateMessage === "Checking…" ? "disabled" : ""}>Check for updates</button>`
+      }
+      ${state.updateMessage ? `<div class="muted small update-message">${esc(state.updateMessage)}</div>` : ""}
+      <div class="muted small">CakeVPN also checks by itself a few times a day, and shows a banner when an update is ready.</div>
+    </div>
+    <div class="about muted small" data-keep>
+      CakeVPN ${esc(state.appVersion)}${helperVersion ? ` · helper ${esc(helperVersion)}` : ""} · cakevpn.net
+    </div>`;
+}
+
+function settingsPaneHtml(tab: SettingsTab): string {
+  switch (tab) {
+    case "general":
+      return generalTab();
+    case "connection":
+      return connectionTab();
+    case "notifications":
+      return notificationsTab();
+    case "protection":
+      return protectionTab();
+    case "skip":
+      return skipTab();
+    case "account":
+      return accountTab();
+    case "invites":
+      return state.account && invitesOn(state.account) ? invitesHtml(state.account) : "";
+    case "about":
+      return aboutTab();
+  }
+}
+
+function renderSettings() {
+  const tabs = settingsTabs();
+  if (!tabs.some((tab) => tab.id === state.settingsTab)) state.settingsTab = "general";
+  const current = tabs.find((tab) => tab.id === state.settingsTab)!;
   app.innerHTML = `
     <header>
       <button class="icon-btn back" id="back" title="Back">‹</button>
       <div class="brand">Settings</div>
       <div class="head-right"></div>
     </header>
-    <main class="settings screen">
-      <div class="section-label">General</div>
-      <div class="card list">
-        <label class="row">
-          <span><b>Open at startup</b><small>Start CakeVPN in the tray when your computer starts</small></span>
-          <input type="checkbox" class="switch" id="set-autostart" ${state.autostart ? "checked" : ""}>
-        </label>
-        <label class="row">
-          <span><b>Connect automatically</b><small>Connect as soon as CakeVPN opens</small></span>
-          <input type="checkbox" class="switch" id="set-autoconnect" ${state.autoConnect ? "checked" : ""}>
-        </label>
-      </div>
-      ${state.settingsError ? `<div class="error">${esc(state.settingsError)}</div>` : ""}
-
-      <div class="section-label">Protection</div>
-      <div class="card list">
-        <label class="row">
-          <span><b>Block ads and trackers</b><small>Stops known ad and tracking sites, in every app on this computer</small></span>
-          <input type="checkbox" class="switch" id="set-ads" ${state.options.blockAds ? "checked" : ""}>
-        </label>
-        <label class="row">
-          <span><b>Kill switch</b><small>If the VPN drops, your internet stays blocked until it reconnects or you disconnect</small></span>
-          <input type="checkbox" class="switch" id="set-kill" ${state.options.killSwitch ? "checked" : ""}>
-        </label>
-        <div class="row" id="dns-row">${dnsRowHtml()}</div>
-      </div>
-
-      <div class="section-label">Skip the VPN</div>
-      <div class="card skip">
-        <p class="muted small">These websites and apps use your normal internet instead of the VPN.</p>
-        ${skipListHtml("domain", state.options.bypassDomains)}
-        <form class="skip-add" id="add-domain">
-          <input type="text" id="new-domain" placeholder="Website, like mybank.com" autocomplete="off" spellcheck="false">
-          <button class="outline small-btn">Add</button>
-        </form>
-        ${skipListHtml("app", state.options.bypassApps)}
-        <form class="skip-add" id="add-app">
-          <input type="text" id="new-app" placeholder="${isWindows ? "App, like steam.exe" : "App, like Steam"}" autocomplete="off" spellcheck="false">
-          <button class="outline small-btn">Add</button>
-        </form>
-        ${state.skipError ? `<div class="error">${esc(state.skipError)}</div>` : ""}
-      </div>
-      ${
-        optionsChanged()
-          ? `<div class="notice reconnect">Reconnect to use your new settings.
-               <button id="reconnect" ${state.busy ? "disabled" : ""}>Reconnect now</button></div>`
-          : ""
-      }
-
-      <div class="section-label">Appearance</div>
-      <div class="segmented" id="theme">
-        ${themeButton("system", "Automatic")}${themeButton("light", "Light")}${themeButton("dark", "Dark")}
-      </div>
-
-      ${invitesOn(account) ? invitesHtml(account!) : ""}
-
-      ${
-        account
-          ? `<div class="section-label">Account</div>
-      <div class="card list">
-        <div class="row"><span><b>Plan</b></span><span class="value">${esc(planLabel(account))}</span></div>
-        <div class="row"><span><b>Used this month</b></span><span class="value">${formatBytes(account.usage.bytes)}</span></div>
-        <div class="row"><span><b>Traffic</b></span><span class="value">Unlimited</span></div>
-        ${account.ips?.ipv4 ? `<div class="row"><span><b>Your IPv4</b></span><span class="value ip">${esc(account.ips.ipv4)}</span></div>` : ""}
-        <div class="row"><span><b>Your IPv6</b></span><span class="value ip">${
-          account.ips?.ipv6 ? esc(account.ips.ipv6) : "Shared"
-        }</span></div>
-      </div>
-      <div class="section-label">Last 30 days</div>
-      <div class="card usage-card" id="usage-card">${usageChartHtml()}</div>
-      <button class="danger-outline" id="sign-out">Sign out of this device</button>`
-          : ""
-      }
-
-      <div class="section-label">Updates</div>
-      <div class="card updates">
-        <div class="row"><span><b>Version</b></span><span class="value">${esc(state.appVersion)}</span></div>
-        ${
-          state.update
-            ? `<button class="primary" id="settings-update" ${state.updating ? "disabled" : ""}>${
-                state.updating ? esc(updatingText()) : `Update to ${esc(state.update.version)}`
-              }</button>
-              ${state.updating ? `<div class="progress-track"><i id="settings-update-fill" style="width:${Math.round((state.updateProgress ?? 0) * 100)}%"></i></div>` : ""}`
-            : `<button class="outline" id="check-update" ${state.updateMessage === "Checking…" ? "disabled" : ""}>Check for updates</button>`
-        }
-        ${state.updateMessage ? `<div class="muted small update-message">${esc(state.updateMessage)}</div>` : ""}
-        <div class="muted small">CakeVPN also checks by itself a few times a day, and shows a banner when an update is ready.</div>
-      </div>
-
-      <div class="about muted small">
-        CakeVPN ${esc(state.appVersion)}${helperVersion ? ` · helper ${esc(helperVersion)}` : ""}
-      </div>
+    <main class="settings-wide screen">
+      <nav class="settings-nav" aria-label="Settings">
+        ${tabs
+          .map(
+            (tab) => `<button class="nav-item ${tab.id === current.id ? "active" : ""}" data-tab="${tab.id}">
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">${TAB_ICONS[tab.id]}</svg><span>${tab.label}</span>
+            </button>`,
+          )
+          .join("")}
+      </nav>
+      <section class="settings-pane" id="settings-pane">
+        <h2>${current.label}</h2>
+        ${settingsPaneHtml(current.id)}
+      </section>
     </main>`;
 
   $("#back")!.addEventListener("click", closeSettings);
-  $("#set-autostart")!.addEventListener("change", async (e) => {
+  app.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((button) =>
+    button.addEventListener("click", () => {
+      state.settingsTab = button.dataset.tab as SettingsTab;
+      saved.set("settingsTab", state.settingsTab);
+      state.recordingShortcut = false;
+      render();
+      if (state.settingsTab === "connection") readNetwork();
+      if (state.settingsTab === "account" && state.account) loadHistory();
+    }),
+  );
+
+  // General
+  $("#set-lang")?.addEventListener("change", (e) => {
+    state.lang = (e.target as HTMLSelectElement).value;
+    saved.set("lang", state.lang);
+    applyLanguage();
+    render();
+    syncTray(true);
+  });
+  $("#theme")?.addEventListener("click", (e) => {
+    const button = (e.target as HTMLElement).closest<HTMLButtonElement>(".seg");
+    if (!button) return;
+    state.theme = button.dataset.theme as Theme;
+    saved.set("theme", state.theme);
+    applyTheme();
+    $("#theme")!.querySelectorAll(".seg").forEach((el) => el.classList.toggle("active", el === button));
+  });
+  $("#close")?.addEventListener("click", (e) => {
+    const button = (e.target as HTMLElement).closest<HTMLButtonElement>(".seg");
+    if (!button) return;
+    state.closeToTray = button.dataset.close === "tray";
+    saved.set("closeToTray", state.closeToTray ? "1" : "0");
+    backend.setCloseToTray(state.closeToTray).catch(() => {});
+    $("#close")!.querySelectorAll(".seg").forEach((el) => el.classList.toggle("active", el === button));
+  });
+  $("#set-autostart")?.addEventListener("change", async (e) => {
     const box = e.target as HTMLInputElement;
     state.settingsError = "";
     try {
@@ -803,31 +1032,71 @@ function renderSettings() {
     box.checked = state.autostart;
     if (state.settingsError) render();
   });
-  $("#set-autoconnect")!.addEventListener("change", (e) => {
-    state.autoConnect = (e.target as HTMLInputElement).checked;
-    saved.set("autoConnect", state.autoConnect ? "1" : "0");
+  $("#shortcut-change")?.addEventListener("click", () => {
+    state.recordingShortcut = true;
+    state.shortcutError = "";
+    render();
   });
-  $("#theme")!.addEventListener("click", (e) => {
-    const button = (e.target as HTMLElement).closest<HTMLButtonElement>(".seg");
-    if (!button) return;
-    state.theme = button.dataset.theme as Theme;
-    saved.set("theme", state.theme);
-    applyTheme();
-    app.querySelectorAll(".seg").forEach((el) => el.classList.toggle("active", el === button));
+  $("#shortcut-off")?.addEventListener("click", () => useShortcut(""));
+
+  // Connection
+  const toggle = (id: string, apply: (on: boolean) => void) =>
+    $(id)?.addEventListener("change", (e) => apply((e.target as HTMLInputElement).checked));
+  toggle("#set-autoconnect", (on) => {
+    state.autoConnect = on;
+    saved.set("autoConnect", on ? "1" : "0");
   });
-  $("#set-ads")!.addEventListener("change", (e) => {
-    state.options.blockAds = (e.target as HTMLInputElement).checked;
+  toggle("#set-reconnect", (on) => {
+    state.autoReconnect = on;
+    saved.set("autoReconnect", on ? "1" : "0");
+  });
+  toggle("#set-autowifi", (on) => {
+    state.autoWifi = on;
+    saved.set("autoWifi", on ? "1" : "0");
+    state.declinedNetwork = "";
+    if (on) checkPublicWifi();
+  });
+  $("#trust-here")?.addEventListener("click", () => {
+    const name = state.network?.name;
+    if (name && !state.trustedWifi.includes(name)) state.trustedWifi.push(name);
+    saved.set("trustedWifi", JSON.stringify(state.trustedWifi));
+    render();
+  });
+  app.querySelectorAll<HTMLButtonElement>(".trust-remove").forEach((button) =>
+    button.addEventListener("click", () => {
+      state.trustedWifi = state.trustedWifi.filter((n) => n !== button.dataset.name);
+      saved.set("trustedWifi", JSON.stringify(state.trustedWifi));
+      render();
+    }),
+  );
+
+  // Notifications
+  toggle("#set-notify-connection", (on) => {
+    state.notifyConnection = on;
+    saved.set("notifyConnection", on ? "1" : "0");
+  });
+  toggle("#set-notify-updates", (on) => {
+    state.notifyUpdates = on;
+    saved.set("notifyUpdates", on ? "1" : "0");
+  });
+  $("#test-notification")?.addEventListener("click", () =>
+    backend.notify("CakeVPN", t("Notifications work. This is how CakeVPN tells you about your connection.")).catch(() => {}),
+  );
+
+  // Protection and Skip the VPN
+  toggle("#set-ads", (on) => {
+    state.options.blockAds = on;
     saveOptions();
   });
-  $("#set-kill")!.addEventListener("change", (e) => {
-    state.options.killSwitch = (e.target as HTMLInputElement).checked;
+  toggle("#set-kill", (on) => {
+    state.options.killSwitch = on;
     saveOptions();
   });
-  $("#add-domain")!.addEventListener("submit", (e) => {
+  $("#add-domain")?.addEventListener("submit", (e) => {
     e.preventDefault();
     addSkipped("domain", ($("#new-domain") as HTMLInputElement).value);
   });
-  $("#add-app")!.addEventListener("submit", (e) => {
+  $("#add-app")?.addEventListener("submit", (e) => {
     e.preventDefault();
     addSkipped("app", ($("#new-app") as HTMLInputElement).value);
   });
@@ -835,9 +1104,19 @@ function renderSettings() {
     button.addEventListener("click", () => removeSkipped(button.dataset.kind as "domain" | "app", button.dataset.value!)),
   );
   $("#reconnect")?.addEventListener("click", reconnect);
+
+  // Account and invites
   wireUsageChart();
   $("#sign-out")?.addEventListener("click", signOut);
   $("#make-invite")?.addEventListener("click", makeInvite);
+  app.querySelectorAll<HTMLButtonElement>(".copy-code").forEach((button) =>
+    button.addEventListener("click", () => copyCode(button)),
+  );
+  app.querySelectorAll<HTMLButtonElement>(".delete-code").forEach((button) =>
+    button.addEventListener("click", () => deleteInvite(button.dataset.code!)),
+  );
+
+  // Updates
   $("#settings-update")?.addEventListener("click", installUpdate);
   $("#check-update")?.addEventListener("click", async () => {
     state.updateMessage = "Checking…";
@@ -845,12 +1124,34 @@ function renderSettings() {
     await checkForUpdate(true);
     render();
   });
-  app.querySelectorAll<HTMLButtonElement>(".copy-code").forEach((button) =>
-    button.addEventListener("click", () => copyCode(button)),
-  );
-  app.querySelectorAll<HTMLButtonElement>(".delete-code").forEach((button) =>
-    button.addEventListener("click", () => deleteInvite(button.dataset.code!)),
-  );
+}
+
+/** Keeps a shortcut the person pressed while "Change" was on. */
+document.addEventListener("keydown", (e) => {
+  if (!state.recordingShortcut) return;
+  e.preventDefault();
+  if (e.key === "Escape") {
+    state.recordingShortcut = false;
+    render();
+    return;
+  }
+  const accelerator = acceleratorOf(e);
+  if (accelerator) useShortcut(accelerator);
+});
+
+async function useShortcut(accelerator: string) {
+  state.recordingShortcut = false;
+  state.shortcutError = "";
+  try {
+    await backend.setShortcut(accelerator || null);
+    state.shortcut = accelerator;
+    saved.set("shortcut", accelerator);
+  } catch (e) {
+    state.shortcutError = asApiError(e).message;
+    // The one that worked before stays.
+    backend.setShortcut(state.shortcut || null).catch(() => {});
+  }
+  if (state.screen === "settings") render();
 }
 
 // ---------- protection settings ----------
@@ -934,6 +1235,7 @@ function skipListHtml(kind: "domain" | "app", list: string[]): string {
 async function reconnect() {
   const id = state.overview?.locationId ?? chosenLocation()?.id;
   if (!id) return;
+  expectChange();
   state.busy = true;
   render();
   try {
@@ -955,16 +1257,16 @@ async function loadHistory() {
   } catch (e) {
     state.historyError = asApiError(e).message;
   }
-  const card = $("#usage-card");
-  if (card && state.screen === "settings") {
-    card.innerHTML = usageChartHtml();
+  const chart = $("#usage-chart");
+  if (chart && state.screen === "settings") {
+    chart.innerHTML = usageChartHtml();
     wireUsageChart();
   }
 }
 
 function dayLabel(day: string, long = false): string {
   const date = new Date(`${day}T00:00:00`);
-  return date.toLocaleDateString(undefined, long ? { weekday: "short", day: "numeric", month: "short" } : { day: "numeric", month: "short" });
+  return date.toLocaleDateString(locale(), long ? { weekday: "short", day: "numeric", month: "short" } : { day: "numeric", month: "short" });
 }
 
 /**
@@ -1027,9 +1329,9 @@ function wireUsageChart() {
   const days = state.history;
   $("#usage-toggle")?.addEventListener("click", () => {
     state.historyList = !state.historyList;
-    const card = $("#usage-card");
-    if (card) {
-      card.innerHTML = usageChartHtml();
+    const chart = $("#usage-chart");
+    if (chart) {
+      chart.innerHTML = usageChartHtml();
       wireUsageChart();
     }
   });
@@ -1079,8 +1381,7 @@ function invitesHtml(account: Account): string {
     )
     .join("");
   return `
-      <div class="section-label" id="invites">Invite friends</div>
-      <div class="card invites">
+      <div class="card invites" id="invites">
         ${
           capped
             ? `<div class="invite-head">
@@ -1098,49 +1399,173 @@ function invitesHtml(account: Account): string {
       </div>`;
 }
 
+// ---------- language ----------
+
+function applyLanguage() {
+  setLanguage(pickLanguage(state.lang));
+  watch(app);
+}
+
+// ---------- tray menu ----------
+
+let trayShown = "";
+
+/** Keeps the tray menu in step: the status, Connect/Disconnect, and the locations to pick from. */
+function syncTray(force = false) {
+  const account = state.account;
+  const tstate = tunnelState();
+  const connectedTo = account?.locations.find((l) => l.id === state.overview?.locationId);
+  const on = tstate === "connected" || tstate === "connecting";
+  const status =
+    tstate === "connected" && connectedTo
+      ? t("Connected · {place}", { place: connectedTo.name })
+      : tstate === "connecting"
+        ? t("Connecting…")
+        : t("Not connected");
+  const locations = account
+    ? [
+        { id: "best", name: t("Best location"), chosen: state.choice === "best", enabled: true },
+        ...account.locations.map((l) => ({ id: l.id, name: l.name, chosen: state.choice === l.id, enabled: l.online })),
+      ]
+    : [];
+  const model = {
+    status,
+    toggle: on ? t("Disconnect") : t("Connect"),
+    locationsLabel: t("Location"),
+    locations,
+    open: t("Open CakeVPN"),
+    quit: t("Quit CakeVPN"),
+    tooltip: `CakeVPN · ${status}`,
+  };
+  const json = JSON.stringify(model);
+  if (!force && json === trayShown) return;
+  trayShown = json;
+  backend.setTray(model).catch(() => {});
+}
+
+/** The tray menu and the keyboard shortcut do what the window's own buttons do. */
+async function trayAction(action: string) {
+  if (!state.account || state.screen === "setup" || state.busy) return;
+  if (action === "toggle") return togglePower();
+  const id = action.startsWith("loc:") ? action.slice(4) : "";
+  if (!id) return;
+  await chooseLocation(id);
+  if (tunnelState() === "disconnected" || tunnelState() === "failed") await togglePower();
+}
+
+// ---------- notifications ----------
+
+/** A desktop notification, only while the window isn't in front (then the window shows it). */
+function notifyUser(kind: "connection" | "update", title: string, body: string) {
+  if (kind === "connection" && !state.notifyConnection) return;
+  if (kind === "update" && !state.notifyUpdates) return;
+  if (windowInFront()) return;
+  backend.notify(title, body).catch(() => {});
+}
+
+// ---------- the connection by itself ----------
+
+/** The next change of the tunnel was asked for, by the person or by CakeVPN: it isn't a drop. */
+function expectChange() {
+  state.expectedUntil = Date.now() + 20_000;
+}
+
+/**
+ * Notices the tunnel dropping by itself, says so, and brings it back when
+ * "Reconnect by itself" is on (at most 3 times in 5 minutes).
+ */
+function watchConnection(before: string, after: string) {
+  if (after === "connected") {
+    if (state.overview?.locationId) state.lastConnectedId = state.overview.locationId;
+    if (state.dropped && before !== "connected") {
+      state.dropped = false;
+      const place = state.account?.locations.find((l) => l.id === state.overview?.locationId)?.name ?? "";
+      notifyUser("connection", t("CakeVPN is connected again"), place ? t("Connected to {place}.", { place }) : "");
+    }
+    return;
+  }
+  if (before !== "connected" || Date.now() < state.expectedUntil) return;
+  state.dropped = true;
+  const coming = state.autoReconnect || state.options.killSwitch;
+  notifyUser(
+    "connection",
+    t("The VPN connection dropped"),
+    coming ? t("CakeVPN is connecting again.") : t("Open CakeVPN to connect again."),
+  );
+  if ((after === "failed" || after === "disconnected") && state.autoReconnect) reconnectSoon();
+}
+
+function reconnectSoon() {
+  const now = Date.now();
+  state.reconnects = state.reconnects.filter((at) => now - at < 5 * 60_000);
+  if (state.reconnects.length >= 3) return;
+  state.reconnects.push(now);
+  setTimeout(async () => {
+    const tstate = tunnelState();
+    const id = state.lastConnectedId || chosenLocation()?.id;
+    if (!state.dropped || !id || tstate === "connected" || tstate === "connecting" || state.busy) return;
+    expectChange();
+    try {
+      await connectTo(id);
+    } catch {
+      /* the next check notices it is still down */
+    }
+    await refreshOverview();
+    if (state.screen === "home") updateHome();
+  }, 3000);
+}
+
+/** Reads the network this computer is on (for Settings and for public Wi-Fi). */
+async function readNetwork() {
+  try {
+    state.network = await backend.currentNetwork();
+  } catch {
+    state.network = null;
+  }
+  if (state.screen === "settings" && state.settingsTab === "connection") render();
+}
+
+/** On a Wi-Fi that isn't trusted, turns the VPN on by itself (once per network, if the person turns it off again). */
+async function checkPublicWifi() {
+  if (!state.autoWifi || !state.account || state.busy || state.overview?.helper !== "ok") return;
+  let net;
+  try {
+    net = await backend.currentNetwork();
+  } catch {
+    return;
+  }
+  state.network = net;
+  if (!net.onWifi) {
+    state.declinedNetwork = "";
+    return;
+  }
+  const key = net.name ?? "?";
+  if ((net.name && state.trustedWifi.includes(net.name)) || state.declinedNetwork === key) return;
+  if (tunnelState() !== "disconnected") return;
+  const loc = chosenLocation();
+  if (!loc) return;
+  state.declinedNetwork = key;
+  expectChange();
+  try {
+    await connectTo(loc.id);
+    notifyUser(
+      "connection",
+      t("CakeVPN turned on"),
+      net.name ? t("{wifi} is a public Wi-Fi, so the VPN is on.", { wifi: net.name }) : t("This Wi-Fi isn't trusted, so the VPN is on."),
+    );
+  } catch {
+    /* tried once on this network */
+  }
+  await refreshOverview();
+  if (state.screen === "home") updateHome();
+}
+
 // ---------- actions ----------
 
 function setScreen(screen: Screen) {
   if (state.screen === screen) return;
   state.screen = screen;
   render();
-}
-
-/** The Settings row that says where the names of the sites you open are looked up. */
-function dnsRowHtml(): string {
-  const note = {
-    "": "Checked while the VPN is connected",
-    checking: "Checking…",
-    vpn: "Through the VPN",
-    outside: "Not through the VPN",
-    unknown: "Couldn't be checked right now",
-  }[state.dnsPath];
-  const more =
-    state.dnsPath === "outside"
-      ? "The network you're on is still answering them, so it can see which sites you open. Disconnect and connect again; if this stays, update CakeVPN."
-      : "The names of the sites you open are looked up through the VPN, so the network you're on doesn't see them";
-  return `<span><b>Name lookups (DNS)</b><small>${more}</small></span>
-    <span class="value dns-${state.dnsPath || "idle"}">${note}</span>`;
-}
-
-/** Checks where name lookups go and shows it in Settings. */
-async function checkDns() {
-  const show = () => {
-    const row = $("#dns-row");
-    if (row) row.innerHTML = dnsRowHtml();
-  };
-  if (tunnelState() !== "connected") {
-    state.dnsPath = "";
-    return show();
-  }
-  state.dnsPath = "checking";
-  show();
-  try {
-    state.dnsPath = await backend.dnsCheck();
-  } catch {
-    state.dnsPath = "unknown";
-  }
-  show();
 }
 
 async function openSettings(toInvites = false) {
@@ -1154,11 +1579,12 @@ async function openSettings(toInvites = false) {
   state.settingsError = "";
   state.inviteError = "";
   state.skipError = "";
+  if (toInvites) state.settingsTab = "invites";
+  state.recordingShortcut = false;
   setScreen("settings");
-  // The usage graph is only asked for while Settings is open.
-  if (state.account) loadHistory();
-  checkDns();
-  if (toInvites) $("#invites")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  // The usage graph is only asked for while its tab is open.
+  if (state.settingsTab === "account" && state.account) loadHistory();
+  if (state.settingsTab === "connection") readNetwork();
 }
 
 async function checkForUpdate(fromButton = false) {
@@ -1166,6 +1592,10 @@ async function checkForUpdate(fromButton = false) {
   try {
     const found = await backend.checkUpdate();
     state.update = found ? { version: found.version } : null;
+    if (found && state.notifiedUpdate !== found.version) {
+      state.notifiedUpdate = found.version;
+      notifyUser("update", t("CakeVPN {version} is ready", { version: found.version }), t("Open CakeVPN to install it."));
+    }
     state.updateMessage = fromButton && !found ? "You have the newest version." : "";
   } catch (e) {
     state.updateMessage = fromButton ? asApiError(e).message : "";
@@ -1230,7 +1660,6 @@ async function makeInvite() {
   }
   state.busy = false;
   render();
-  $("#invites")?.scrollIntoView({ block: "start" });
 }
 
 let confirmTimer: number | undefined;
@@ -1241,7 +1670,6 @@ async function deleteInvite(code: string) {
   if (state.confirmDelete !== code) {
     state.confirmDelete = code;
     render();
-    $("#invites")?.scrollIntoView({ block: "start" });
     confirmTimer = window.setTimeout(() => {
       state.confirmDelete = "";
       if (state.screen === "settings") render();
@@ -1259,7 +1687,6 @@ async function deleteInvite(code: string) {
   }
   state.busy = false;
   render();
-  $("#invites")?.scrollIntoView({ block: "start" });
 }
 
 async function copyCode(button: HTMLButtonElement) {
@@ -1302,7 +1729,8 @@ async function submitCode(code: string) {
     if (err.error === "locked" && err.retryAfter) {
       state.lockedUntil = Date.now() + err.retryAfter * 1000;
     } else if (err.error === "wrong_code" && err.triesLeft != null) {
-      state.codeError = `That code is not valid. ${err.triesLeft} ${err.triesLeft === 1 ? "try" : "tries"} left.`;
+      state.codeError =
+        err.triesLeft === 1 ? "That code is not valid. 1 try left." : `That code is not valid. ${err.triesLeft} tries left.`;
     } else {
       state.codeError = err.message;
     }
@@ -1330,9 +1758,10 @@ function protectionText(): string {
   }
   const skipped = applied.bypassDomains.length + applied.bypassApps.length;
   return [
-    applied.blockAds && "Ads blocked",
-    applied.killSwitch && "Kill switch on",
-    skipped > 0 && `${skipped} skip${skipped === 1 ? "s" : ""} the VPN`,
+    applied.blockAds && t("Ads blocked"),
+    applied.killSwitch && t("Kill switch on"),
+    skipped === 1 && t("1 skips the VPN"),
+    skipped > 1 && t("{n} skip the VPN", { n: skipped }),
   ]
     .filter(Boolean)
     .join(" · ");
@@ -1385,6 +1814,10 @@ async function runSpeedTest() {
 
 async function togglePower() {
   const tstate = tunnelState();
+  expectChange();
+  state.dropped = false;
+  // Turned off on a public Wi-Fi: it stays off there.
+  if ((tstate === "connected" || tstate === "connecting") && state.network?.onWifi) state.declinedNetwork = state.network.name ?? "?";
   state.busy = true;
   state.actionError = "";
   state.moveNotice = "";
@@ -1424,6 +1857,7 @@ async function chooseLocation(id: string) {
   if (tunnelState() === "connected") {
     const loc = chosenLocation();
     if (loc && loc.id !== state.overview?.locationId) {
+      expectChange();
       state.busy = true;
       updateHome();
       try {
@@ -1439,6 +1873,7 @@ async function chooseLocation(id: string) {
 }
 
 async function signOut() {
+  expectChange();
   await backend.signOut();
   state.account = null;
   state.codeNotice = "";
@@ -1472,7 +1907,10 @@ function handleSignedOut(message: string) {
 async function refreshOverview() {
   try {
     const ov = await backend.overview();
+    const before = tunnelState();
     state.overview = ov;
+    watchConnection(before, tunnelState());
+    syncTray();
     const s = ov.status;
     if (s && s.state === "connected") {
       const now = Date.now();
@@ -1504,6 +1942,7 @@ async function refreshAccount() {
   try {
     state.account = await backend.refreshAccount();
     state.offline = false;
+    syncTray();
     updateLocations();
     updateHome();
     await leaveOverloadedLocation();
@@ -1536,6 +1975,7 @@ async function leaveOverloadedLocation() {
   if (!current || !target) return;
   state.overloadSince = 0;
   state.movedAt = Date.now();
+  expectChange();
   followMove(target);
   state.busy = true;
   updateLocations();
@@ -1543,6 +1983,7 @@ async function leaveOverloadedLocation() {
   try {
     await connectTo(target.id);
     state.moveNotice = moveMessage(current, target);
+    notifyUser("connection", t("CakeVPN moved you"), state.moveNotice);
   } catch (e) {
     state.actionError = asApiError(e).message;
   }
@@ -1568,7 +2009,13 @@ async function refreshPings() {
 
 async function start() {
   applyTheme();
+  applyLanguage();
   render();
+  listen<string>("tray-action", (e) => trayAction(e.payload)).catch(() => {});
+  backend.setCloseToTray(state.closeToTray).catch(() => {});
+  if (state.shortcut) {
+    backend.setShortcut(state.shortcut).catch((e) => (state.shortcutError = asApiError(e).message));
+  }
   try {
     const session = await backend.loadSession();
     state.account = session.account;
@@ -1587,7 +2034,9 @@ async function start() {
   render();
   await refreshPings();
 
+  syncTray(true);
   if (state.autoConnect && state.screen === "home" && tunnelState() === "disconnected") togglePower();
+  else checkPublicWifi();
   checkForUpdate();
   state.last.overview = state.last.pings = Date.now();
   setInterval(tick, 1000);
@@ -1618,6 +2067,8 @@ const PACE = {
   overview: { inFront: 900, visible: 10_000, hidden: 10_000 },
   account: { visible: 10_000, hiddenConnected: 60_000, hidden: 5 * 60_000, unreachable: 30_000 },
   pings: 30_000,
+  /** Public Wi-Fi: often enough to turn the VPN on soon after joining one. */
+  network: 15_000,
   update: 3 * 60 * 60_000,
   updateOnReturn: 30 * 60_000,
 };
@@ -1663,6 +2114,10 @@ async function tick(returned = false) {
     if (looking && now - state.last.pings >= PACE.pings) {
       state.last.pings = now;
       await refreshPings();
+    }
+    if (state.autoWifi && now - state.last.network >= PACE.network) {
+      state.last.network = now;
+      await checkPublicWifi();
     }
     if (now - state.last.update >= PACE.update || (returned && now - state.last.update >= PACE.updateOnReturn)) {
       await checkForUpdate();

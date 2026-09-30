@@ -94,10 +94,20 @@ export interface Overview {
   helper: "ok" | "missing" | "outdated";
   status: Status | null;
   /** What is wrong and whose problem it is: the Wi-Fi, the internet connection, a busy location or the VPN. */
-  banner: { kind: "wifi" | "internet" | "load" | "vpn"; message: string } | null;
+  banner: { kind: "wifi" | "internet" | "load" | "vpn" | "dns"; message: string } | null;
   locationId: string | null;
   /** False while the window is hidden and CakeVPN sits in the tray. */
   windowVisible?: boolean;
+}
+
+export interface TrayModel {
+  status: string;
+  toggle: string;
+  locationsLabel: string;
+  locations: { id: string; name: string; chosen: boolean; enabled: boolean }[];
+  open: string;
+  quit: string;
+  tooltip: string;
 }
 
 export const backend = {
@@ -117,8 +127,16 @@ export const backend = {
   deleteInvite: (code: string) => invoke<Account>("delete_invite", { code }),
   /** The last 30 days, oldest first. */
   usageHistory: () => invoke<DayUsage[]>("usage_history"),
-  /** Where this computer's name lookups go right now. */
-  dnsCheck: () => invoke<"vpn" | "outside" | "unknown">("dns_check"),
+  /** Whether this computer is on a Wi-Fi, and its name when the system says. */
+  currentNetwork: () => invoke<{ onWifi: boolean; name: string | null }>("current_network"),
+  /** A desktop notification. */
+  notify: (title: string, body: string) => invoke<void>("notify", { title, body }),
+  /** The keyboard shortcut that turns the VPN on and off ("Control+Alt+Shift+V"), or null for none. */
+  setShortcut: (accelerator: string | null) => invoke<void>("set_shortcut", { accelerator }),
+  /** Closing the window keeps CakeVPN in the tray (true) or quits it. */
+  setCloseToTray: (enabled: boolean) => invoke<void>("set_close_to_tray", { enabled }),
+  /** What the tray menu shows. */
+  setTray: (model: TrayModel) => invoke<void>("set_tray", { model }),
   /** Starts a speed test (the server may refuse: once a minute, a few a day) and returns the download Mbps. */
   speedTestDownload: () => invoke<number>("speed_test_download"),
   /** The upload half of the test just started, in Mbps. */

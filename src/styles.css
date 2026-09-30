@@ -1608,3 +1608,176 @@ label.row {
 #dns-row .value {
   white-space: nowrap;
 }
+
+/* ---------- settings in the wide window: tabs on the left, one page at a time ---------- */
+
+#app[data-screen="settings"] {
+  height: 100%;
+}
+
+.settings-wide {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 208px minmax(0, 1fr);
+  gap: 22px;
+  padding: 6px 20px 0;
+}
+
+.settings-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-self: start;
+  padding-top: 4px;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  color: var(--muted);
+  font-weight: 600;
+  text-align: left;
+  transition: background-color 0.2s var(--ease), color 0.2s var(--ease), box-shadow 0.2s var(--ease);
+}
+
+.nav-item svg {
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.nav-item:hover {
+  background: var(--line);
+  color: var(--text);
+}
+
+.nav-item.active {
+  background: var(--card);
+  color: var(--pink-dark);
+  box-shadow: var(--shadow);
+}
+
+/* The page scrolls by itself; the tabs stay where they are. */
+.settings-pane {
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  padding: 0 10px 20px 4px;
+  margin-right: -10px;
+}
+
+.settings-pane > * {
+  max-width: 640px;
+}
+
+.settings-pane h2 {
+  margin: 4px 0 12px;
+  font-size: 21px;
+}
+
+.settings-pane .card {
+  margin: 0 0 14px;
+}
+
+.settings-pane .danger-outline,
+.settings-pane > .outline {
+  width: auto;
+  padding: 10px 18px;
+  margin-top: 0;
+}
+
+.settings-pane .about {
+  text-align: left;
+  margin-top: 4px;
+}
+
+.row.column {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.row.column .small-btn {
+  align-self: flex-start;
+}
+
+.segmented.small {
+  display: inline-grid;
+  grid-template-columns: repeat(var(--count, 3), auto);
+  box-shadow: none;
+  background: var(--bg);
+  flex: none;
+}
+
+#close.segmented.small {
+  --count: 2;
+}
+
+.segmented.small .seg {
+  padding: 6px 12px;
+}
+
+.select {
+  flex: none;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--bg);
+  border: 1.5px solid var(--line);
+  border-radius: 10px;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+
+.select:focus {
+  outline: none;
+  border-color: var(--pink);
+}
+
+.shortcut {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.shortcut kbd {
+  font: 600 13px ui-monospace, "SF Mono", Consolas, monospace;
+  padding: 5px 10px;
+  border-radius: 8px;
+  background: var(--bg);
+  border: 1.5px solid var(--line);
+  min-width: 44px;
+  text-align: center;
+}
+
+.shortcut kbd.recording {
+  border-color: var(--pink);
+  color: var(--pink-dark);
+  animation: record-blink 1s ease-in-out infinite;
+}
+
+@keyframes record-blink {
+  50% {
+    border-color: var(--line);
+  }
+}
+
+.account-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.account-grid .card {
+  margin: 0 0 14px;
+}

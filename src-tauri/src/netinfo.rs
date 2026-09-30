@@ -106,6 +106,42 @@ fn parse_system_profiler(text: &str) -> Option<Signal> {
     })
 }
 
+/// Whether this computer is on a Wi-Fi now, and which one when the system
+/// says (a Mac may keep the name private).
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentNetwork {
+    pub on_wifi: bool,
+    pub name: Option<String>,
+}
+
+fn mac_wifi_device() -> String {
+    let ports = run("networksetup", &["-listallhardwareports"]).unwrap_or_default();
+    ports
+        .split("Hardware Port: ")
+        .find(|block| block.starts_with("Wi-Fi") || block.starts_with("AirPort"))
+        .and_then(|block| block.lines().find_map(|l| l.strip_prefix("Device: ")))
+        .unwrap_or("en0")
+        .trim()
+        .to_string()
+}
+
+pub fn current_network() -> CurrentNetwork {
+    if cfg!(windows) {
+        // Windows names the network only while the Wi-Fi is connected.
+        let name = run("netsh", &["wlan", "show", "interfaces"]).as_deref().and_then(parse_netsh);
+        CurrentNetwork { on_wifi: name.is_some(), name }
+    } else if cfg!(target_os = "macos") {
+        let device = mac_wifi_device();
+        // The Wi-Fi is in use when it has an address, whether or not its name may be read.
+        let on_wifi = run("ipconfig", &["getifaddr", &device]).is_some_and(|a| !a.trim().is_empty());
+        let name = run("networksetup", &["-getairportnetwork", &device]).as_deref().and_then(parse_networksetup);
+        CurrentNetwork { on_wifi: on_wifi || name.is_some(), name }
+    } else {
+        CurrentNetwork::default()
+    }
+}
+
 /// Reads the Wi-Fi's name. With `signal` it also reads how strong the Wi-Fi
 /// is, which on a Mac takes a slower system tool.
 pub fn network(signal: bool) -> Network {
@@ -116,14 +152,7 @@ pub fn network(signal: bool) -> Network {
             signal: text.as_deref().filter(|_| signal).and_then(parse_netsh_signal),
         }
     } else if cfg!(target_os = "macos") {
-        let ports = run("networksetup", &["-listallhardwareports"]).unwrap_or_default();
-        let device = ports
-            .split("Hardware Port: ")
-            .find(|block| block.starts_with("Wi-Fi") || block.starts_with("AirPort"))
-            .and_then(|block| block.lines().find_map(|l| l.strip_prefix("Device: ")))
-            .unwrap_or("en0")
-            .trim()
-            .to_string();
+        let device = mac_wifi_device();
         Network {
             wifi_name: run("networksetup", &["-getairportnetwork", &device]).as_deref().and_then(parse_networksetup),
             signal: if signal {
