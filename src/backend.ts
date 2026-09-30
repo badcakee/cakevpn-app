@@ -70,7 +70,8 @@ export interface Overview {
 }
 
 export const backend = {
-  loadSession: () => invoke<{ signedIn: boolean; account: Account | null }>("load_session"),
+  /** `offline` means the server couldn't be reached and `account` is the copy saved earlier. */
+  loadSession: () => invoke<{ signedIn: boolean; account: Account | null; offline?: boolean }>("load_session"),
   redeem: (code: string) => invoke<Account>("redeem", { code }),
   refreshAccount: () => invoke<Account>("refresh_account"),
   signOut: () => invoke<void>("sign_out"),

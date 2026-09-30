@@ -51,6 +51,10 @@ const state = {
   speed: { up: 0, down: 0 },
   /** Why CakeVPN moved to another location, shown under the button. */
   moveNotice: "",
+  /** The server can't be reached (some networks block it); the saved account is in use. */
+  offline: false,
+  /** When the account was last asked for, to ask less often while offline. */
+  lastRefresh: 0,
   /** Since when (ms) the connected location has been overloaded; 0 when it isn't. */
   overloadSince: 0,
   /** The invite code whose Delete button was pressed once and now asks to confirm. */
@@ -334,6 +338,7 @@ function renderHome() {
       <div class="status-line" id="status-line"></div>
       <div class="error hidden" id="action-error"></div>
       <div class="notice hidden" id="move-notice"></div>
+      <div class="notice hidden" id="offline-notice">CakeVPN's sign-in server can't be reached on this network. You can still connect with your saved details.</div>
       <div class="banner" id="banner"><span class="banner-icon"></span><span class="banner-text"></span></div>
 
       <div class="card">
@@ -406,6 +411,8 @@ function updateHome() {
   const moved = $("#move-notice")!;
   moved.classList.toggle("hidden", !state.moveNotice);
   setText("#move-notice", state.moveNotice);
+  // Once connected the server is reached through the VPN, so the note goes away.
+  $("#offline-notice")!.classList.toggle("hidden", !state.offline || tstate === "connected" || tstate === "connecting");
 
   const banner = $("#banner")!;
   const b = state.overview?.banner;
@@ -862,13 +869,22 @@ async function refreshOverview() {
 
 async function refreshAccount() {
   if (!state.account) return;
+  // While the server can't be reached and the VPN is off, ask only every 30 seconds.
+  const now = Date.now();
+  if (state.offline && tunnelState() !== "connected" && now - state.lastRefresh < 30_000) return;
+  state.lastRefresh = now;
   try {
     state.account = await backend.refreshAccount();
+    state.offline = false;
     updateLocations();
     updateHome();
     await leaveOverloadedLocation();
   } catch (e) {
     const err = asApiError(e);
+    if (err.error === "offline" && !state.offline) {
+      state.offline = true;
+      updateHome();
+    }
     if (err.error === "signed_out") handleSignedOut("You were signed out because this code was used on another device.");
     if (err.error === "code_disabled") handleSignedOut("This code has been turned off. Ask for a new one.");
   }
@@ -924,6 +940,8 @@ async function start() {
   try {
     const session = await backend.loadSession();
     state.account = session.account;
+    state.offline = !!session.offline;
+    state.lastRefresh = Date.now();
     state.screen = session.signedIn && session.account ? "home" : "code";
   } catch (e) {
     const err = asApiError(e);

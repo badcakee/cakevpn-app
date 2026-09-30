@@ -57,6 +57,8 @@ struct AppState {
     location: Mutex<Option<String>>,
     wifi: Mutex<Option<(Instant, netinfo::Network)>>,
     traffic: Mutex<Traffic>,
+    /// The connection details last saved to disk, to save them only when they change.
+    saved: Mutex<Option<String>>,
 }
 
 #[derive(Serialize)]
@@ -64,6 +66,8 @@ struct AppState {
 struct Session {
     signed_in: bool,
     account: Option<Account>,
+    /// The server couldn't be reached, so `account` is the copy saved earlier.
+    offline: bool,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -116,17 +120,46 @@ fn not_signed_in() -> ApiError {
     ApiError::new("signed_out", "Enter your code to sign in.")
 }
 
+/// The account as it is kept on disk: unlike what the window gets, it
+/// includes each location's connection details.
+fn account_for_disk(account: &Account) -> serde_json::Value {
+    let mut value = serde_json::to_value(account).unwrap_or_default();
+    if let Some(locations) = value["locations"].as_array_mut() {
+        for (saved, location) in locations.iter_mut().zip(&account.locations) {
+            saved["connect"] = serde_json::to_value(&location.connect).unwrap_or_default();
+        }
+    }
+    value
+}
+
+/// Saves the account for networks where the server can't be reached. It is
+/// written again only when the connection details changed.
+async fn remember_account(state: &AppState, token: &str, account: &Account) {
+    let on_disk = account_for_disk(account);
+    let details = on_disk["locations"].to_string();
+    let mut saved = state.saved.lock().await;
+    if saved.as_deref() == Some(details.as_str()) {
+        return;
+    }
+    if store::save_account(&state.data_dir, token, on_disk.to_string().as_bytes()).is_ok() {
+        *saved = Some(details);
+    }
+}
+
 async fn fetch_account(state: &AppState) -> Result<Account, ApiError> {
     let token = store::token().ok_or_else(not_signed_in)?;
     match api::account(&token).await {
         Ok(account) => {
             *state.account.lock().await = Some(account.clone());
+            remember_account(state, &token, &account).await;
             Ok(account)
         }
         Err(e) => {
             if e.error == "signed_out" {
                 // Signed in somewhere else, or the code was deleted: forget the token and stop the tunnel.
                 store::clear_token();
+                store::forget_account(&state.data_dir);
+                *state.saved.lock().await = None;
                 *state.account.lock().await = None;
                 let _ = helper::ask(Request::Disconnect).await;
             }
@@ -135,13 +168,33 @@ async fn fetch_account(state: &AppState) -> Result<Account, ApiError> {
     }
 }
 
+/// How long starting and connecting wait for the server before they go on
+/// with the saved account.
+const SERVER_WAIT: Duration = Duration::from_secs(6);
+
 #[tauri::command]
 async fn load_session(state: State<'_, AppState>) -> Result<Session, ApiError> {
-    if store::token().is_none() {
-        return Ok(Session { signed_in: false, account: None });
+    let Some(token) = store::token() else {
+        return Ok(Session { signed_in: false, account: None, offline: false });
+    };
+    let error = match tokio::time::timeout(SERVER_WAIT, fetch_account(&state)).await {
+        Ok(Ok(account)) => return Ok(Session { signed_in: true, account: Some(account), offline: false }),
+        // Signed out or turned off: the saved copy must not be used.
+        Ok(Err(e)) if e.error == "signed_out" || e.error == "code_disabled" => return Err(e),
+        Ok(Err(e)) => e,
+        Err(_) => ApiError::new("offline", "Can't reach CakeVPN. Check your internet connection and try again."),
+    };
+    // Some networks block CakeVPN's sign-in port but not the VPN itself, so
+    // the account saved last time still lets this device connect.
+    let saved = store::saved_account(&state.data_dir, &token)
+        .and_then(|raw| serde_json::from_slice::<Account>(&raw).ok());
+    match saved {
+        Some(account) => {
+            *state.account.lock().await = Some(account.clone());
+            Ok(Session { signed_in: true, account: Some(account), offline: true })
+        }
+        None => Err(error),
     }
-    let account = fetch_account(&state).await?;
-    Ok(Session { signed_in: true, account: Some(account) })
 }
 
 #[tauri::command]
@@ -179,17 +232,24 @@ async fn sign_out(state: State<'_, AppState>) -> Result<(), String> {
         api::sign_out(&token).await;
     }
     store::clear_token();
+    store::forget_account(&state.data_dir);
+    *state.saved.lock().await = None;
     *state.account.lock().await = None;
     Ok(())
 }
 
 #[tauri::command]
 async fn connect(location_id: String, state: State<'_, AppState>) -> Result<Status, String> {
-    // Always use fresh details: signing in elsewhere changes them.
-    let account = match fetch_account(&state).await {
-        Ok(a) => a,
-        Err(e) if e.error == "offline" => state.account.lock().await.clone().ok_or(e.message)?,
-        Err(e) => return Err(e.message),
+    // Use fresh details when the server answers: signing in elsewhere changes them.
+    let account = match tokio::time::timeout(SERVER_WAIT, fetch_account(&state)).await {
+        Ok(Ok(a)) => a,
+        Ok(Err(e)) if e.error != "offline" => return Err(e.message),
+        _ => state
+            .account
+            .lock()
+            .await
+            .clone()
+            .ok_or("Can't reach CakeVPN. Check your internet connection and try again.")?,
     };
     let location = account
         .locations
@@ -380,6 +440,7 @@ pub fn run() {
                 location: Mutex::new(None),
                 wifi: Mutex::new(None),
                 traffic: Mutex::new(Traffic::default()),
+                saved: Mutex::new(None),
             });
 
             let open = MenuItem::with_id(app, "open", "Open CakeVPN", true, None::<&str>)?;
@@ -490,6 +551,23 @@ mod tests {
     fn nothing_while_disconnected() {
         let s = Status { state: TunnelState::Disconnected, quality: Quality { gateway_loss: Some(1.0), ..Default::default() }, ..Default::default() };
         assert_eq!(banner(&s, None, None, false), None);
+    }
+
+    #[test]
+    fn saved_account_keeps_the_connection_details() {
+        let account: Account = serde_json::from_str(
+            r#"{"plan":{"id":"free","name":"Free","mbps":25},"usage":{"month":"2026-09","bytes":5},
+                "locations":[{"id":"main","name":"France","country":"FR","online":true,"load":null,
+                  "connect":{"host":"147.135.128.62","port":443,"uuid":"24c7a93b-bbc7-4f9f-bccb-2bfe437c2fbb",
+                    "flow":"xtls-rprx-vision","sni":"www.google.com","publicKey":"k","shortId":"ab","fingerprint":"chrome"}}]}"#,
+        )
+        .unwrap();
+        // The window never gets the details...
+        assert!(serde_json::to_value(&account).unwrap()["locations"][0].get("connect").is_none());
+        // ...but the copy on disk has them, and reads back as an account.
+        let back: Account = serde_json::from_value(account_for_disk(&account)).unwrap();
+        assert_eq!(back.locations[0].connect, account.locations[0].connect);
+        assert!(back.locations[0].connect.is_some());
     }
 
     #[test]
