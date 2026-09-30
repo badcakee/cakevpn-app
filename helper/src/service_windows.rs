@@ -136,6 +136,13 @@ fn stop_fully(service: &Service) {
     if wait_for(service, ServiceState::Stopped, STOP_WAIT) {
         return;
     }
+    // Ending it must not make Windows start it again (see restart_after_failures).
+    let _ = service.update_failure_actions(ServiceFailureActions {
+        reset_period: ServiceFailureResetPeriod::Never,
+        reboot_msg: None,
+        command: None,
+        actions: Some(vec![]),
+    });
     if let Some(pid) = status.process_id {
         let _ = std::process::Command::new("taskkill")
             .args(["/F", "/T", "/PID", &pid.to_string()])
@@ -220,7 +227,7 @@ pub fn install() -> windows_service::Result<()> {
 
 pub fn uninstall() -> windows_service::Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(WINDOWS_SERVICE, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE)?;
+    let service = manager.open_service(WINDOWS_SERVICE, ACCESS | ServiceAccess::DELETE)?;
     stop_fully(&service);
     service.delete()
 }
