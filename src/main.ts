@@ -22,6 +22,16 @@ const saved = {
   },
 };
 
+/** The pings measured last time, so they are there when the app opens with the VPN already on. */
+function savedPings(): Record<string, number | null> {
+  try {
+    const pings = JSON.parse(saved.get("pings") || "{}");
+    return pings && typeof pings === "object" ? pings : {};
+  } catch {
+    return {};
+  }
+}
+
 function savedList(key: string): string[] {
   try {
     const list = JSON.parse(saved.get(key) || "[]");
@@ -35,7 +45,9 @@ const state = {
   screen: "loading" as Screen,
   account: null as Account | null,
   overview: null as Overview | null,
-  pings: {} as Record<string, number | null>,
+  pings: savedPings(),
+  /** How far the update download is, 0 to 1; null while the size isn't known. */
+  updateProgress: null as number | null,
   /** "best" or a location id; remembered between runs. */
   choice: saved.get("location") || "best",
   autoConnect: saved.get("autoConnect") === "1",
@@ -133,6 +145,47 @@ function formatRate(bytesPerSecond: number): string {
   return mbps >= 10 ? `${mbps.toFixed(0)} Mbps` : `${mbps.toFixed(1)} Mbps`;
 }
 
+// "Speed now" glides from one reading to the next instead of jumping. The
+// browser only runs these frames while the window can be seen.
+const shownSpeed = { up: 0, down: 0 };
+let speedFrom = { up: 0, down: 0 };
+let speedTo = { up: 0, down: 0 };
+let speedStart = 0;
+let speedMoving = false;
+
+function drawSpeed() {
+  const el = $("#speed");
+  if (!el) return;
+  const html = tunnelState() === "connected" ? `↓ ${formatRate(shownSpeed.down)}<br>↑ ${formatRate(shownSpeed.up)}` : "—";
+  if (el.innerHTML !== html) el.innerHTML = html;
+}
+
+function speedStep(now: number) {
+  const t = Math.min(1, (now - speedStart) / 800);
+  const eased = 1 - Math.pow(1 - t, 3);
+  shownSpeed.up = speedFrom.up + (speedTo.up - speedFrom.up) * eased;
+  shownSpeed.down = speedFrom.down + (speedTo.down - speedFrom.down) * eased;
+  drawSpeed();
+  if (t < 1) requestAnimationFrame(speedStep);
+  else speedMoving = false;
+}
+
+/** Shows a new speed reading: gliding when someone is looking, at once otherwise. */
+function showSpeed(target: { up: number; down: number }) {
+  if (!windowVisible() || state.screen !== "home") {
+    Object.assign(shownSpeed, target);
+    speedMoving = false;
+    return;
+  }
+  speedFrom = { ...shownSpeed };
+  speedTo = { ...target };
+  speedStart = performance.now();
+  if (!speedMoving) {
+    speedMoving = true;
+    requestAnimationFrame(speedStep);
+  }
+}
+
 function formatDuration(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -184,7 +237,19 @@ function quieterLocation(except?: Location): Location | undefined {
 
 function bestLocation(): Location | undefined {
   const online = (state.account?.locations ?? []).filter((l) => l.online);
+  // With no ping measured yet, load alone would send people far away: keep the list's order.
+  if (!online.some((l) => state.pings[l.id] != null)) return online.find((l) => !overloaded(l)) ?? online[0];
   return quieterLocation() ?? online.sort((a, b) => score(a) - score(b))[0];
+}
+
+/** The location on the home screen: the one the VPN is connected to, otherwise the chosen one. */
+function shownLocation(): Location | undefined {
+  const tstate = tunnelState();
+  if (tstate === "connected" || tstate === "connecting") {
+    const connected = (state.account?.locations ?? []).find((l) => l.id === state.overview?.locationId);
+    if (connected) return connected;
+  }
+  return chosenLocation();
 }
 
 /** Moves the saved choice along when CakeVPN picked a location for someone. */
@@ -316,9 +381,9 @@ const GEAR = `<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"
 
 function loadBadge(l: Location): string {
   if (!l.load) return "";
-  return `<span class="load ${l.load.level}" title="How busy this location is">
+  return `<span class="load ${l.load.level}" title="How busy this location's server is, from everyone using it">
       <span class="load-bar"><i style="width:${Math.max(4, l.load.percent)}%"></i></span>
-      <span class="load-pct">${l.load.percent}%</span>
+      <span class="load-pct">Load ${l.load.percent}%</span>
     </span>`;
 }
 
@@ -339,10 +404,13 @@ function pickerHtml(): string {
 }
 
 function currentLocationHtml(): string {
-  const loc = chosenLocation();
+  const loc = shownLocation();
+  const ping = loc ? state.pings[loc.id] : null;
+  // "Best location" only when that is really where this is, not while the VPN is connected somewhere else.
+  const isBest = state.choice === "best" && !!loc && loc.id === bestLocation()?.id;
   return `${loc ? flag(loc.country) : ""}
-    <span class="loc-name">${loc ? esc(loc.name) : "No location online"}${state.choice === "best" ? "<small>Best location</small>" : ""}</span>
-    <span class="loc-meta">${loc ? loadBadge(loc) : ""}<span class="chevron">▾</span></span>`;
+    <span class="loc-name">${loc ? esc(loc.name) : "No location online"}${isBest ? "<small>Best location</small>" : ""}</span>
+    <span class="loc-meta">${loc ? loadBadge(loc) : ""}<span class="ping">${ping != null ? `${ping} ms` : ""}</span><span class="chevron">▾</span></span>`;
 }
 
 function renderHome() {
@@ -359,6 +427,7 @@ function renderHome() {
       <div class="update-bar" id="update-bar">
         <span id="update-text"></span>
         <button id="update-now">Update now</button>
+        <div class="progress-track" id="update-track"><i id="update-fill"></i></div>
       </div>
       <button id="power" class="power">
         <svg class="ring" viewBox="0 0 120 120" aria-hidden="true">
@@ -387,6 +456,7 @@ function renderHome() {
       </div>
       <div class="speedtest hidden" id="speedtest">
         <button class="pill" id="run-speedtest">Run a speed test</button>
+        <div class="progress-track hidden" id="speedtest-track"><i id="speedtest-fill"></i></div>
         <div class="speedtest-result" id="speedtest-result"></div>
       </div>
       <div class="muted small center-text" id="protection-line"></div>
@@ -459,7 +529,7 @@ function updateHome() {
   const b = state.overview?.banner;
   banner.className = `banner ${b ? `show ${b.kind}` : ""}`;
   if (b) {
-    setText("#banner .banner-icon", b.kind === "wifi" ? "📶" : b.kind === "load" ? "🔥" : "🐢");
+    setText("#banner .banner-icon", { wifi: "📶", internet: "🌐", load: "🔥", vpn: "🛠️" }[b.kind] ?? "⚠️");
     setText("#banner .banner-text", b.message);
   }
 
@@ -478,6 +548,7 @@ function updateHome() {
   const connectedTo = state.account.locations.find((l) => l.id === state.overview?.locationId);
   const canTest = tstate === "connected" && !!connectedTo?.speedTest;
   $("#speedtest")!.classList.toggle("hidden", !canTest && !test.phase);
+  $("#speedtest-track")!.classList.toggle("hidden", !test.phase);
   const run = $("#run-speedtest") as HTMLButtonElement;
   run.disabled = !!test.phase;
   setText("#run-speedtest", test.phase === "down" ? "Testing download…" : test.phase === "up" ? "Testing upload…" : "Run a speed test");
@@ -496,14 +567,14 @@ function updateHome() {
   const bar = $("#update-bar")!;
   bar.classList.toggle("show", !!state.update);
   if (state.update) {
-    setText("#update-text", state.updating ? "Updating CakeVPN…" : `CakeVPN ${state.update.version} is ready`);
-    ($("#update-now") as HTMLButtonElement).disabled = state.updating;
+    setText("#update-text", state.updating ? updatingText() : `CakeVPN ${state.update.version} is ready`);
+    $("#update-now")!.classList.toggle("hidden", state.updating);
+    bar.classList.toggle("updating", state.updating);
+    ($("#update-fill") as HTMLElement).style.width = `${Math.round((state.updateProgress ?? 0) * 100)}%`;
   }
 
   setText("#usage", formatBytes(state.account.usage.bytes));
-  const speed = $("#speed")!;
-  const speedHtml = tstate === "connected" ? `↓ ${formatRate(state.speed.down)}<br>↑ ${formatRate(state.speed.up)}` : "—";
-  if (speed.innerHTML !== speedHtml) speed.innerHTML = speedHtml;
+  drawSpeed();
 }
 
 /** "IPv4 1.2.3.4 · IPv6 2603:…" for the main location, or "" when unknown. */
@@ -521,7 +592,7 @@ function updateLocations() {
   if (current) current.innerHTML = currentLocationHtml();
   if (inner) inner.innerHTML = pickerHtml();
   // The addresses belong to the main location; other locations use their own.
-  const main = chosenLocation()?.id === "main";
+  const main = shownLocation()?.id === "main";
   setText("#your-ip", main ? ipsText(state.account) : "");
 }
 
@@ -615,8 +686,9 @@ function renderSettings() {
         ${
           state.update
             ? `<button class="primary" id="settings-update" ${state.updating ? "disabled" : ""}>${
-                state.updating ? "Updating…" : `Update to ${esc(state.update.version)}`
-              }</button>`
+                state.updating ? esc(updatingText()) : `Update to ${esc(state.update.version)}`
+              }</button>
+              ${state.updating ? `<div class="progress-track"><i id="settings-update-fill" style="width:${Math.round((state.updateProgress ?? 0) * 100)}%"></i></div>` : ""}`
             : `<button class="outline" id="check-update" ${state.updateMessage === "Checking…" ? "disabled" : ""}>Check for updates</button>`
         }
         ${state.updateMessage ? `<div class="muted small update-message">${esc(state.updateMessage)}</div>` : ""}
@@ -972,15 +1044,42 @@ async function checkForUpdate(fromButton = false) {
   if (state.screen === "home") updateHome();
 }
 
+/** "Downloading the update… 45%", then "Installing…" once it is all there. */
+function updatingText(): string {
+  const p = state.updateProgress;
+  if (p === null) return "Downloading the update…";
+  return p >= 1 ? "Installing the update…" : `Downloading the update… ${Math.round(p * 100)}%`;
+}
+
+/** Shows the download's progress where the update was started, without redrawing the screen. */
+function drawUpdateProgress() {
+  if (state.screen === "home") return updateHome();
+  const fill = $("#settings-update-fill") as HTMLElement | null;
+  if (fill) fill.style.width = `${Math.round((state.updateProgress ?? 0) * 100)}%`;
+  const button = $("#settings-update");
+  if (button) button.textContent = updatingText();
+}
+
 async function installUpdate() {
   state.updating = true;
   state.updateMessage = "";
+  state.updateProgress = null;
   if (state.screen === "settings") render();
   else updateHome();
+  const watch = setInterval(async () => {
+    try {
+      const p = await backend.updateProgress();
+      if (p && p.total > 0) state.updateProgress = Math.min(1, p.downloaded / p.total);
+      drawUpdateProgress();
+    } catch {
+      /* the bar just stays where it is */
+    }
+  }, 400);
   try {
     // CakeVPN restarts by itself once the update is installed.
     await backend.installUpdate();
   } catch (e) {
+    clearInterval(watch);
     state.updating = false;
     state.updateMessage = asApiError(e).message;
     state.actionError = state.screen === "home" ? state.updateMessage : state.actionError;
@@ -1121,16 +1220,33 @@ function closeAnnouncement() {
   updateHome();
 }
 
+/** Moves the speed test's bar to `percent` over `seconds`. */
+function speedTestBar(percent: number, seconds: number) {
+  const fill = $("#speedtest-fill") as HTMLElement | null;
+  if (!fill) return;
+  fill.style.transition = seconds > 0 ? `width ${seconds}s linear` : "none";
+  // Reading the width makes the browser apply the last step before this one starts.
+  void fill.offsetWidth;
+  fill.style.width = `${percent}%`;
+}
+
 /** Download, then upload. The server allows one test a minute and a few a day. */
 async function runSpeedTest() {
   if (state.speedTest.phase) return;
   state.speedTest = { phase: "down", down: null, up: null, error: "" };
   updateHome();
+  // The download runs for up to 8 seconds and the upload for about 6: the
+  // bar moves through its first part and then the rest in those times.
+  speedTestBar(0, 0);
+  speedTestBar(60, 8);
   try {
     state.speedTest.down = await backend.speedTestDownload();
     state.speedTest.phase = "up";
     updateHome();
+    speedTestBar(60, 0.2);
+    speedTestBar(97, 6);
     state.speedTest.up = await backend.speedTestUpload();
+    speedTestBar(100, 0.2);
   } catch (e) {
     state.speedTest.error = asApiError(e).message;
   }
@@ -1248,6 +1364,7 @@ async function refreshOverview() {
       state.lastBytes = null;
       state.speed = { up: 0, down: 0 };
     }
+    showSpeed(state.speed);
     if ((ov.helper === "missing" || ov.helper === "outdated") && state.screen === "home") setScreen("setup");
     if (ov.helper === "ok" && state.screen === "setup") setScreen(state.account ? "home" : "code");
   } catch {
@@ -1313,6 +1430,7 @@ async function refreshPings() {
   if (!state.account || tunnelState() === "connected" || tunnelState() === "connecting") return;
   try {
     state.pings = { ...state.pings, ...(await backend.pingLocations()) };
+    saved.set("pings", JSON.stringify(state.pings));
     updateLocations();
   } catch {
     /* pings are only a hint */
@@ -1356,9 +1474,19 @@ function windowVisible(): boolean {
   return !document.hidden && state.overview?.windowVisible !== false;
 }
 
-/** How often each thing is checked (ms): often while someone is looking, rarely in the tray. */
+/** The window is in front: nothing covers it and the person is using it. */
+function windowInFront(): boolean {
+  return windowVisible() && document.hasFocus();
+}
+
+/**
+ * How often each thing is checked (ms): every second while the window is in
+ * front (so "Speed now" moves smoothly), less while another app is in front
+ * of it, rarely in the tray.
+ */
 const PACE = {
-  overview: { visible: 2_000, hidden: 10_000 },
+  // A little under a second, so a timer that fires a moment early doesn't skip a turn.
+  overview: { inFront: 900, visible: 3_000, hidden: 10_000 },
   account: { visible: 10_000, hiddenConnected: 60_000, hidden: 5 * 60_000, unreachable: 30_000 },
   pings: 30_000,
   update: 3 * 60 * 60_000,
@@ -1378,7 +1506,8 @@ async function tick(returned = false) {
   try {
     const now = Date.now();
     let visible = windowVisible() || returned;
-    if (now - state.last.overview >= (visible ? PACE.overview.visible : PACE.overview.hidden) || returned) {
+    const overviewEvery = !visible ? PACE.overview.hidden : windowInFront() || returned ? PACE.overview.inFront : PACE.overview.visible;
+    if (now - state.last.overview >= overviewEvery || returned) {
       state.last.overview = now;
       await refreshOverview();
       visible = windowVisible();

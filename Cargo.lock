@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "cakevpn"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "cakevpn-proto",
  "gethostname",
@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "cakevpn-helper"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "cakevpn-proto",
  "getrandom 0.3.4",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "cakevpn-proto"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "serde",
  "serde_json",

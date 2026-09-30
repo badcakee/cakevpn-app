@@ -234,36 +234,67 @@ fn mbps(bytes: f64, seconds: f64) -> f64 {
     }
 }
 
-/// Downloads for up to `seconds` and returns the speed in Mbps. The first
-/// half second is left out when there is enough left, while the speed ramps up.
+/// A speed test uses this many connections at once, like other speed tests
+/// do: one connection alone often can't fill a fast line.
+const SPEED_STREAMS: usize = 4;
+
+/// Downloads over several connections for up to `seconds` and returns the
+/// speed in Mbps. The first half second is left out when there is enough
+/// left, while the speed ramps up.
 pub async fn speed_download(ticket: &SpeedTicket) -> Result<f64, ApiError> {
-    let mut response =
-        speed_client(ticket.seconds).get(&ticket.down).send().await.map_err(|_| speed_failed())?;
-    if !response.status().is_success() {
-        return Err(speed_failed());
-    }
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let received = Arc::new(AtomicU64::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let client = speed_client(ticket.seconds);
+    let tasks: Vec<_> = (0..SPEED_STREAMS)
+        .map(|_| {
+            let (client, url) = (client.clone(), ticket.down.clone());
+            let (received, finished) = (Arc::clone(&received), Arc::clone(&finished));
+            tauri::async_runtime::spawn(async move {
+                if let Ok(mut response) = client.get(&url).send().await {
+                    if response.status().is_success() {
+                        while let Ok(Some(chunk)) = response.chunk().await {
+                            received.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                        }
+                    }
+                }
+                finished.fetch_add(1, Ordering::Relaxed);
+            })
+        })
+        .collect();
+
     let limit = Duration::from_secs(ticket.seconds);
-    let mut started: Option<std::time::Instant> = None;
-    let mut total = 0f64;
+    let asked = Instant::now();
+    let mut started: Option<Instant> = None;
     let mut warm: Option<(f64, f64)> = None; // seconds and bytes when the warm-up ended
-    while let Ok(Some(chunk)) = response.chunk().await {
-        let start = *started.get_or_insert_with(std::time::Instant::now);
-        total += chunk.len() as f64;
-        let elapsed = start.elapsed();
+    let (total, elapsed) = loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let total = received.load(Ordering::Relaxed) as f64;
+        if started.is_none() && total > 0.0 {
+            started = Some(Instant::now());
+        }
+        let elapsed = started.map(|s| s.elapsed()).unwrap_or_default();
         if warm.is_none() && elapsed >= Duration::from_millis(500) {
             warm = Some((elapsed.as_secs_f64(), total));
         }
-        if elapsed >= limit {
-            break;
+        let all_done = finished.load(Ordering::Relaxed) == SPEED_STREAMS;
+        let nothing_came = started.is_none() && asked.elapsed() >= Duration::from_secs(10);
+        if all_done || elapsed >= limit || nothing_came {
+            break (total, elapsed.as_secs_f64());
         }
+    };
+    for task in &tasks {
+        task.abort();
     }
-    let elapsed = started.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
     if total == 0.0 {
         return Err(speed_failed());
     }
     Ok(match warm {
         Some((at, bytes)) if elapsed - at >= 1.0 => mbps(total - bytes, elapsed - at),
-        _ => mbps(total, elapsed),
+        _ => mbps(total, elapsed.max(0.05)),
     })
 }
 
@@ -274,39 +305,58 @@ fn upload_size(bytes_per_sec: f64, left: u64) -> usize {
     ((bytes_per_sec * 5.0) as u64).clamp(256 << 10, MOST).min(left) as usize
 }
 
-/// Uploads and returns the speed in Mbps, as measured by the server.
+/// What the server measured for one upload.
+#[derive(Deserialize)]
+struct Uploaded {
+    bytes: u64,
+    ms: u64,
+}
+
+async fn upload(client: reqwest::Client, url: String, size: usize) -> Option<Uploaded> {
+    // Not all zeros, so nothing on the way can shrink it.
+    let mut body = vec![0u8; size];
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    for chunk in body.chunks_mut(8) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        chunk.copy_from_slice(&x.to_le_bytes()[..chunk.len()]);
+    }
+    let response = client.post(&url).body(body).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json().await.ok()
+}
+
+/// Uploads and returns the speed in Mbps, as measured by the server: a small
+/// upload first to size the real one, which goes over several connections.
 pub async fn speed_upload(ticket: &SpeedTicket) -> Result<f64, ApiError> {
-    #[derive(Deserialize)]
-    struct Measured {
-        bytes: u64,
-        ms: u64,
-    }
-    async fn send(ticket: &SpeedTicket, size: usize) -> Result<Measured, ApiError> {
-        // Not all zeros, so nothing on the way can shrink it.
-        let mut body = vec![0u8; size];
-        let mut x = 0x9e37_79b9_7f4a_7c15u64;
-        for chunk in body.chunks_mut(8) {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            chunk.copy_from_slice(&x.to_le_bytes()[..chunk.len()]);
-        }
-        let response =
-            speed_client(ticket.seconds).post(&ticket.up).body(body).send().await.map_err(|_| speed_failed())?;
-        if !response.status().is_success() {
-            return Err(speed_failed());
-        }
-        response.json().await.map_err(|_| speed_failed())
-    }
     const FIRST: usize = 256 << 10;
-    let first = send(ticket, FIRST.min(ticket.up_bytes as usize)).await?;
-    let rate = first.bytes as f64 / (first.ms.max(1) as f64 / 1000.0);
+    let client = speed_client(ticket.seconds);
+    let first = upload(client.clone(), ticket.up.clone(), FIRST.min(ticket.up_bytes as usize)).await.ok_or_else(speed_failed)?;
+    let first_secs = first.ms.max(1) as f64 / 1000.0;
     let left = ticket.up_bytes.saturating_sub(first.bytes);
-    if left < FIRST as u64 {
-        return Ok(mbps(first.bytes as f64, first.ms.max(1) as f64 / 1000.0));
+    if left < (FIRST * SPEED_STREAMS) as u64 {
+        return Ok(mbps(first.bytes as f64, first_secs));
     }
-    let main = send(ticket, upload_size(rate, left)).await?;
-    Ok(mbps(main.bytes as f64, main.ms.max(1) as f64 / 1000.0))
+    // One connection showed this rate; several together usually carry more,
+    // so the real upload is sized for twice that.
+    let each = upload_size(first.bytes as f64 / first_secs * 2.0, left) / SPEED_STREAMS;
+    let tasks: Vec<_> = (0..SPEED_STREAMS)
+        .map(|_| tauri::async_runtime::spawn(upload(client.clone(), ticket.up.clone(), each)))
+        .collect();
+    let (mut bytes, mut longest) = (0u64, 0u64);
+    for task in tasks {
+        if let Ok(Some(done)) = task.await {
+            bytes += done.bytes;
+            longest = longest.max(done.ms);
+        }
+    }
+    if bytes == 0 {
+        return Err(speed_failed());
+    }
+    Ok(mbps(bytes as f64, longest.max(1) as f64 / 1000.0))
 }
 
 pub async fn sign_out(token: &str) {

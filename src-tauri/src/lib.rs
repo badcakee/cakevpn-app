@@ -8,7 +8,8 @@ use cakevpn_proto::{Request, Status, TunnelState, HELPER_REVISION, PROTOCOL_VERS
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -65,6 +66,17 @@ struct AppState {
     visible: AtomicBool,
     /// The speed test in progress: its download and upload use one ticket.
     speed: Mutex<Option<api::SpeedTicket>>,
+    /// Bytes of the update downloaded so far, and its size (0 while unknown).
+    update_done: Arc<AtomicU64>,
+    update_total: Arc<AtomicU64>,
+}
+
+/// How far the update download is, for the progress bar.
+#[derive(Serialize)]
+struct UpdateProgress {
+    downloaded: u64,
+    /// 0 while the size isn't known yet.
+    total: u64,
 }
 
 /// What the person switched on in Settings, sent along with every connect.
@@ -104,33 +116,60 @@ struct Overview {
     window_visible: bool,
 }
 
-/// Decides which warning to show, most useful first: a bad Wi-Fi explains a
-/// slow VPN, so it wins over the server's load. While the line is busy (a
-/// speed test, a big download) slow pings are expected, so the Wi-Fi and
-/// speed warnings wait until it calms down.
+/// Decides which warning to show. One only appears when something is
+/// actually wrong for the person: the VPN isn't getting through, or is very
+/// slow. Then it names the cause, nearest first: the Wi-Fi (pings to the
+/// router are lost or slow), the internet connection (the same check fails
+/// outside the tunnel too), a busy location, or the VPN itself. A busy
+/// location is also mentioned when nothing is wrong yet.
+///
+/// While the line is full (a speed test, a big download) slow answers are
+/// expected, so it takes more to count as a problem.
 fn banner(status: &Status, load: Option<&Load>, wifi_name: Option<&str>, busy: bool) -> Option<Banner> {
     if status.state != TunnelState::Connected {
         return None;
     }
     let q = &status.quality;
-    let shaky_wifi = !busy
-        && (q.gateway_loss.is_some_and(|l| l >= 0.05)
-            || q.gateway_jitter_ms.is_some_and(|j| j >= 30.0)
-            || q.gateway_rtt_ms.is_some_and(|r| r >= 50.0));
-    if shaky_wifi {
+    let not_through = q.tunnel_failures >= if busy { 4 } else { 2 };
+    let slow = !busy && q.tunnel_delay_ms.is_some_and(|d| d >= 600);
+    let high_load = load.is_some_and(|l| l.level == "high");
+    if !not_through && !slow {
+        return high_load
+            .then(|| Banner { kind: "load", message: "The location you're in is experiencing high load.".into() });
+    }
+
+    // One lost or slow ping now and then is normal; over a quarter of them is not.
+    if q.gateway_bad.is_some_and(|bad| bad >= if busy { 0.5 } else { 0.27 }) {
         let message = match wifi_name {
-            Some(name) => format!("The Wi-Fi you're connected to ({name}) is unstable."),
-            None => "The Wi-Fi or network you're connected to is unstable.".to_string(),
+            Some(name) => format!("The problem is your Wi-Fi ({name}), not the VPN: it keeps dropping or lagging."),
+            None => "The problem is your Wi-Fi or network, not the VPN: it keeps dropping or lagging.".to_string(),
         };
         return Some(Banner { kind: "wifi", message });
     }
-    if load.is_some_and(|l| l.level == "high") {
-        return Some(Banner { kind: "load", message: "The location you're in is experiencing high load.".into() });
+    if q.direct_failures >= 2 {
+        return Some(Banner {
+            kind: "internet",
+            message: "The problem is your internet connection, not the VPN: websites aren't reachable without the VPN either.".into(),
+        });
     }
-    if !busy && (q.tunnel_failures >= 2 || q.tunnel_delay_ms.is_some_and(|d| d >= 400)) {
-        return Some(Banner { kind: "slow", message: "Your connection to the VPN is slow right now.".into() });
+    if !not_through && q.direct_delay_ms.is_some_and(|d| d >= 600) {
+        return Some(Banner {
+            kind: "internet",
+            message: "Your internet connection is slow right now, with or without the VPN.".into(),
+        });
     }
-    None
+    if high_load {
+        return Some(Banner {
+            kind: "load",
+            message: "This location is very busy right now, which slows it down. Try another location.".into(),
+        });
+    }
+    let message = if not_through {
+        "The problem is on the VPN's side, not your Wi-Fi: this location isn't answering right now. Try another location."
+    } else {
+        "The problem is on the VPN's side, not your Wi-Fi: this location is slow right now. Try another location."
+    };
+    Some(Banner { kind: "vpn", message: message.into() })
 }
 
 fn not_signed_in() -> ApiError {
@@ -454,7 +493,7 @@ async fn check_update(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, Strin
 
 /// Downloads and installs the newer release, then restarts CakeVPN.
 #[tauri::command]
-async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+async fn install_update(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let updater = app.updater().map_err(|e| e.to_string())?;
     let update = updater
         .check()
@@ -463,11 +502,30 @@ async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
         .ok_or("CakeVPN is already up to date.")?;
     // The installer replaces the helper on Windows, which would cut the tunnel anyway.
     let _ = helper::ask(Request::Disconnect).await;
+    let (done, total) = (Arc::clone(&state.update_done), Arc::clone(&state.update_total));
+    done.store(0, Ordering::Relaxed);
+    total.store(0, Ordering::Relaxed);
     update
-        .download_and_install(|_, _| {}, || {})
+        .download_and_install(
+            move |chunk, size| {
+                done.fetch_add(chunk as u64, Ordering::Relaxed);
+                if let Some(size) = size {
+                    total.store(size, Ordering::Relaxed);
+                }
+            },
+            || {},
+        )
         .await
         .map_err(|e| format!("The update could not be installed: {e}"))?;
     app.restart()
+}
+
+#[tauri::command]
+fn update_progress(state: State<'_, AppState>) -> UpdateProgress {
+    UpdateProgress {
+        downloaded: state.update_done.load(Ordering::Relaxed),
+        total: state.update_total.load(Ordering::Relaxed),
+    }
 }
 
 fn show_window(app: &tauri::AppHandle) {
@@ -502,6 +560,8 @@ pub fn run() {
                 saved: Mutex::new(None),
                 visible: AtomicBool::new(shown),
                 speed: Mutex::new(None),
+                update_done: Arc::new(AtomicU64::new(0)),
+                update_total: Arc::new(AtomicU64::new(0)),
             });
 
             let open = MenuItem::with_id(app, "open", "Open CakeVPN", true, None::<&str>)?;
@@ -568,7 +628,8 @@ pub fn run() {
             speed_test_download,
             speed_test_upload,
             check_update,
-            install_update
+            install_update,
+            update_progress
         ])
         .build(tauri::generate_context!())
         .expect("error while starting CakeVPN");
@@ -596,35 +657,78 @@ mod tests {
         Load { percent: 90, level: level.into() }
     }
 
+    /// Pings to the router: `bad` is the share lost or slow.
+    fn wifi(bad: f64) -> Quality {
+        Quality { gateway_rtt_ms: Some(4.0), gateway_jitter_ms: Some(2.0), gateway_loss: Some(0.0), gateway_bad: Some(bad), ..Default::default() }
+    }
+
     #[test]
     fn quiet_when_all_is_well() {
-        let s = connected(Quality { gateway_rtt_ms: Some(3.0), gateway_jitter_ms: Some(1.0), gateway_loss: Some(0.0), tunnel_delay_ms: Some(40), tunnel_failures: 0 });
+        let s = connected(Quality { tunnel_delay_ms: Some(40), direct_delay_ms: Some(20), ..wifi(0.0) });
         assert_eq!(banner(&s, Some(&load("low")), Some("Home"), false), None);
     }
 
     #[test]
-    fn lossy_wifi_is_named() {
-        let s = connected(Quality { gateway_loss: Some(0.2), gateway_rtt_ms: Some(4.0), gateway_jitter_ms: Some(2.0), ..Default::default() });
+    fn shaky_pings_alone_are_not_a_warning() {
+        // The router drops half its pings, but the VPN works: nothing is wrong for the person.
+        let s = connected(Quality { tunnel_delay_ms: Some(60), ..wifi(0.5) });
+        assert_eq!(banner(&s, Some(&load("low")), Some("Home"), false), None);
+    }
+
+    #[test]
+    fn one_bad_ping_does_not_blame_the_wifi() {
+        let s = connected(Quality { tunnel_failures: 2, direct_delay_ms: Some(30), ..wifi(1.0 / 15.0) });
+        assert_eq!(banner(&s, None, Some("Home"), false).unwrap().kind, "vpn");
+    }
+
+    #[test]
+    fn bad_wifi_is_named_when_the_vpn_suffers() {
+        let s = connected(Quality { tunnel_failures: 2, direct_failures: 2, ..wifi(0.4) });
         let b = banner(&s, Some(&load("high")), Some("School Guest"), false).unwrap();
         assert_eq!(b.kind, "wifi");
-        assert!(b.message.contains("School Guest"));
+        assert!(b.message.contains("School Guest") && b.message.contains("not the VPN"), "{}", b.message);
     }
 
     #[test]
-    fn busy_location_when_wifi_is_fine() {
-        let s = connected(Quality { gateway_loss: Some(0.0), gateway_rtt_ms: Some(4.0), gateway_jitter_ms: Some(2.0), ..Default::default() });
-        assert_eq!(banner(&s, Some(&load("high")), None, false).unwrap().kind, "load");
+    fn internet_down_is_not_the_vpns_fault() {
+        let s = connected(Quality { tunnel_failures: 3, direct_failures: 3, ..wifi(0.0) });
+        let b = banner(&s, None, Some("Home"), false).unwrap();
+        assert_eq!(b.kind, "internet");
+        assert!(b.message.contains("not the VPN"), "{}", b.message);
     }
 
     #[test]
-    fn slow_tunnel() {
-        let s = connected(Quality { tunnel_delay_ms: Some(900), ..Default::default() });
-        assert_eq!(banner(&s, None, None, false).unwrap().kind, "slow");
+    fn vpn_problem_is_called_a_vpn_problem() {
+        // The Wi-Fi is fine and the internet works outside the tunnel.
+        let s = connected(Quality { tunnel_failures: 2, direct_delay_ms: Some(25), ..wifi(0.0) });
+        let b = banner(&s, None, Some("Home"), false).unwrap();
+        assert_eq!(b.kind, "vpn");
+        assert!(b.message.contains("VPN's side") && b.message.contains("isn't answering"), "{}", b.message);
+        let slow = connected(Quality { tunnel_delay_ms: Some(900), direct_delay_ms: Some(25), ..wifi(0.0) });
+        let b = banner(&slow, None, Some("Home"), false).unwrap();
+        assert_eq!(b.kind, "vpn");
+        assert!(b.message.contains("slow"), "{}", b.message);
+    }
+
+    #[test]
+    fn slow_everywhere_is_the_internet() {
+        let s = connected(Quality { tunnel_delay_ms: Some(900), direct_delay_ms: Some(800), ..wifi(0.0) });
+        assert_eq!(banner(&s, None, None, false).unwrap().kind, "internet");
+    }
+
+    #[test]
+    fn busy_location_with_and_without_trouble() {
+        let fine = connected(Quality { tunnel_delay_ms: Some(50), ..wifi(0.0) });
+        assert_eq!(banner(&fine, Some(&load("high")), None, false).unwrap().kind, "load");
+        let slow = connected(Quality { tunnel_delay_ms: Some(900), direct_delay_ms: Some(30), ..wifi(0.0) });
+        let b = banner(&slow, Some(&load("high")), None, false).unwrap();
+        assert_eq!(b.kind, "load");
+        assert!(b.message.contains("Try another location"), "{}", b.message);
     }
 
     #[test]
     fn nothing_while_disconnected() {
-        let s = Status { state: TunnelState::Disconnected, quality: Quality { gateway_loss: Some(1.0), ..Default::default() }, ..Default::default() };
+        let s = Status { state: TunnelState::Disconnected, quality: Quality { tunnel_failures: 9, ..wifi(1.0) }, ..Default::default() };
         assert_eq!(banner(&s, None, None, false), None);
     }
 
@@ -646,10 +750,14 @@ mod tests {
     }
 
     #[test]
-    fn busy_line_is_not_a_bad_wifi() {
-        let s = connected(Quality { gateway_loss: Some(0.1), gateway_rtt_ms: Some(120.0), gateway_jitter_ms: Some(60.0), tunnel_delay_ms: Some(900), ..Default::default() });
+    fn busy_line_needs_more_to_count_as_trouble() {
+        // A speed test: answers are slow, a couple of checks time out, pings lag.
+        let s = connected(Quality { tunnel_delay_ms: Some(900), tunnel_failures: 3, ..wifi(0.4) });
         assert_eq!(banner(&s, None, Some("Home"), true), None);
         assert_eq!(banner(&s, Some(&load("high")), Some("Home"), true).unwrap().kind, "load");
+        // Nothing gets through for a good while: that is a real problem, even then.
+        let stuck = connected(Quality { tunnel_failures: 4, direct_delay_ms: Some(30), ..wifi(0.1) });
+        assert_eq!(banner(&stuck, None, Some("Home"), true).unwrap().kind, "vpn");
     }
 
     #[test]

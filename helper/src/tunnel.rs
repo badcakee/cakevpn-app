@@ -18,6 +18,15 @@ const TEST_URL: &str = "https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204";
 /// it keeps stopping: then the tunnel can't be kept up at all.
 const MAX_RESTARTS_PER_MINUTE: usize = 5;
 
+/// After the computer wakes up, the network needs a moment to come back.
+/// Nothing is measured for this long, so waking up doesn't look like a problem.
+const SETTLE_AFTER_WAKE: Duration = Duration::from_secs(20);
+/// A pause between two measurements this much longer than planned means the
+/// computer was asleep.
+const WAKE_GAP_SECS: u64 = 12;
+/// Traffic totals older than this are read again when the app asks.
+const FRESH_TOTALS: Duration = Duration::from_millis(900);
+
 const KILL_SWITCH_WAITING: &str =
     "Can't reach the VPN server. The kill switch keeps your internet blocked until it's back, or until you disconnect.";
 
@@ -45,6 +54,7 @@ struct Inner {
     gateway: Option<Ipv4Addr>,
     up_bytes: u64,
     down_bytes: u64,
+    totals_at: Option<Instant>,
 }
 
 pub struct Tunnel {
@@ -71,7 +81,28 @@ impl Tunnel {
         Arc::new(Tunnel { paths, inner: Mutex::new(Inner::default()) })
     }
 
+    /// The status for the app. Traffic totals are read again when they are
+    /// older than a second, so the app's speed display is as fresh as it
+    /// asks, and nothing extra runs while nobody is looking.
     pub async fn status(&self) -> Status {
+        let stale = {
+            let inner = self.inner.lock().await;
+            match (inner.state, &inner.api) {
+                (TunnelState::Connected, Some(api)) if inner.totals_at.is_none_or(|at| at.elapsed() >= FRESH_TOTALS) => {
+                    Some((api.clone(), inner.generation))
+                }
+                _ => None,
+            }
+        };
+        if let Some(((port, secret), generation)) = stale {
+            let totals = tokio::time::timeout(Duration::from_millis(700), read_totals(port, &secret)).await.ok().flatten();
+            let mut inner = self.inner.lock().await;
+            if let (Some((up, down)), true) = (totals, inner.generation == generation) {
+                inner.up_bytes = up;
+                inner.down_bytes = down;
+                inner.totals_at = Some(Instant::now());
+            }
+        }
         let inner = self.inner.lock().await;
         Status {
             protocol: PROTOCOL_VERSION,
@@ -98,6 +129,7 @@ impl Tunnel {
         inner.since = None;
         inner.up_bytes = 0;
         inner.down_bytes = 0;
+        inner.totals_at = None;
         inner.tracker.reset();
         // Look up the router before the tunnel changes the routes.
         inner.gateway = tokio::task::spawn_blocking(ping::gateway).await.ok().flatten();
@@ -242,7 +274,7 @@ impl Tunnel {
         let mut reached = false;
         for _ in 0..3 {
             let Ok((port, secret)) = self.still_current(generation).await else { return };
-            if let Some(ms) = delay_test(port, &secret).await {
+            if let Some(ms) = delay_test(port, &secret, "proxy").await {
                 let mut inner = self.inner.lock().await;
                 if inner.generation != generation {
                     return;
@@ -268,7 +300,7 @@ impl Tunnel {
             loop {
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 let Ok((port, secret)) = self.still_current(generation).await else { return };
-                if let Some(ms) = delay_test(port, &secret).await {
+                if let Some(ms) = delay_test(port, &secret, "proxy").await {
                     let mut inner = self.inner.lock().await;
                     if inner.generation != generation {
                         return;
@@ -284,11 +316,48 @@ impl Tunnel {
 
         // 3. Measure every 2 seconds while connected.
         let mut tick: u64 = 0;
+        let mut last = now_secs();
+        let mut settle_until: Option<Instant> = None;
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
             tick += 1;
             let Ok((port, secret)) = self.still_current(generation).await else { return };
-            let gateway = self.inner.lock().await.gateway;
+
+            // The clock jumped: the computer was asleep (a closed laptop lid).
+            // What was measured before says nothing about now, and the Wi-Fi
+            // needs a moment to come back, so start afresh after a pause.
+            let now = now_secs();
+            let slept = now.saturating_sub(last) >= WAKE_GAP_SECS || now < last;
+            last = now;
+            if slept {
+                settle_until = Some(Instant::now() + SETTLE_AFTER_WAKE);
+                let mut inner = self.inner.lock().await;
+                if inner.generation != generation {
+                    return;
+                }
+                inner.tracker.reset();
+            }
+            if let Some(until) = settle_until {
+                if Instant::now() < until {
+                    continue;
+                }
+                settle_until = None;
+                // The laptop may have woken up on another network.
+                let found = tokio::task::spawn_blocking(ping::gateway).await.ok().flatten();
+                let mut inner = self.inner.lock().await;
+                if inner.generation != generation {
+                    return;
+                }
+                if found.is_some() {
+                    inner.gateway = found;
+                }
+                inner.tracker.reset();
+            }
+
+            let (gateway, retest) = {
+                let inner = self.inner.lock().await;
+                (inner.gateway, inner.tracker.tunnel_failing())
+            };
             let seq = (tick & 0xffff) as u16;
             // Err means pings cannot be sent here at all, which says nothing about the Wi-Fi.
             let rtt = match gateway {
@@ -297,11 +366,15 @@ impl Tunnel {
                     .unwrap_or(Err(())),
                 None => Err(()),
             };
-            let delay = if tick % 5 == 0 { Some(delay_test(port, &secret).await) } else { None };
-            let totals = clash_get(port, &secret, "/connections").await.and_then(|body| {
-                let v: serde_json::Value = serde_json::from_str(&body).ok()?;
-                Some((v["uploadTotal"].as_u64()?, v["downloadTotal"].as_u64()?))
-            });
+            // Every 10 seconds, and right away again after a failed check: the
+            // same website through the tunnel and outside it. When only the
+            // tunnel fails, the VPN is the problem; when both do, the internet is.
+            let delay = if tick % 5 == 0 || retest {
+                Some(tokio::join!(delay_test(port, &secret, "proxy"), delay_test(port, &secret, "direct")))
+            } else {
+                None
+            };
+            let totals = read_totals(port, &secret).await;
 
             let mut inner = self.inner.lock().await;
             if inner.generation != generation {
@@ -310,20 +383,23 @@ impl Tunnel {
             if let Ok(rtt) = rtt {
                 inner.tracker.gateway_sample(rtt);
             }
-            if let Some(result) = delay {
-                inner.tracker.tunnel_sample(result);
+            if let Some((through_tunnel, outside)) = delay {
+                inner.tracker.tunnel_sample(through_tunnel);
+                inner.tracker.direct_sample(outside);
             }
             if let Some((up, down)) = totals {
                 inner.up_bytes = up;
                 inner.down_bytes = down;
+                inner.totals_at = Some(Instant::now());
             }
             if tick % 30 == 0 {
                 // The Wi-Fi may have changed; look the router up again.
                 drop(inner);
                 let found = tokio::task::spawn_blocking(ping::gateway).await.ok().flatten();
                 let mut inner = self.inner.lock().await;
-                if found.is_some() && inner.generation == generation {
+                if found.is_some() && inner.generation == generation && inner.gateway != found {
                     inner.gateway = found;
+                    inner.tracker.new_network();
                 }
             }
         }
@@ -381,9 +457,17 @@ async fn clash_get(port: u16, secret: &str, path: &str) -> Option<String> {
     tokio::time::timeout(Duration::from_secs(8), request).await.ok().flatten()
 }
 
-/// Round trip through the tunnel to a small web page, in milliseconds.
-async fn delay_test(port: u16, secret: &str) -> Option<u32> {
-    let body = clash_get(port, secret, &format!("/proxies/proxy/delay?timeout=5000&url={TEST_URL}")).await?;
+/// Bytes sent and received through sing-box since it started.
+async fn read_totals(port: u16, secret: &str) -> Option<(u64, u64)> {
+    let body = clash_get(port, secret, "/connections").await?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    Some((v["uploadTotal"].as_u64()?, v["downloadTotal"].as_u64()?))
+}
+
+/// Round trip to a small web page in milliseconds: through the tunnel
+/// ("proxy") or outside it ("direct").
+async fn delay_test(port: u16, secret: &str, outbound: &str) -> Option<u32> {
+    let body = clash_get(port, secret, &format!("/proxies/{outbound}/delay?timeout=5000&url={TEST_URL}")).await?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
     v["delay"].as_u64().map(|d| d as u32)
 }

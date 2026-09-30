@@ -91,7 +91,8 @@ export interface Status {
 export interface Overview {
   helper: "ok" | "missing" | "outdated";
   status: Status | null;
-  banner: { kind: "wifi" | "load" | "slow"; message: string } | null;
+  /** What is wrong and whose problem it is: the Wi-Fi, the internet connection, a busy location or the VPN. */
+  banner: { kind: "wifi" | "internet" | "load" | "vpn"; message: string } | null;
   locationId: string | null;
   /** False while the window is hidden and CakeVPN sits in the tray. */
   windowVisible?: boolean;
@@ -120,6 +121,8 @@ export const backend = {
   speedTestUpload: () => invoke<number>("speed_test_upload"),
   checkUpdate: () => invoke<{ version: string; notes: string | null } | null>("check_update"),
   installUpdate: () => invoke<void>("install_update"),
+  /** How far the update download is; `total` is 0 while the size isn't known. */
+  updateProgress: () => invoke<{ downloaded: number; total: number }>("update_progress"),
 };
 
 /** Tauri hands back command errors as the value the Rust side returned. */

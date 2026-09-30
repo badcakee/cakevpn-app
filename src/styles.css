@@ -423,15 +423,47 @@ h1 {
 }
 
 .banner.show {
-  max-height: 80px;
+  max-height: 140px;
   opacity: 1;
   padding: 10px 12px;
   margin: 4px 0 10px;
 }
 
-.banner.load {
+.banner.load,
+.banner.vpn {
   background: #ffe4e6;
   color: #9f1239;
+}
+
+/* ---------- progress bars ---------- */
+
+.progress-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.progress-track.hidden {
+  display: none;
+}
+
+.progress-track i {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: var(--pink);
+  transition: width 0.4s var(--ease);
+}
+
+#speedtest-track {
+  width: 180px;
+  margin: 8px auto 0;
+}
+
+.updates .progress-track {
+  margin: 0 0 10px;
 }
 
 /* ---------- cards and locations ---------- */
@@ -552,7 +584,8 @@ h1 {
 .load-pct {
   font-size: 12px;
   font-weight: 600;
-  min-width: 32px;
+  min-width: 62px;
+  white-space: nowrap;
   text-align: right;
   color: var(--green);
   font-variant-numeric: tabular-nums;
@@ -1004,6 +1037,29 @@ label.row {
   opacity: 1;
   padding: 8px 12px;
   margin-top: 4px;
+}
+
+.update-bar {
+  flex-wrap: wrap;
+}
+
+/* While the update downloads, the bar shows how far it is instead of the button. */
+.update-bar .progress-track {
+  display: none;
+  flex-basis: 100%;
+  background: rgba(255, 255, 255, 0.35);
+}
+
+.update-bar.updating .progress-track {
+  display: block;
+}
+
+.update-bar .progress-track i {
+  background: #fff;
+}
+
+.update-bar button.hidden {
+  display: none;
 }
 
 .update-bar button {

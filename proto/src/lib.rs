@@ -15,7 +15,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// 2: QUIC (UDP 443) is refused in the tunnel.
 /// 3: IPv6 is let through for users with their own IPv6 exit.
 /// 4: ad blocking, the kill switch and split tunneling.
-pub const HELPER_REVISION: u32 = 4;
+/// 5: checks the internet outside the tunnel too, measures afresh after the
+///    computer wakes up, and reports traffic as fresh as the app asks.
+pub const HELPER_REVISION: u32 = 5;
 
 /// Most websites and apps one person can set to skip the VPN.
 pub const MAX_BYPASS_DOMAINS: usize = 100;
@@ -157,6 +159,17 @@ pub struct Quality {
     pub tunnel_delay_ms: Option<u32>,
     /// Tunnel checks in a row that failed.
     pub tunnel_failures: u32,
+    /// Share of recent pings to the router that were lost or slow, 0.0 to
+    /// 1.0. One bad ping in a while is normal, so this is what Wi-Fi is judged on.
+    #[serde(default)]
+    pub gateway_bad: Option<f64>,
+    /// Round trip to the same website outside the tunnel, which shows
+    /// whether the internet itself works when the tunnel doesn't.
+    #[serde(default)]
+    pub direct_delay_ms: Option<u32>,
+    /// Checks outside the tunnel in a row that failed.
+    #[serde(default)]
+    pub direct_failures: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
