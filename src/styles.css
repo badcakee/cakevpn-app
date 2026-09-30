@@ -200,8 +200,9 @@ h1 {
   font-size: 12px;
 }
 
+/* Wins over any layout rule: a note laid out with flex must still hide. */
 .hidden {
-  display: none;
+  display: none !important;
 }
 
 .error {
