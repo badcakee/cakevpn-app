@@ -1,7 +1,7 @@
 //! Starts and stops sing-box and keeps track of how the tunnel is doing.
 
 use crate::{dns, ping, quality::Tracker, singbox};
-use cakevpn_proto::{ConnectParams, PingTarget, Status, TunnelState, HELPER_REVISION, MAX_PING_TARGETS, PROTOCOL_VERSION};
+use cakevpn_proto::{ConnectParams, PingTarget, Request, Response, Status, TunnelState, HELPER_REVISION, MAX_PING_TARGETS, PROTOCOL_VERSION};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -36,6 +36,18 @@ pub struct Paths {
     pub data_dir: PathBuf,
     pub sing_box: PathBuf,
     pub capture: singbox::Capture,
+    /// With `Capture::Device`: what connects the phone's VPN to sing-box.
+    pub attach: Option<Arc<dyn Attach>>,
+}
+
+/// Connects the phone's own VPN interface (Android's VpnService) to the
+/// local port sing-box listens on, and takes it away again. Both may block
+/// while Android does its part, so they run on a blocking thread.
+pub trait Attach: Send + Sync + 'static {
+    /// Called once traffic gets through the server, before the tunnel counts as connected.
+    fn attach(&self, local_port: u16, params: &ConnectParams) -> Result<(), String>;
+    /// Called whenever the tunnel stops; must be fine to call when nothing is attached.
+    fn detach(&self);
 }
 
 #[derive(Default)]
@@ -46,6 +58,8 @@ struct Inner {
     params: Option<ConnectParams>,
     child: Option<Child>,
     api: Option<(u16, String)>,
+    /// The port sing-box takes the phone's traffic on (`Capture::Device`).
+    device_port: u16,
     config_path: Option<PathBuf>,
     /// When sing-box was started again after stopping (kill switch only).
     restarts: Vec<Instant>,
@@ -80,6 +94,25 @@ fn free_local_port() -> std::io::Result<u16> {
 impl Tunnel {
     pub fn new(paths: Paths) -> Arc<Tunnel> {
         Arc::new(Tunnel { paths, inner: Mutex::new(Inner::default()) })
+    }
+
+    /// Carries out one request from the app and says how the tunnel is now.
+    pub async fn answer(self: &Arc<Self>, request: Request) -> Response {
+        let mut pings = None;
+        let result = match request {
+            Request::Connect { params } => self.connect(params).await,
+            Request::Disconnect => {
+                self.disconnect().await;
+                Ok(())
+            }
+            Request::Status => Ok(()),
+            Request::Ping { targets } => self.ping(targets).await.map(|measured| pings = Some(measured)),
+        };
+        let status = self.status().await;
+        match result {
+            Ok(()) => Response { ok: true, error: None, status, pings },
+            Err(e) => Response { ok: false, error: Some(e), status, pings: None },
+        }
     }
 
     /// The status for the app. Traffic totals are read again when they are
@@ -136,6 +169,10 @@ impl Tunnel {
         inner.gateway = tokio::task::spawn_blocking(ping::gateway).await.ok().flatten();
 
         let port = free_local_port().map_err(|e| format!("no free local port: {e}"))?;
+        inner.device_port = match self.paths.capture {
+            singbox::Capture::Device => free_local_port().map_err(|e| format!("no free local port: {e}"))?,
+            _ => 0,
+        };
         let secret = random_hex(16);
         let dir = &self.paths.data_dir;
         std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -149,6 +186,7 @@ impl Tunnel {
             api_port: port,
             api_secret: &secret,
             ads_rule_set: Some(&ads_path),
+            device_port: inner.device_port,
         });
         let config_path = dir.join("config.json");
         write_private(&config_path, &serde_json::to_vec_pretty(&config).unwrap())
@@ -252,8 +290,12 @@ impl Tunnel {
         inner.api = None;
     }
 
-    /// Ends sing-box and gives the computer its own DNS back.
+    /// Ends sing-box and gives the computer its own DNS back (or, on a
+    /// phone, takes its VPN away).
     async fn stop(&self, inner: &mut Inner) {
+        if let Some(attach) = self.paths.attach.clone() {
+            let _ = tokio::task::spawn_blocking(move || attach.detach()).await;
+        }
         stop_child(inner).await;
         if self.paths.capture == singbox::Capture::Tun {
             let dir = self.paths.data_dir.clone();
@@ -304,6 +346,27 @@ impl Tunnel {
         inner.api.clone().ok_or(())
     }
 
+    /// On a phone, points its VPN at sing-box. On failure the tunnel is
+    /// marked failed and `false` comes back.
+    async fn attach_device(&self, generation: u64) -> bool {
+        let Some(attach) = self.paths.attach.clone() else { return true };
+        let (port, params) = {
+            let inner = self.inner.lock().await;
+            if inner.generation != generation {
+                return false;
+            }
+            (inner.device_port, inner.params.clone())
+        };
+        let Some(params) = params else { return false };
+        let why = match tokio::task::spawn_blocking(move || attach.attach(port, &params)).await {
+            Ok(Ok(())) => return true,
+            Ok(Err(why)) => why,
+            Err(_) => "The VPN could not be started.".to_string(),
+        };
+        self.fail(generation, why).await;
+        false
+    }
+
     async fn watch(self: Arc<Self>, generation: u64) {
         // 1. Wait for sing-box to start.
         let mut started = false;
@@ -326,6 +389,9 @@ impl Tunnel {
         for _ in 0..3 {
             let Ok((port, secret)) = self.still_current(generation).await else { return };
             if let Some(ms) = delay_test(port, &secret, "proxy").await {
+                if !self.attach_device(generation).await {
+                    return;
+                }
                 let mut inner = self.inner.lock().await;
                 if inner.generation != generation {
                     return;
@@ -352,6 +418,9 @@ impl Tunnel {
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 let Ok((port, secret)) = self.still_current(generation).await else { return };
                 if let Some(ms) = delay_test(port, &secret, "proxy").await {
+                    if !self.attach_device(generation).await {
+                        return;
+                    }
                     let mut inner = self.inner.lock().await;
                     if inner.generation != generation {
                         return;

@@ -10,15 +10,10 @@
 //! For testing without touching routes, set CAKEVPN_HELPER_LOCAL_PORT to get a
 //! local SOCKS/HTTP port instead of a TUN interface.
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-mod dns;
-mod ipc;
-mod ping;
-mod quality;
-mod singbox;
-mod tunnel;
 #[cfg(windows)]
 mod service_windows;
+
+use cakevpn_helper::{dns, ipc, singbox, tunnel};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -70,6 +65,7 @@ pub async fn serve(shutdown: impl std::future::Future<Output = ()>) -> std::io::
         data_dir: data_dir(),
         sing_box: sing_box_path(),
         capture: capture(),
+        attach: None,
     });
     let path = channel_path();
     let result = tokio::select! {

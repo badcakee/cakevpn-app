@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 description = "Runs the CakeVPN tunnel with the rights it needs"
 
+[lib]
+name = "cakevpn_helper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cakevpn-helper"
+path = "src/main.rs"
+
 [dependencies]
 cakevpn-proto = { path = "../proto" }
 serde = { version = "1", features = ["derive"] }
