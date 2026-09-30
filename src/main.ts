@@ -88,6 +88,8 @@ const state = {
   /** The id of the panel message this person closed. */
   closedAnnouncement: Number(saved.get("closedAnnouncement") || 0),
   speedTest: { phase: "" as "" | "down" | "up", down: null as number | null, up: null as number | null, error: "" },
+  /** Where name lookups go, checked when Settings opens while connected. */
+  dnsPath: "" as "" | "checking" | "vpn" | "outside" | "unknown",
   /** The last 30 days for the usage graph; null until Settings asked for it. */
   history: null as DayUsage[] | null,
   historyError: "",
@@ -611,7 +613,7 @@ function updateHome() {
   const b = state.overview?.banner;
   banner.className = `banner ${b ? `show ${b.kind}` : ""}`;
   if (b) {
-    setText("#banner .banner-icon", { wifi: "📶", internet: "🌐", load: "🔥", vpn: "🛠️" }[b.kind] ?? "⚠️");
+    setText("#banner .banner-icon", { wifi: "📶", internet: "🌐", load: "🔥", vpn: "🛠️", dns: "🔎" }[b.kind] ?? "⚠️");
     setText("#banner .banner-text", b.message);
   }
 
@@ -719,6 +721,7 @@ function renderSettings() {
           <span><b>Kill switch</b><small>If the VPN drops, your internet stays blocked until it reconnects or you disconnect</small></span>
           <input type="checkbox" class="switch" id="set-kill" ${state.options.killSwitch ? "checked" : ""}>
         </label>
+        <div class="row" id="dns-row">${dnsRowHtml()}</div>
       </div>
 
       <div class="section-label">Skip the VPN</div>
@@ -1103,6 +1106,43 @@ function setScreen(screen: Screen) {
   render();
 }
 
+/** The Settings row that says where the names of the sites you open are looked up. */
+function dnsRowHtml(): string {
+  const note = {
+    "": "Checked while the VPN is connected",
+    checking: "Checking…",
+    vpn: "Through the VPN",
+    outside: "Not through the VPN",
+    unknown: "Couldn't be checked right now",
+  }[state.dnsPath];
+  const more =
+    state.dnsPath === "outside"
+      ? "The network you're on is still answering them, so it can see which sites you open. Disconnect and connect again; if this stays, update CakeVPN."
+      : "The names of the sites you open are looked up through the VPN, so the network you're on doesn't see them";
+  return `<span><b>Name lookups (DNS)</b><small>${more}</small></span>
+    <span class="value dns-${state.dnsPath || "idle"}">${note}</span>`;
+}
+
+/** Checks where name lookups go and shows it in Settings. */
+async function checkDns() {
+  const show = () => {
+    const row = $("#dns-row");
+    if (row) row.innerHTML = dnsRowHtml();
+  };
+  if (tunnelState() !== "connected") {
+    state.dnsPath = "";
+    return show();
+  }
+  state.dnsPath = "checking";
+  show();
+  try {
+    state.dnsPath = await backend.dnsCheck();
+  } catch {
+    state.dnsPath = "unknown";
+  }
+  show();
+}
+
 async function openSettings(toInvites = false) {
   try {
     const info = await backend.settingsInfo();
@@ -1117,6 +1157,7 @@ async function openSettings(toInvites = false) {
   setScreen("settings");
   // The usage graph is only asked for while Settings is open.
   if (state.account) loadHistory();
+  checkDns();
   if (toInvites) $("#invites")?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 

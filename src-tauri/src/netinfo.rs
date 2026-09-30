@@ -137,6 +137,76 @@ pub fn network(signal: bool) -> Network {
     }
 }
 
+/// Where this computer's name lookups (DNS) end up while the VPN is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DnsPath {
+    /// Through the VPN, as they should.
+    Vpn,
+    /// Answered by someone else: the network the computer is on.
+    Outside,
+    /// Could not be told (no internet, or the check itself no longer works).
+    Unknown,
+}
+
+/// Names that tell who answered. The VPN looks names up at Cloudflare over
+/// HTTPS, and Cloudflare keeps two names for testing exactly that: anything
+/// under the first one exists only when it is asked over HTTPS, anything
+/// under the second one never does when asked that way.
+const ONLY_OVER_HTTPS: &str = "is-doh.help.every1dns.net";
+const NEVER_OVER_HTTPS: &str = "is-dot.help.every1dns.net";
+
+/// Decides from what the three lookups found. `premise` is whether the first
+/// name really exists when Cloudflare is asked over HTTPS directly (None when
+/// that could not be asked); without it the check says nothing.
+fn dns_path_from(premise: Option<bool>, only_over_https: bool, never_over_https: bool) -> DnsPath {
+    match premise {
+        Some(true) if only_over_https && !never_over_https => DnsPath::Vpn,
+        // Either the first name is unknown to whoever answered, or they
+        // answer every name (a filter's block page): not the VPN's lookups.
+        Some(true) => DnsPath::Outside,
+        _ => DnsPath::Unknown,
+    }
+}
+
+async fn resolves(name: &str) -> bool {
+    let lookup = tokio::net::lookup_host(format!("{name}:443"));
+    match tokio::time::timeout(Duration::from_secs(5), lookup).await {
+        Ok(Ok(mut found)) => found.next().is_some(),
+        _ => false,
+    }
+}
+
+/// Asks Cloudflare over HTTPS directly whether a name exists.
+async fn exists_over_https(name: &str) -> Option<bool> {
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(6)).build().ok()?;
+    let answer: serde_json::Value = client
+        .get("https://1.1.1.1/dns-query")
+        .query(&[("name", name), ("type", "A")])
+        .header("accept", "application/dns-json")
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    Some(answer["Status"] == 0 && answer["Answer"].as_array().is_some_and(|a| !a.is_empty()))
+}
+
+/// Checks where this computer's name lookups go, by looking up names only
+/// the VPN's way of asking can find. Each check uses a name nobody has
+/// looked up before, so an answer remembered earlier can't get in the way.
+pub async fn dns_path() -> DnsPath {
+    let mut fresh = [0u8; 6];
+    if getrandom::fill(&mut fresh).is_err() {
+        return DnsPath::Unknown;
+    }
+    let label: String = fresh.iter().map(|b| format!("{b:02x}")).collect();
+    let only = format!("c{label}.{ONLY_OVER_HTTPS}");
+    let never = format!("c{label}.{NEVER_OVER_HTTPS}");
+    let (premise, only_found, never_found) = tokio::join!(exists_over_https(&only), resolves(&only), resolves(&never));
+    dns_path_from(premise, only_found, never_found)
+}
+
 /// Time to open a TCP connection to a location, in milliseconds.
 pub async fn tcp_ping(host: &str, port: u16) -> Option<u32> {
     let start = Instant::now();
@@ -189,6 +259,19 @@ mod tests {
         // Wi-Fi off or not joined: no current network.
         assert_eq!(parse_system_profiler(r#"{"SPAirPortDataType":[{"spairport_airport_interfaces":[{"_name":"en0"}]}]}"#), None);
         assert_eq!(parse_system_profiler("not json"), None);
+    }
+
+    #[test]
+    fn tells_where_names_are_looked_up() {
+        // Only the name that exists over HTTPS was found: the VPN's lookups.
+        assert_eq!(dns_path_from(Some(true), true, false), DnsPath::Vpn);
+        // The local network answered: it doesn't know the name...
+        assert_eq!(dns_path_from(Some(true), false, false), DnsPath::Outside);
+        // ...or it answers every name with its own page.
+        assert_eq!(dns_path_from(Some(true), true, true), DnsPath::Outside);
+        // The test names stopped working, or there is no internet: say nothing.
+        assert_eq!(dns_path_from(Some(false), false, false), DnsPath::Unknown);
+        assert_eq!(dns_path_from(None, true, false), DnsPath::Unknown);
     }
 
     #[test]

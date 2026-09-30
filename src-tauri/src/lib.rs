@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Manager, State, WindowEvent};
@@ -70,6 +70,10 @@ struct AppState {
     wifi: Mutex<WifiSeen>,
     /// How far each location last measured, for judging what "slow" is there.
     pings: Mutex<HashMap<String, u32>>,
+    slow: Mutex<Slowness>,
+    /// Where names are looked up, checked once per connection: the moment
+    /// the connection was made, and what the check found (None while it runs).
+    dns: Arc<Mutex<Option<(u64, Option<netinfo::DnsPath>)>>>,
     traffic: Mutex<Traffic>,
     /// The connection details last saved to disk, to save them only when they change.
     saved: Mutex<Option<String>>,
@@ -134,22 +138,56 @@ struct Around<'a> {
     wifi: &'a netinfo::Network,
     /// The line is full (a speed test, a big download), so slow answers are expected.
     busy: bool,
-    /// How far the connected location is, in milliseconds.
-    ping_ms: Option<u32>,
+    /// The checks through the VPN, and outside it, have been slow for a
+    /// while (see [`Slowness`]).
+    tunnel_slow: bool,
+    direct_slow: bool,
+    /// Names are being looked up by the local network instead of through the VPN.
+    dns_outside: bool,
 }
 
 /// A check outside the VPN slower than this means the connection itself is slow.
 const SLOW_DIRECT_MS: u32 = 500;
 /// A check through the VPN slower than this is slow for a location nearby.
-const SLOW_TUNNEL_MS: u32 = 600;
+const SLOW_TUNNEL_MS: u32 = 800;
+/// One slow check says little: the next is often quick again (the check
+/// looks a name up first now and then, the line hiccups). Slow counts once
+/// it has lasted this long, which is three checks in a row.
+const SLOW_FOR: Duration = Duration::from_secs(25);
+
+/// From how many milliseconds a check through the VPN is slow. Each check
+/// makes several round trips, so a far location answers later than a near
+/// one without anything being wrong.
+fn slow_tunnel_from(ping_ms: Option<u32>) -> u32 {
+    SLOW_TUNNEL_MS.max(ping_ms.unwrap_or(0).saturating_mul(6) + 250)
+}
+
+/// Since when the checks have been slow without a quick one in between.
+#[derive(Default)]
+struct Slowness {
+    tunnel: Option<Instant>,
+    direct: Option<Instant>,
+}
+
+impl Slowness {
+    /// Notes whether a check is slow now, and tells whether it has been for long enough to say so.
+    fn lasting(since: &mut Option<Instant>, slow_now: bool, now: Instant) -> bool {
+        if !slow_now {
+            *since = None;
+            return false;
+        }
+        now.duration_since(*since.get_or_insert(now)) >= SLOW_FOR
+    }
+}
 
 /// Decides which warning to show. One only appears when something is
-/// actually wrong for the person: the VPN isn't getting through or is very
-/// slow, or the connection is slow even outside the VPN. Then it names the
-/// cause, nearest first: the Wi-Fi (its signal is weak, or pings to the
-/// router are lost or slow), the internet connection (the same check fails
-/// or crawls outside the tunnel too), a busy location, or the VPN itself. A
-/// busy location is also mentioned when nothing is wrong yet.
+/// actually wrong for the person: the VPN isn't getting through or has been
+/// slow for a while, or the connection is slow even outside the VPN. Then it
+/// names the cause, nearest first: the Wi-Fi (its signal is weak, or pings
+/// to the router are lost or slow), the internet connection (the same check
+/// fails or crawls outside the tunnel too), a busy location, or the VPN
+/// itself. Without such trouble, it says when names are looked up outside
+/// the VPN, and when the location is busy.
 ///
 /// While the line is full slow answers are expected, so it takes more to
 /// count as a problem.
@@ -160,12 +198,9 @@ fn banner(status: &Status, around: &Around) -> Option<Banner> {
     let q = &status.quality;
     let busy = around.busy;
     let not_through = q.tunnel_failures >= if busy { 4 } else { 2 };
-    // Each check makes several round trips, so a far location answers later
-    // than a near one without anything being wrong.
-    let slow_from = SLOW_TUNNEL_MS.max(around.ping_ms.unwrap_or(0).saturating_mul(6) + 250);
-    let slow = !busy && q.tunnel_delay_ms.is_some_and(|d| d >= slow_from);
+    let slow = !busy && around.tunnel_slow;
     let direct_down = q.direct_failures >= 2;
-    let direct_slow = !busy && q.direct_delay_ms.is_some_and(|d| d >= SLOW_DIRECT_MS);
+    let direct_slow = !busy && around.direct_slow;
     let trouble = not_through || slow || direct_down || direct_slow;
 
     // One lost or slow ping now and then is normal; over a quarter of them is
@@ -201,6 +236,12 @@ fn banner(status: &Status, around: &Around) -> Option<Banner> {
 
     let high_load = around.load.is_some_and(|l| l.level == "high");
     if !trouble {
+        if around.dns_outside {
+            return Some(Banner {
+                kind: "dns",
+                message: "The names of the sites you open are still looked up by the network you're on, not through the VPN, so it can see them. Disconnect and connect again; if this stays, update CakeVPN.".into(),
+            });
+        }
         return high_load
             .then(|| Banner { kind: "load", message: "The location you're in is experiencing high load.".into() });
     }
@@ -479,8 +520,58 @@ async fn overview(state: State<'_, AppState>) -> Result<Overview, String> {
         Some(id) => state.pings.lock().await.get(id).copied(),
         None => None,
     };
-    let banner = banner(&status, &Around { load: load.as_ref(), wifi: &wifi, busy, ping_ms });
+    let (tunnel_slow, direct_slow) = {
+        let mut slow = state.slow.lock().await;
+        let q = &status.quality;
+        let now = Instant::now();
+        let measuring = connected && !busy;
+        (
+            Slowness::lasting(&mut slow.tunnel, measuring && q.tunnel_delay_ms.is_some_and(|d| d >= slow_tunnel_from(ping_ms)), now),
+            Slowness::lasting(&mut slow.direct, measuring && q.direct_delay_ms.is_some_and(|d| d >= SLOW_DIRECT_MS), now),
+        )
+    };
+    let dns_outside = dns_outside(&state, &status).await;
+    let banner = banner(&status, &Around { load: load.as_ref(), wifi: &wifi, busy, tunnel_slow, direct_slow, dns_outside });
     Ok(Overview { helper: helper_state, status: Some(status), banner, location_id, window_visible })
+}
+
+/// Once per connection, a little after it is made, checks in the background
+/// where this computer's name lookups go. True once a check found them
+/// outside the VPN.
+async fn dns_outside(state: &AppState, status: &Status) -> bool {
+    let (TunnelState::Connected, Some(since)) = (status.state, status.connected_since) else {
+        return false;
+    };
+    let mut dns = state.dns.lock().await;
+    match *dns {
+        Some((checked, found)) if checked == since => found == Some(netinfo::DnsPath::Outside),
+        _ => {
+            let connected_for = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0).saturating_sub(since);
+            if connected_for >= 8 {
+                *dns = Some((since, None));
+                let shared = Arc::clone(&state.dns);
+                tokio::spawn(async move {
+                    let found = netinfo::dns_path().await;
+                    let mut dns = shared.lock().await;
+                    if matches!(*dns, Some((checked, None)) if checked == since) {
+                        *dns = Some((since, Some(found)));
+                    }
+                });
+            }
+            false
+        }
+    }
+}
+
+/// Where this computer's name lookups go right now: "vpn", "outside" or
+/// "unknown". Settings shows it while the VPN is connected.
+#[tauri::command]
+async fn dns_check() -> &'static str {
+    match netinfo::dns_path().await {
+        netinfo::DnsPath::Vpn => "vpn",
+        netinfo::DnsPath::Outside => "outside",
+        netinfo::DnsPath::Unknown => "unknown",
+    }
 }
 
 #[tauri::command]
@@ -672,6 +763,8 @@ pub fn run() {
                 location: Mutex::new(None),
                 wifi: Mutex::new(WifiSeen::default()),
                 pings: Mutex::new(HashMap::new()),
+                slow: Mutex::new(Slowness::default()),
+                dns: Arc::new(Mutex::new(None)),
                 traffic: Mutex::new(Traffic::default()),
                 saved: Mutex::new(None),
                 visible: AtomicBool::new(shown),
@@ -741,6 +834,7 @@ pub fn run() {
             create_invite,
             delete_invite,
             usage_history,
+            dns_check,
             speed_test_download,
             speed_test_upload,
             check_update,
@@ -769,10 +863,23 @@ mod tests {
         Status { state: TunnelState::Connected, quality: q, ..Default::default() }
     }
 
+    /// What the app would pass for these measurements once slowness has lasted.
+    fn around<'a>(status: &Status, load: Option<&'a Load>, wifi: &'a netinfo::Network, busy: bool, ping_ms: Option<u32>) -> Around<'a> {
+        let q = &status.quality;
+        Around {
+            load,
+            wifi,
+            busy,
+            tunnel_slow: q.tunnel_delay_ms.is_some_and(|d| d >= slow_tunnel_from(ping_ms)),
+            direct_slow: q.direct_delay_ms.is_some_and(|d| d >= SLOW_DIRECT_MS),
+            dns_outside: false,
+        }
+    }
+
     /// The banner for someone near the location, whose Wi-Fi signal is unknown.
     fn seen(status: &Status, load: Option<&Load>, wifi_name: Option<&str>, busy: bool) -> Option<Banner> {
         let wifi = netinfo::Network { wifi_name: wifi_name.map(str::to_string), signal: None };
-        banner(status, &Around { load, wifi: &wifi, busy, ping_ms: Some(20) })
+        banner(status, &around(status, load, &wifi, busy, Some(20)))
     }
 
     fn load(level: &str) -> Load {
@@ -867,7 +974,7 @@ mod tests {
     fn weak_signal_is_named_when_it_shows() {
         let say = |s: &Status, signal| {
             let net = netinfo::Network { wifi_name: Some("Home".into()), signal: Some(signal) };
-            banner(s, &Around { load: None, wifi: &net, busy: false, ping_ms: Some(20) })
+            banner(s, &around(s, None, &net, false, Some(20)))
         };
 
         // All is quick: a weak signal is not worth a warning, and it may not even be the Wi-Fi in use.
@@ -893,15 +1000,50 @@ mod tests {
 
     #[test]
     fn a_far_location_may_answer_later() {
-        // 650 ms is slow for a location 20 ms away, and normal for one 120 ms away.
-        let s = connected(Quality { tunnel_delay_ms: Some(650), direct_delay_ms: Some(40), ..wifi(0.0) });
-        let wifi_info = netinfo::Network::default();
-        let say = |ping_ms| banner(&s, &Around { load: None, wifi: &wifi_info, busy: false, ping_ms });
-        assert_eq!(say(Some(20)).unwrap().kind, "vpn");
-        assert_eq!(say(Some(120)), None);
-        assert_eq!(say(None).unwrap().kind, "vpn");
+        // 900 ms is slow for a location 20 ms away, and normal for one 120 ms away.
+        let s = connected(Quality { tunnel_delay_ms: Some(900), direct_delay_ms: Some(40), ..wifi(0.0) });
+        let net = netinfo::Network::default();
+        let say = |status: &Status, ping_ms| banner(status, &around(status, None, &net, false, ping_ms));
+        assert_eq!(say(&s, Some(20)).unwrap().kind, "vpn");
+        assert_eq!(say(&s, Some(120)), None);
+        assert_eq!(say(&s, None).unwrap().kind, "vpn");
         let very = connected(Quality { tunnel_delay_ms: Some(1200), direct_delay_ms: Some(40), ..wifi(0.0) });
-        assert_eq!(banner(&very, &Around { load: None, wifi: &wifi_info, busy: false, ping_ms: Some(120) }).unwrap().kind, "vpn");
+        assert_eq!(say(&very, Some(120)).unwrap().kind, "vpn");
+        // Under the limit for a near location: nothing to say.
+        let ok = connected(Quality { tunnel_delay_ms: Some(700), direct_delay_ms: Some(40), ..wifi(0.0) });
+        assert_eq!(say(&ok, Some(20)), None);
+    }
+
+    #[test]
+    fn one_slow_check_is_not_a_slow_vpn() {
+        let start = Instant::now();
+        let mut since = None;
+        // Slow once, then quick again: never said.
+        assert!(!Slowness::lasting(&mut since, true, start));
+        assert!(!Slowness::lasting(&mut since, false, start + Duration::from_secs(10)));
+        // Slow check after slow check: said once it has lasted three checks.
+        assert!(!Slowness::lasting(&mut since, true, start + Duration::from_secs(20)));
+        assert!(!Slowness::lasting(&mut since, true, start + Duration::from_secs(30)));
+        assert!(Slowness::lasting(&mut since, true, start + Duration::from_secs(46)));
+        // A quick one ends it at once.
+        assert!(!Slowness::lasting(&mut since, false, start + Duration::from_secs(50)));
+        assert!(!Slowness::lasting(&mut since, true, start + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn lookups_outside_the_vpn_are_said_when_nothing_else_is_wrong() {
+        let net = netinfo::Network::default();
+        let fine = connected(Quality { tunnel_delay_ms: Some(60), direct_delay_ms: Some(40), ..wifi(0.0) });
+        let mut a = around(&fine, None, &net, false, Some(20));
+        a.dns_outside = true;
+        let b = banner(&fine, &a).unwrap();
+        assert_eq!(b.kind, "dns");
+        assert!(b.message.contains("not through the VPN"), "{}", b.message);
+        // Something that is broken right now comes first.
+        let down = connected(Quality { tunnel_failures: 3, direct_delay_ms: Some(30), ..wifi(0.0) });
+        let mut a = around(&down, None, &net, false, Some(20));
+        a.dns_outside = true;
+        assert_eq!(banner(&down, &a).unwrap().kind, "vpn");
     }
 
     #[test]

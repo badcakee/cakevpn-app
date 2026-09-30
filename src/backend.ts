@@ -117,6 +117,8 @@ export const backend = {
   deleteInvite: (code: string) => invoke<Account>("delete_invite", { code }),
   /** The last 30 days, oldest first. */
   usageHistory: () => invoke<DayUsage[]>("usage_history"),
+  /** Where this computer's name lookups go right now. */
+  dnsCheck: () => invoke<"vpn" | "outside" | "unknown">("dns_check"),
   /** Starts a speed test (the server may refuse: once a minute, a few a day) and returns the download Mbps. */
   speedTestDownload: () => invoke<number>("speed_test_download"),
   /** The upload half of the test just started, in Mbps. */

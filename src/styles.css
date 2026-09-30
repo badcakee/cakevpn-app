@@ -439,6 +439,7 @@ h1 {
 }
 
 .banner.load,
+.banner.dns,
 .banner.vpn {
   background: #ffe4e6;
   color: #9f1239;
@@ -1590,4 +1591,20 @@ label.row {
 .live-note {
   color: var(--green);
   font-weight: 600;
+}
+
+/* ---------- where name lookups go (Settings) ---------- */
+
+.row .value.dns-vpn {
+  color: var(--green);
+  font-weight: 600;
+}
+
+.row .value.dns-outside {
+  color: var(--red);
+  font-weight: 600;
+}
+
+#dns-row .value {
+  white-space: nowrap;
 }
