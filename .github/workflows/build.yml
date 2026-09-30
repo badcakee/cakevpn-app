@@ -2,8 +2,9 @@ name: Build CakeVPN
 
 # Run it from the Actions tab ("Run workflow"), or push a tag like v1.3.0.
 # Each run makes a GitHub release named after the version in
-# src-tauri/tauri.conf.json: a draft while the two platforms build, published
-# once both are in it. The apps check the newest published release for updates.
+# src-tauri/tauri.conf.json: a draft while Windows, Mac and Android build,
+# published once all three are in it. The apps check the newest published
+# release for updates.
 on:
   workflow_dispatch:
   push:
@@ -48,7 +49,7 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: CakeVPN __VERSION__
-          releaseBody: Download CakeVPN for Windows (.exe) or Mac (.dmg) below. Installed apps update themselves.
+          releaseBody: Download CakeVPN for Windows (.exe), Mac (.dmg) or Android (.apk) below. Installed apps update themselves.
           # A draft until both platforms are in it (see the last step), so apps
           # never find a release that lacks their platform.
           releaseDraft: true
@@ -88,13 +89,63 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: CakeVPN __VERSION__
-          releaseBody: Download CakeVPN for Windows (.exe) or Mac (.dmg) below. Installed apps update themselves.
+          releaseBody: Download CakeVPN for Windows (.exe), Mac (.dmg) or Android (.apk) below. Installed apps update themselves.
           # A draft until both platforms are in it (see the last step), so apps
           # never find a release that lacks their platform.
           releaseDraft: true
           prerelease: false
           args: --target universal-apple-darwin --bundles app,dmg
-      - name: Publish the release now that Windows and Mac are both in it
+
+  android:
+    # After Windows, which makes the draft release the APK goes into.
+    needs: windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Android SDK parts
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" > /dev/null
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - run: scripts/fetch-sing-box.sh android arm64-v8a
+      - name: Build the signed APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/cakevpn.jks"
+          export CAKEVPN_KEYSTORE="$RUNNER_TEMP/cakevpn.jks" CAKEVPN_KEY_ALIAS=cakevpn
+          export CAKEVPN_KEYSTORE_PASSWORD="$KEYSTORE_PASSWORD" CAKEVPN_KEY_PASSWORD="$KEYSTORE_PASSWORD"
+          export NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+          npx tauri android build --apk --target aarch64
+          rm -f "$RUNNER_TEMP/cakevpn.jks"
+      - name: Add the APK to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          apk="CakeVPN_${version}_android.apk"
+          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk "$apk"
+          gh release upload "v$version" "$apk" --clobber
+
+  publish:
+    needs: [macos, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish the release now that Windows, Mac and Android are all in it
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

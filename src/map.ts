@@ -104,6 +104,8 @@ export function drawMap() {
     const py = ty + Number(pin.dataset.y) * scale;
     const taken = (from: number, to: number) =>
       spots.some((s) => s.pin !== pin && s.x > px + from && s.x < px + to && Math.abs(s.y - py) < 20);
+    // A pin outside the card keeps its name to itself, or the name's end would show at the edge.
+    pin.classList.toggle("outside", px < 0 || px > size.w || py < 0 || py > size.h);
     const left = px > size.w - 170 || (taken(6, 150) && !taken(-150, -6) && px > 170);
     if (pin.classList.contains("left") !== left) {
       pin.classList.toggle("left", left);

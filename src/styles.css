@@ -1464,6 +1464,10 @@ label.row {
   fill: var(--land-connected);
 }
 
+.pin.outside text {
+  display: none;
+}
+
 .pin {
   cursor: pointer;
 }
