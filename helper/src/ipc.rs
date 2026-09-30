@@ -7,15 +7,17 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 /// Longest request line accepted; a connect request is well under 1 KB.
-const MAX_LINE: usize = 8 * 1024;
+/// Room for a connect request with full skip lists.
+const MAX_LINE: usize = 64 * 1024;
 
 async fn handle(tunnel: &Arc<Tunnel>, line: &str) -> Response {
     let request: Request = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
-            return Response { ok: false, error: Some(format!("bad request: {e}")), status: tunnel.status().await }
+            return Response { ok: false, error: Some(format!("bad request: {e}")), status: tunnel.status().await, pings: None }
         }
     };
+    let mut pings = None;
     let result = match request {
         Request::Connect { params } => tunnel.connect(params).await,
         Request::Disconnect => {
@@ -23,11 +25,12 @@ async fn handle(tunnel: &Arc<Tunnel>, line: &str) -> Response {
             Ok(())
         }
         Request::Status => Ok(()),
+        Request::Ping { targets } => tunnel.ping(targets).await.map(|measured| pings = Some(measured)),
     };
     let status = tunnel.status().await;
     match result {
-        Ok(()) => Response { ok: true, error: None, status },
-        Err(e) => Response { ok: false, error: Some(e), status },
+        Ok(()) => Response { ok: true, error: None, status, pings },
+        Err(e) => Response { ok: false, error: Some(e), status, pings: None },
     }
 }
 

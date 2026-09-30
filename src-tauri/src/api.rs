@@ -298,13 +298,6 @@ pub async fn speed_download(ticket: &SpeedTicket) -> Result<f64, ApiError> {
     })
 }
 
-/// How much to upload after a small first upload showed `bytes_per_sec`:
-/// about five seconds' worth, within what the ticket and memory allow.
-fn upload_size(bytes_per_sec: f64, left: u64) -> usize {
-    const MOST: u64 = 48 << 20;
-    ((bytes_per_sec * 5.0) as u64).clamp(256 << 10, MOST).min(left) as usize
-}
-
 /// What the server measured for one upload.
 #[derive(Deserialize)]
 struct Uploaded {
@@ -312,37 +305,50 @@ struct Uploaded {
     ms: u64,
 }
 
-async fn upload(client: reqwest::Client, url: String, size: usize) -> Option<Uploaded> {
+/// How long each upload connection keeps sending.
+const UPLOAD_SECONDS: u64 = 6;
+
+/// A request body that keeps sending until `seconds` have passed or `most`
+/// bytes went out, without holding it all in memory.
+fn upload_body(most: u64, seconds: u64) -> reqwest::Body {
     // Not all zeros, so nothing on the way can shrink it.
-    let mut body = vec![0u8; size];
+    let mut block = vec![0u8; 64 << 10];
     let mut x = 0x9e37_79b9_7f4a_7c15u64;
-    for chunk in body.chunks_mut(8) {
+    for chunk in block.chunks_mut(8) {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
         chunk.copy_from_slice(&x.to_le_bytes()[..chunk.len()]);
     }
-    let response = client.post(&url).body(body).send().await.ok()?;
+    let block = bytes::Bytes::from(block);
+    let started = std::time::Instant::now();
+    let stream = futures_util::stream::unfold(0u64, move |sent| {
+        let block = block.clone();
+        async move {
+            if sent >= most || started.elapsed() >= Duration::from_secs(seconds) {
+                return None;
+            }
+            let part = block.slice(..(most - sent).min(block.len() as u64) as usize);
+            let sent = sent + part.len() as u64;
+            Some((Ok::<_, std::io::Error>(part), sent))
+        }
+    });
+    reqwest::Body::wrap_stream(stream)
+}
+
+async fn upload(client: reqwest::Client, url: String, most: u64) -> Option<Uploaded> {
+    let response = client.post(&url).body(upload_body(most, UPLOAD_SECONDS)).send().await.ok()?;
     if !response.status().is_success() {
         return None;
     }
     response.json().await.ok()
 }
 
-/// Uploads and returns the speed in Mbps, as measured by the server: a small
-/// upload first to size the real one, which goes over several connections.
+/// Uploads over several connections for a few seconds and returns the speed
+/// in Mbps, as the server measured it.
 pub async fn speed_upload(ticket: &SpeedTicket) -> Result<f64, ApiError> {
-    const FIRST: usize = 256 << 10;
-    let client = speed_client(ticket.seconds);
-    let first = upload(client.clone(), ticket.up.clone(), FIRST.min(ticket.up_bytes as usize)).await.ok_or_else(speed_failed)?;
-    let first_secs = first.ms.max(1) as f64 / 1000.0;
-    let left = ticket.up_bytes.saturating_sub(first.bytes);
-    if left < (FIRST * SPEED_STREAMS) as u64 {
-        return Ok(mbps(first.bytes as f64, first_secs));
-    }
-    // One connection showed this rate; several together usually carry more,
-    // so the real upload is sized for twice that.
-    let each = upload_size(first.bytes as f64 / first_secs * 2.0, left) / SPEED_STREAMS;
+    let client = speed_client(UPLOAD_SECONDS);
+    let each = ticket.up_bytes / SPEED_STREAMS as u64;
     let tasks: Vec<_> = (0..SPEED_STREAMS)
         .map(|_| tauri::async_runtime::spawn(upload(client.clone(), ticket.up.clone(), each)))
         .collect();
@@ -365,18 +371,6 @@ pub async fn sign_out(token: &str) {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn upload_size_fits_the_speed_and_the_ticket() {
-        use super::upload_size;
-        // A slow line still sends enough to measure.
-        assert_eq!(upload_size(10_000.0, 30_000_000), 256 << 10);
-        // 25 Mbps: about five seconds' worth.
-        assert_eq!(upload_size(3_125_000.0, 30_000_000), 15_625_000);
-        // A fast line is held to what the ticket has left, and to 48 MB.
-        assert_eq!(upload_size(100_000_000.0, 20_000_000), 20_000_000);
-        assert_eq!(upload_size(100_000_000.0, 80 << 20), 48 << 20);
-    }
-
     /// Runs the real download and upload against a server when
     /// CAKEVPN_SPEED_DOWN and CAKEVPN_SPEED_UP hold a ticket's addresses.
     #[test]

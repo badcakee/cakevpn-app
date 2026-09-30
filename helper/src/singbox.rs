@@ -6,23 +6,7 @@ use std::path::Path;
 
 /// The ad and tracker list (see assets/README.md), written next to the
 /// config when blocking is on.
-pub const ADS_RULE_SET: &[u8] = include_bytes!("../assets/geosite-category-ads-all.srs");
-
-/// Well-known ad and tracking networks the list above leaves out.
-const EXTRA_AD_DOMAINS: [&str; 12] = [
-    "criteo.com",
-    "criteo.net",
-    "outbrain.com",
-    "scorecardresearch.com",
-    "quantserve.com",
-    "moatads.com",
-    "adsrvr.org",
-    "amazon-adsystem.com",
-    "pubmatic.com",
-    "rubiconproject.com",
-    "openx.net",
-    "casalemedia.com",
-];
+pub const ADS_RULE_SET: &[u8] = include_bytes!("../assets/ads.srs");
 
 /// How the tunnel takes over traffic.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -74,9 +58,7 @@ pub fn config(s: &Settings) -> Value {
     if let (true, Some(path)) = (p.block_ads, s.ads_rule_set) {
         rule_sets.push(json!({ "type": "local", "tag": "ads", "format": "binary", "path": path }));
         dns_rules.push(json!({ "rule_set": "ads", "action": "predefined", "rcode": "NXDOMAIN" }));
-        dns_rules.push(json!({ "domain_suffix": EXTRA_AD_DOMAINS, "action": "predefined", "rcode": "NXDOMAIN" }));
         rules.push(json!({ "rule_set": "ads", "action": "reject" }));
-        rules.push(json!({ "domain_suffix": EXTRA_AD_DOMAINS, "action": "reject" }));
     }
 
     rules.push(json!({ "network": "udp", "port": 443, "action": "reject" }));

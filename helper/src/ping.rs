@@ -144,3 +144,80 @@ mod imp {
         }
     }
 }
+
+/// The address this computer has on the router's network. Nothing is sent:
+/// asking where a packet to the router would leave from is enough.
+fn address_toward(gateway: Ipv4Addr) -> Option<Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect((gateway, 9)).ok()?;
+    match socket.local_addr().ok()? {
+        std::net::SocketAddr::V4(local) if !local.ip().is_unspecified() => Some(*local.ip()),
+        _ => None,
+    }
+}
+
+/// Ties a socket to the network interface that has `local`, so what it sends
+/// leaves there and not through the tunnel. A failure only means the ping
+/// comes out wrong, which `tcp_outside_tunnel` notices.
+#[cfg(target_os = "macos")]
+fn keep_on_interface(socket: &tokio::net::TcpSocket, local: Ipv4Addr) {
+    use std::os::fd::AsRawFd;
+    let Some(index) = netdev::get_interfaces().into_iter().find(|i| i.ipv4.iter().any(|n| n.addr() == local)).map(|i| i.index)
+    else {
+        return;
+    };
+    let index = index as libc::c_uint;
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_BOUND_IF,
+            &index as *const libc::c_uint as *const libc::c_void,
+            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+        );
+    }
+}
+
+#[cfg(windows)]
+fn keep_on_interface(socket: &tokio::net::TcpSocket, local: Ipv4Addr) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{setsockopt, IPPROTO_IP, IP_UNICAST_IF};
+    let Some(index) = netdev::get_interfaces().into_iter().find(|i| i.ipv4.iter().any(|n| n.addr() == local)).map(|i| i.index)
+    else {
+        return;
+    };
+    // IP_UNICAST_IF takes the interface index in network byte order.
+    let index = index.to_be();
+    unsafe {
+        setsockopt(socket.as_raw_socket() as usize, IPPROTO_IP, IP_UNICAST_IF, &index as *const u32 as *const u8, 4);
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn keep_on_interface(_socket: &tokio::net::TcpSocket, _local: Ipv4Addr) {}
+
+/// Times a TCP connection to `host:port` that goes out on the router's
+/// network and not through the tunnel, in milliseconds.
+///
+/// Inside the tunnel a connection is answered by the tunnel itself in well
+/// under a millisecond. So when the tunnel takes everything (`through_tun`),
+/// a time that short means the connection didn't get outside, and no ping is
+/// better than a wrong one.
+pub async fn tcp_outside_tunnel(gateway: Option<Ipv4Addr>, host: &str, port: u16, through_tun: bool) -> Option<u32> {
+    use std::net::SocketAddr;
+    let target = tokio::net::lookup_host((host, port)).await.ok()?.find(|a| a.is_ipv4())?;
+    let socket = tokio::net::TcpSocket::new_v4().ok()?;
+    if let Some(local) = gateway.and_then(address_toward) {
+        socket.bind(SocketAddr::new(local.into(), 0)).ok()?;
+        keep_on_interface(&socket, local);
+    } else if through_tun {
+        return None; // no way to tell which network leads outside
+    }
+    let start = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(3), socket.connect(target)).await.ok()?.ok()?;
+    let elapsed = start.elapsed();
+    if through_tun && elapsed < Duration::from_micros(800) {
+        return None;
+    }
+    Some((elapsed.as_millis() as u32).max(1))
+}

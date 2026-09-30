@@ -17,7 +17,12 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// 4: ad blocking, the kill switch and split tunneling.
 /// 5: checks the internet outside the tunnel too, measures afresh after the
 ///    computer wakes up, and reports traffic as fresh as the app asks.
-pub const HELPER_REVISION: u32 = 5;
+/// 6: a much bigger ad and tracker list, and pings to the locations while
+///    the tunnel is up.
+pub const HELPER_REVISION: u32 = 6;
+
+/// Most locations one ping request can name.
+pub const MAX_PING_TARGETS: usize = 32;
 
 /// Most websites and apps one person can set to skip the VPN.
 pub const MAX_BYPASS_DOMAINS: usize = 100;
@@ -128,12 +133,38 @@ impl ConnectParams {
     }
 }
 
+/// A location to measure while the tunnel is up. The helper connects to
+/// `host:port` outside the tunnel, which the app itself cannot do then.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PingTarget {
+    pub id: String,
+    pub host: String,
+    pub port: u16,
+}
+
+impl PingTarget {
+    /// The same kind of check as for connect details: nothing but plain values.
+    pub fn validate(&self) -> Result<(), String> {
+        let plain = |s: &str, max: usize, ok: &dyn Fn(char) -> bool| !s.is_empty() && s.len() <= max && s.chars().all(ok);
+        if !plain(&self.id, 40, &|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Err("bad location id".into());
+        }
+        if !plain(&self.host, 253, &|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') || self.port == 0 {
+            return Err("bad location address".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "cmd", rename_all = "camelCase")]
 pub enum Request {
     Connect { params: ConnectParams },
     Disconnect,
     Status,
+    /// Measures the locations outside the tunnel. Only answered while connected.
+    Ping { targets: Vec<PingTarget> },
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -199,6 +230,9 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub status: Status,
+    /// The answer to `Ping`: milliseconds per location id, `None` where it didn't answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pings: Option<std::collections::HashMap<String, Option<u32>>>,
 }
 
 #[cfg(test)]
@@ -262,6 +296,21 @@ mod tests {
             let mut p = good();
             change(&mut p);
             assert!(p.validate().is_err(), "{p:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn ping_targets_are_plain_values() {
+        let good = PingTarget { id: "node-1".into(), host: "194.156.89.230".into(), port: 443 };
+        assert_eq!(good.validate(), Ok(()));
+        for bad in [
+            PingTarget { host: "a/b?x=1".into(), ..good.clone() },
+            PingTarget { host: "a b".into(), ..good.clone() },
+            PingTarget { host: String::new(), ..good.clone() },
+            PingTarget { port: 0, ..good.clone() },
+            PingTarget { id: "x\"y".into(), ..good.clone() },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?} was accepted");
         }
     }
 

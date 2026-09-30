@@ -1,7 +1,8 @@
 //! Starts and stops sing-box and keeps track of how the tunnel is doing.
 
 use crate::{ping, quality::Tracker, singbox};
-use cakevpn_proto::{ConnectParams, Status, TunnelState, HELPER_REVISION, PROTOCOL_VERSION};
+use cakevpn_proto::{ConnectParams, PingTarget, Status, TunnelState, HELPER_REVISION, MAX_PING_TARGETS, PROTOCOL_VERSION};
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -164,6 +165,42 @@ impl Tunnel {
         let me = Arc::clone(self);
         tokio::spawn(async move { me.watch(generation).await });
         Ok(())
+    }
+
+    /// Measures the locations while the tunnel is up. The app can't: all it
+    /// sends goes through the tunnel. The helper times a TCP connection to
+    /// each one on the network the router is on, outside the tunnel, which
+    /// is the same measurement the app makes while the tunnel is down.
+    pub async fn ping(&self, targets: Vec<PingTarget>) -> Result<HashMap<String, Option<u32>>, String> {
+        if targets.len() > MAX_PING_TARGETS {
+            return Err("too many locations".into());
+        }
+        for target in &targets {
+            target.validate()?;
+        }
+        let (gateway, through_tun) = {
+            let inner = self.inner.lock().await;
+            if inner.state != TunnelState::Connected {
+                return Err("not connected".into());
+            }
+            (inner.gateway, self.paths.capture == singbox::Capture::Tun)
+        };
+        let tasks: Vec<_> = targets
+            .into_iter()
+            .map(|target| {
+                tokio::spawn(async move {
+                    let ms = ping::tcp_outside_tunnel(gateway, &target.host, target.port, through_tun).await;
+                    (target.id, ms)
+                })
+            })
+            .collect();
+        let mut pings = HashMap::new();
+        for task in tasks {
+            if let Ok((id, ms)) = task.await {
+                pings.insert(id, ms);
+            }
+        }
+        Ok(pings)
     }
 
     /// Starts sing-box with a config written by `connect`. A fresh start

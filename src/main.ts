@@ -155,7 +155,7 @@ let speedMoving = false;
 
 function drawSpeed() {
   const el = $("#speed");
-  if (!el) return;
+  if (!el || !windowInFront()) return;
   const html = tunnelState() === "connected" ? `↓ ${formatRate(shownSpeed.down)}<br>↑ ${formatRate(shownSpeed.up)}` : "—";
   if (el.innerHTML !== html) el.innerHTML = html;
 }
@@ -170,9 +170,13 @@ function speedStep(now: number) {
   else speedMoving = false;
 }
 
-/** Shows a new speed reading: gliding when someone is looking, at once otherwise. */
+/**
+ * Shows a new speed reading, gliding to it. Only while the window is in
+ * front: covered by another app or in the tray, the numbers stay as they are
+ * and nothing is drawn.
+ */
 function showSpeed(target: { up: number; down: number }) {
-  if (!windowVisible() || state.screen !== "home") {
+  if (!windowInFront() || state.screen !== "home") {
     Object.assign(shownSpeed, target);
     speedMoving = false;
     return;
@@ -215,10 +219,9 @@ function invitesOn(account: Account | null): boolean {
   return !!account?.referral && account.referral.maxFriends > 0;
 }
 
-/** Lower is better: a quick answer and a quiet server. */
+/** Lower is better: the closest location wins. One that wasn't measured comes after those that were. */
 function score(loc: Location): number {
-  const ping = state.pings[loc.id];
-  return (ping ?? 250) + (loc.load?.percent ?? 50) * 2;
+  return state.pings[loc.id] ?? 100_000;
 }
 
 /** Above this load (in percent) CakeVPN sends people to a quieter location. */
@@ -235,10 +238,13 @@ function quieterLocation(except?: Location): Location | undefined {
     .sort((a, b) => score(a) - score(b))[0];
 }
 
+/**
+ * The best location is the closest one (lowest ping). Load only matters once
+ * a location is overloaded: then the closest of the others is best. Sorting
+ * keeps the list's order for equal or unmeasured pings.
+ */
 function bestLocation(): Location | undefined {
   const online = (state.account?.locations ?? []).filter((l) => l.online);
-  // With no ping measured yet, load alone would send people far away: keep the list's order.
-  if (!online.some((l) => state.pings[l.id] != null)) return online.find((l) => !overloaded(l)) ?? online[0];
   return quieterLocation() ?? online.sort((a, b) => score(a) - score(b))[0];
 }
 
@@ -1427,9 +1433,12 @@ async function leaveOverloadedLocation() {
 }
 
 async function refreshPings() {
-  if (!state.account || tunnelState() === "connected" || tunnelState() === "connecting") return;
+  // While connected the helper measures outside the tunnel; while connecting nothing can.
+  if (!state.account || tunnelState() === "connecting") return;
   try {
-    state.pings = { ...state.pings, ...(await backend.pingLocations()) };
+    const measured = await backend.pingLocations();
+    // A location that didn't answer keeps its last ping rather than losing it.
+    for (const [id, ms] of Object.entries(measured)) if (ms != null) state.pings[id] = ms;
     saved.set("pings", JSON.stringify(state.pings));
     updateLocations();
   } catch {
@@ -1481,12 +1490,12 @@ function windowInFront(): boolean {
 
 /**
  * How often each thing is checked (ms): every second while the window is in
- * front (so "Speed now" moves smoothly), less while another app is in front
- * of it, rarely in the tray.
+ * front (so "Speed now" moves smoothly); covered by another app or in the
+ * tray, only every 10 seconds, enough to notice the VPN going up or down.
  */
 const PACE = {
   // A little under a second, so a timer that fires a moment early doesn't skip a turn.
-  overview: { inFront: 900, visible: 3_000, hidden: 10_000 },
+  overview: { inFront: 900, visible: 10_000, hidden: 10_000 },
   account: { visible: 10_000, hiddenConnected: 60_000, hidden: 5 * 60_000, unreachable: 30_000 },
   pings: 30_000,
   update: 3 * 60 * 60_000,
@@ -1497,20 +1506,22 @@ let ticking = false;
 
 /**
  * Runs every second and does whatever is due. One ticker instead of several
- * timers keeps the app quiet in the tray: nothing but a status check every 10
- * seconds there, and the account once a minute while connected.
+ * timers keeps the app quiet while nobody is looking: nothing but a status
+ * check every 10 seconds then, and the account once a minute while connected.
  */
 async function tick(returned = false) {
   if (ticking) return;
   ticking = true;
   try {
     const now = Date.now();
-    let visible = windowVisible() || returned;
-    const overviewEvery = !visible ? PACE.overview.hidden : windowInFront() || returned ? PACE.overview.inFront : PACE.overview.visible;
+    // "Looking" means the window is open and in front. Covered by another
+    // app, minimized or in the tray all count as not looking.
+    let looking = windowInFront() || returned;
+    const overviewEvery = looking ? PACE.overview.inFront : PACE.overview.hidden;
     if (now - state.last.overview >= overviewEvery || returned) {
       state.last.overview = now;
       await refreshOverview();
-      visible = windowVisible();
+      looking = windowInFront();
       if (state.screen === "code" && state.lockedUntil > 0) {
         if (state.lockedUntil <= Date.now()) {
           state.lockedUntil = 0;
@@ -1520,16 +1531,16 @@ async function tick(returned = false) {
         }
       }
     }
-    // The connected timer counts every second, but only while someone can see it.
-    if (visible && state.screen === "home") updateHome();
+    // The connected timer counts every second, but only while someone is looking.
+    if (looking && state.screen === "home") updateHome();
 
     const connected = tunnelState() === "connected";
-    let accountEvery = visible ? PACE.account.visible : connected ? PACE.account.hiddenConnected : PACE.account.hidden;
+    let accountEvery = looking ? PACE.account.visible : connected ? PACE.account.hiddenConnected : PACE.account.hidden;
     // A server that can't be reached (and no VPN to reach it through) is asked less often.
     if (state.offline && !connected) accountEvery = Math.max(accountEvery, PACE.account.unreachable);
     if (now - state.lastRefresh >= accountEvery) await refreshAccount();
 
-    if (visible && now - state.last.pings >= PACE.pings) {
+    if (looking && now - state.last.pings >= PACE.pings) {
       state.last.pings = now;
       await refreshPings();
     }

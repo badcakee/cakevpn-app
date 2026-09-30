@@ -4,7 +4,7 @@ mod netinfo;
 mod store;
 
 use api::{Account, ApiError, Load};
-use cakevpn_proto::{Request, Status, TunnelState, HELPER_REVISION, PROTOCOL_VERSION};
+use cakevpn_proto::{PingTarget, Request, Status, TunnelState, HELPER_REVISION, PROTOCOL_VERSION};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -424,15 +424,11 @@ async fn install_helper() -> Result<(), String> {
     }
 }
 
-/// How fast each location answers, measured outside the tunnel. While the
-/// tunnel is up the numbers would be wrong, so nothing is measured then.
+/// Measures how far each location is, in milliseconds. While the tunnel is
+/// down the app connects to them itself. While it is up, everything the app
+/// sends goes through the tunnel, so the helper measures outside it instead.
 #[tauri::command]
 async fn ping_locations(state: State<'_, AppState>) -> Result<HashMap<String, Option<u32>>, String> {
-    if let Ok(r) = helper::ask(Request::Status).await {
-        if r.status.state != TunnelState::Disconnected && r.status.state != TunnelState::Failed {
-            return Ok(HashMap::new());
-        }
-    }
     let targets: Vec<(String, String, u16)> = state
         .account
         .lock()
@@ -445,6 +441,17 @@ async fn ping_locations(state: State<'_, AppState>) -> Result<HashMap<String, Op
                 .collect()
         })
         .unwrap_or_default();
+    if let Ok(r) = helper::ask(Request::Status).await {
+        match r.status.state {
+            TunnelState::Connected => {
+                let targets = targets.into_iter().map(|(id, host, port)| PingTarget { id, host, port }).collect();
+                return Ok(helper::ask(Request::Ping { targets }).await?.pings.unwrap_or_default());
+            }
+            // Routes are changing; a measurement now would mean nothing.
+            TunnelState::Connecting => return Ok(HashMap::new()),
+            _ => {}
+        }
+    }
     let mut pings = HashMap::new();
     for (id, host, port) in targets {
         pings.insert(id, netinfo::tcp_ping(&host, port).await);
