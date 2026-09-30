@@ -81,6 +81,18 @@ export interface ApiError {
 
 export type TunnelState = "disconnected" | "connecting" | "connected" | "failed";
 
+/** The helper's checks of the connection, repeated every 10 seconds (every 2 while failing). */
+export interface Quality {
+  /** Round trip through the tunnel to a website. */
+  tunnelDelayMs: number | null;
+  /** Checks through the tunnel in a row that got no answer. */
+  tunnelFailures: number;
+  /** The same round trip outside the tunnel. */
+  directDelayMs: number | null;
+  /** Checks outside the tunnel in a row that got no answer. */
+  directFailures: number;
+}
+
 export interface Status {
   version: string;
   state: TunnelState;
@@ -88,6 +100,7 @@ export interface Status {
   connectedSince: number | null;
   upBytes: number;
   downBytes: number;
+  quality?: Quality;
 }
 
 export interface Overview {

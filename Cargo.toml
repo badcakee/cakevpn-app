@@ -3,9 +3,17 @@ resolver = "2"
 members = ["proto", "helper", "src-tauri"]
 
 [workspace.package]
-version = "1.7.0"
+version = "1.7.1"
 edition = "2021"
 license = "Proprietary"
+
+# Test builds keep only line numbers for debugging: full debug info made the
+# target folder grow to 15 GB on the build server.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 opt-level = "s"

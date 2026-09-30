@@ -9,6 +9,8 @@ import { placeOf } from "./places";
 type Screen = "loading" | "code" | "home" | "setup" | "settings";
 type Theme = "system" | "light" | "dark";
 type SettingsTab = "general" | "connection" | "notifications" | "protection" | "skip" | "account" | "invites" | "about";
+/** What is wrong with the connected location: nothing, it stopped responding, or it got slow from high load. */
+type Trouble = "" | "down" | "slow";
 
 const saved = {
   get: (key: string) => {
@@ -78,8 +80,9 @@ const state = {
   updateMessage: "",
   lastBytes: null as { at: number; up: number; down: number } | null,
   speed: { up: 0, down: 0 },
-  /** Why CakeVPN moved to another location, shown under the button. */
+  /** Why CakeVPN moved to another location, shown under the button until moveNoticeUntil. */
   moveNotice: "",
+  moveNoticeUntil: 0,
   /** The server can't be reached (some networks block it); the saved account is in use. */
   offline: false,
   /** Protection settings; they take effect at the next connect. */
@@ -132,11 +135,13 @@ const state = {
   last: { overview: 0, pings: 0, update: 0, network: 0 },
   /** When the account was last asked for, to ask less often while offline. */
   lastRefresh: 0,
-  /** Since when (ms) the connected location has been overloaded; 0 when it isn't. */
-  overloadSince: 0,
+  /** What is wrong with the connected location right now, and since when (ms). */
+  trouble: { kind: "" as Trouble, since: 0 },
+  /** The fastest checks of this connection so far, to see a sudden slowdown against. */
+  baseline: { key: "", tunnel: 0, direct: 0 },
   /** The invite code whose Delete button was pressed once and now asks to confirm. */
   confirmDelete: "",
-  /** When CakeVPN last moved away from an overloaded location. */
+  /** When CakeVPN last moved away from a location by itself. */
   movedAt: 0,
 };
 
@@ -261,28 +266,32 @@ function score(loc: Location): number {
   return state.pings[loc.id] ?? 100_000;
 }
 
-/** Above this load (in percent) CakeVPN sends people to a quieter location. */
+/** From this load (in percent) on, the server calls a location's load high. */
 const OVERLOAD_PERCENT = 85;
 
 function overloaded(loc: Location | undefined): boolean {
-  return (loc?.load?.percent ?? 0) > OVERLOAD_PERCENT;
-}
-
-/** The best online location that isn't overloaded, other than `except`. */
-function quieterLocation(except?: Location): Location | undefined {
-  return (state.account?.locations ?? [])
-    .filter((l) => l.online && l.id !== except?.id && !overloaded(l))
-    .sort((a, b) => score(a) - score(b))[0];
+  return (loc?.load?.percent ?? 0) >= OVERLOAD_PERCENT;
 }
 
 /**
- * The best location is the closest one (lowest ping). Load only matters once
- * a location is overloaded: then the closest of the others is best. Sorting
- * keeps the list's order for equal or unmeasured pings.
+ * The best location is the closest one: the lowest ping. Load doesn't
+ * count; a busy location is only left when it actually gets slow (see
+ * leaveTroubledLocation). Sorting keeps the list's order for equal or
+ * unmeasured pings.
  */
 function bestLocation(): Location | undefined {
-  const online = (state.account?.locations ?? []).filter((l) => l.online);
-  return quieterLocation() ?? online.sort((a, b) => score(a) - score(b))[0];
+  return (state.account?.locations ?? []).filter((l) => l.online).sort((a, b) => score(a) - score(b))[0];
+}
+
+/**
+ * Where to go when `from` is in trouble: the closest other location that
+ * answers pings. After a slowdown from high load, not to another busy one.
+ */
+function otherLocation(from: Location, kind: Trouble): Location | undefined {
+  return (state.account?.locations ?? [])
+    .filter((l) => l.online && l.id !== from.id && state.pings[l.id] != null)
+    .filter((l) => kind !== "slow" || !overloaded(l))
+    .sort((a, b) => score(a) - score(b))[0];
 }
 
 /** The location on the home screen: the one the VPN is connected to, otherwise the chosen one. */
@@ -303,8 +312,18 @@ function followMove(to: Location) {
   }
 }
 
-function moveMessage(from: Location, to: Location): string {
-  return `${from.name} is very busy right now (${from.load?.percent ?? OVERLOAD_PERCENT}% load), so CakeVPN moved you to ${to.name}.`;
+function moveMessage(from: Location, to: Location, kind: Trouble): string {
+  return kind === "down"
+    ? `${from.name} stopped responding, so CakeVPN moved you to ${to.name}.`
+    : `${from.name} slowed down from high load, so CakeVPN moved you to ${to.name}.`;
+}
+
+/** The note under the button goes away by itself after a while, or with its ×. */
+const MOVE_NOTICE_FOR = 30_000;
+
+function showMoveNotice(text: string) {
+  state.moveNotice = text;
+  state.moveNoticeUntil = Date.now() + MOVE_NOTICE_FOR;
 }
 
 function chosenLocation(): Location | undefined {
@@ -529,7 +548,7 @@ function renderHome() {
           </button>
           <div class="status-line" id="status-line"></div>
           <div class="error hidden" id="action-error"></div>
-          <div class="notice hidden" id="move-notice"></div>
+          <div class="notice move hidden" id="move-notice"><span id="move-text"></span><button class="notice-close" id="move-close" aria-label="Close">×</button></div>
           <div class="notice hidden" id="offline-notice">CakeVPN's sign-in server can't be reached on this network. You can still connect with your saved details.</div>
           <div class="banner" id="banner"><span class="banner-icon"></span><span class="banner-text"></span></div>
 
@@ -565,6 +584,10 @@ function renderHome() {
     </main>`;
 
   $("#power")!.addEventListener("click", togglePower);
+  $("#move-close")!.addEventListener("click", () => {
+    state.moveNotice = "";
+    updateHome();
+  });
   $("#open-settings")!.addEventListener("click", () => openSettings());
   $("#invite-link")?.addEventListener("click", () => openSettings(true));
   $("#update-now")!.addEventListener("click", installUpdate);
@@ -638,9 +661,10 @@ function updateHome() {
   const error = $("#action-error")!;
   error.classList.toggle("hidden", !state.actionError);
   setText("#action-error", state.actionError);
+  if (state.moveNotice && Date.now() > state.moveNoticeUntil) state.moveNotice = "";
   const moved = $("#move-notice")!;
   moved.classList.toggle("hidden", !state.moveNotice);
-  setText("#move-notice", state.moveNotice);
+  setText("#move-text", state.moveNotice);
   // Once connected the server is reached through the VPN, so the note goes away.
   $("#offline-notice")!.classList.toggle("hidden", !state.offline || tstate === "connected" || tstate === "connecting");
 
@@ -1826,15 +1850,8 @@ async function togglePower() {
     if (tstate === "connected" || tstate === "connecting") {
       await backend.disconnect();
     } else {
-      let loc = chosenLocation();
+      const loc = chosenLocation();
       if (!loc) throw { message: "No location is online right now." };
-      const quieter = overloaded(loc) ? quieterLocation(loc) : undefined;
-      if (quieter) {
-        state.moveNotice = moveMessage(loc, quieter);
-        followMove(quieter);
-        loc = quieter;
-        updateLocations();
-      }
       await connectTo(loc.id);
     }
   } catch (e) {
@@ -1910,6 +1927,8 @@ async function refreshOverview() {
     const before = tunnelState();
     state.overview = ov;
     watchConnection(before, tunnelState());
+    noteBaseline();
+    void leaveTroubledLocation();
     syncTray();
     const s = ov.status;
     if (s && s.state === "connected") {
@@ -1945,7 +1964,6 @@ async function refreshAccount() {
     syncTray();
     updateLocations();
     updateHome();
-    await leaveOverloadedLocation();
   } catch (e) {
     const err = asApiError(e);
     if (err.error === "offline" && !state.offline) {
@@ -1957,24 +1975,61 @@ async function refreshAccount() {
   }
 }
 
+/** How long trouble must last before CakeVPN moves (ms). */
+const DOWN_FOR = 5_000;
+const SLOW_FOR = 30_000;
+/** CakeVPN moves by itself at most once in this long (ms), so people don't bounce around. */
+const MOVE_AT_MOST_EVERY = 10 * 60_000;
+
+/** Remembers the fastest checks of this connection, which a sudden slowdown is measured against. */
+function noteBaseline() {
+  const status = state.overview?.status;
+  if (status?.state !== "connected") return;
+  const key = `${state.overview?.locationId}@${status.connectedSince}`;
+  if (state.baseline.key !== key) state.baseline = { key, tunnel: 0, direct: 0 };
+  const q = status.quality;
+  const lowest = (was: number, now: number | null | undefined) => (now ? (was ? Math.min(was, now) : now) : was);
+  state.baseline.tunnel = lowest(state.baseline.tunnel, q?.tunnelDelayMs);
+  state.baseline.direct = lowest(state.baseline.direct, q?.directDelayMs);
+}
+
+/** At least twice as slow and 300 ms slower than the fastest check. */
+function jumped(now: number | null | undefined, base: number): boolean {
+  return !!now && !!base && now >= Math.max(2 * base, base + 300);
+}
+
 /**
- * Moves the tunnel off a location that stays above OVERLOAD_PERCENT for 20
- * seconds, when a quieter one is up. It moves at most once every 10 minutes
- * so people don't bounce around.
+ * What is wrong with the connected location, if it's the location's fault:
+ * - "down": the checks through the VPN time out while the internet itself answers;
+ * - "slow": the ping through the VPN jumped while the location's load is high,
+ *   and the internet outside the VPN didn't slow down with it.
+ * Anything else (the Wi-Fi, the internet, another location's load) is no reason to move.
  */
-async function leaveOverloadedLocation() {
+function troubleNow(current: Location): Trouble {
+  const q = state.overview?.status?.quality;
+  if (!q || q.directFailures > 0) return "";
+  if (q.tunnelFailures >= 3) return "down";
+  const base = state.baseline;
+  if (overloaded(current) && jumped(q.tunnelDelayMs, base.tunnel) && !jumped(q.directDelayMs, base.direct)) return "slow";
+  return "";
+}
+
+/**
+ * Moves the tunnel to the closest other location when the connected one
+ * stops responding (5 s after the third check in a row timed out), or gets
+ * slow from its own high load for 30 seconds.
+ */
+async function leaveTroubledLocation() {
   const current = (state.account?.locations ?? []).find((l) => l.id === state.overview?.locationId);
-  if (tunnelState() !== "connected" || !overloaded(current)) {
-    state.overloadSince = 0;
-    return;
-  }
+  const kind = tunnelState() === "connected" && current ? troubleNow(current) : "";
   const now = Date.now();
-  if (!state.overloadSince) state.overloadSince = now;
-  if (state.busy || now - state.overloadSince < 20_000 || now - state.movedAt < 10 * 60 * 1000) return;
-  const target = quieterLocation(current);
-  if (!current || !target) return;
-  state.overloadSince = 0;
-  state.movedAt = Date.now();
+  if (kind !== state.trouble.kind) state.trouble = { kind, since: now };
+  if (!kind || !current || state.busy) return;
+  if (now - state.trouble.since < (kind === "down" ? DOWN_FOR : SLOW_FOR) || now - state.movedAt < MOVE_AT_MOST_EVERY) return;
+  const target = otherLocation(current, kind);
+  if (!target) return;
+  state.trouble = { kind: "", since: now };
+  state.movedAt = now;
   expectChange();
   followMove(target);
   state.busy = true;
@@ -1982,7 +2037,7 @@ async function leaveOverloadedLocation() {
   updateHome();
   try {
     await connectTo(target.id);
-    state.moveNotice = moveMessage(current, target);
+    showMoveNotice(moveMessage(current, target, kind));
     notifyUser("connection", t("CakeVPN moved you"), state.moveNotice);
   } catch (e) {
     state.actionError = asApiError(e).message;
