@@ -847,10 +847,29 @@ label.row {
   }
 }
 
+/* Invite codes are blurred until the mouse is on their row (or a button in
+   it has the keyboard's focus), so they can't be read off a shared screen.
+   The one just made is shown. */
 .invite-code {
   flex: 1;
   font: 700 17px ui-monospace, "SF Mono", Consolas, monospace;
   letter-spacing: 2px;
+  filter: blur(6px);
+  opacity: 0.75;
+  transition: filter 0.3s var(--ease), opacity 0.3s var(--ease);
+}
+
+.invite-row:hover .invite-code,
+.invite-row:focus-within .invite-code,
+.invite-row.new .invite-code {
+  filter: blur(0);
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .invite-code {
+    transition: none;
+  }
 }
 
 .tag {

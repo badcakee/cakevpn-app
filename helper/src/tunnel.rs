@@ -1,6 +1,6 @@
 //! Starts and stops sing-box and keeps track of how the tunnel is doing.
 
-use crate::{ping, quality::Tracker, singbox};
+use crate::{dns, ping, quality::Tracker, singbox};
 use cakevpn_proto::{ConnectParams, PingTarget, Status, TunnelState, HELPER_REVISION, MAX_PING_TARGETS, PROTOCOL_VERSION};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -122,7 +122,7 @@ impl Tunnel {
     pub async fn connect(self: &Arc<Self>, params: ConnectParams) -> Result<(), String> {
         params.validate()?;
         let mut inner = self.inner.lock().await;
-        stop_child(&mut inner).await;
+        self.stop(&mut inner).await;
         inner.generation += 1;
         let generation = inner.generation;
         inner.state = TunnelState::Connecting;
@@ -156,6 +156,11 @@ impl Tunnel {
 
         let child = self.spawn(&config_path, true).inspect_err(|_| inner.state = TunnelState::Failed)?;
         inner.child = Some(child);
+        // On a Mac, names would otherwise still be asked of the local network.
+        if self.paths.capture == singbox::Capture::Tun {
+            let dir = dir.clone();
+            let _ = tokio::task::spawn_blocking(move || dns::into_tunnel(&dir)).await;
+        }
         inner.api = Some((port, secret));
         inner.config_path = Some(config_path);
         inner.restarts.clear();
@@ -225,7 +230,7 @@ impl Tunnel {
     pub async fn disconnect(&self) {
         let mut inner = self.inner.lock().await;
         inner.generation += 1;
-        stop_child(&mut inner).await;
+        self.stop(&mut inner).await;
         inner.state = TunnelState::Disconnected;
         inner.error = None;
         inner.since = None;
@@ -240,11 +245,20 @@ impl Tunnel {
         if inner.generation != generation {
             return;
         }
-        stop_child(&mut inner).await;
+        self.stop(&mut inner).await;
         inner.state = TunnelState::Failed;
         inner.error = Some(message);
         inner.since = None;
         inner.api = None;
+    }
+
+    /// Ends sing-box and gives the computer its own DNS back.
+    async fn stop(&self, inner: &mut Inner) {
+        stop_child(inner).await;
+        if self.paths.capture == singbox::Capture::Tun {
+            let dir = self.paths.data_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || dns::back_to_normal(&dir)).await;
+        }
     }
 
     fn log_tail(&self) -> String {

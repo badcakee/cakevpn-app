@@ -19,7 +19,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 ///    computer wakes up, and reports traffic as fresh as the app asks.
 /// 6: a much bigger ad and tracker list, and pings to the locations while
 ///    the tunnel is up.
-pub const HELPER_REVISION: u32 = 6;
+/// 7: on a Mac, name lookups go into the tunnel even when the network's own
+///    DNS server is on the local network.
+pub const HELPER_REVISION: u32 = 7;
 
 /// Most locations one ping request can name.
 pub const MAX_PING_TARGETS: usize = 32;

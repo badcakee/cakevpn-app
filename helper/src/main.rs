@@ -10,6 +10,8 @@
 //! For testing without touching routes, set CAKEVPN_HELPER_LOCAL_PORT to get a
 //! local SOCKS/HTTP port instead of a TUN interface.
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod dns;
 mod ipc;
 mod ping;
 mod quality;
@@ -60,6 +62,10 @@ fn capture() -> singbox::Capture {
 
 /// Serves the app until `shutdown` finishes, then takes the tunnel down.
 pub async fn serve(shutdown: impl std::future::Future<Output = ()>) -> std::io::Result<()> {
+    // A helper that was ended while the tunnel was up left the Mac's DNS pointing into it.
+    if capture() == singbox::Capture::Tun {
+        dns::back_to_normal(&data_dir());
+    }
     let tunnel = tunnel::Tunnel::new(tunnel::Paths {
         data_dir: data_dir(),
         sing_box: sing_box_path(),
