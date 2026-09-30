@@ -39,6 +39,9 @@ pub struct Location {
     pub id: String,
     pub name: String,
     pub country: String,
+    /// Where the server is, for the map. Empty when the panel doesn't say.
+    #[serde(default)]
+    pub city: String,
     pub online: bool,
     pub load: Option<Load>,
     /// Kept out of what the window sees; only the tunnel needs it.

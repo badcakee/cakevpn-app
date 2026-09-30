@@ -1,4 +1,6 @@
 import { Account, asApiError, backend, ConnectOptions, DayUsage, Location, Overview } from "./backend";
+import { placeOf } from "./places";
+import { WORLD_HEIGHT, WORLD_PATH, WORLD_WIDTH } from "./worldmap";
 
 // ---------- state ----------
 
@@ -54,7 +56,6 @@ const state = {
   theme: (saved.get("theme") as Theme) || "system",
   autostart: false,
   appVersion: "",
-  pickerOpen: false,
   busy: false,
   codeError: "",
   codeNotice: "",
@@ -369,54 +370,98 @@ function renderSetup() {
     ${header()}
     <main class="center setup screen">
       <div class="logo big">🔧</div>
-      <h1>${outdated ? "Update needed" : "One-time setup"}</h1>
+      <h1>${isWindows ? "One quick fix" : outdated ? "Update needed" : "One-time setup"}</h1>
       <p class="muted">${
         isWindows
-          ? "The CakeVPN service is not running. Reinstall CakeVPN to fix it."
+          ? "CakeVPN's background service isn't running. Fix it here; Windows will ask for permission once."
           : outdated
             ? "CakeVPN was updated and its network helper needs updating too."
             : "CakeVPN needs to install a small network helper. Your Mac will ask for your password once."
       }</p>
       ${state.actionError ? `<div class="error">${esc(state.actionError)}</div>` : ""}
-      ${isWindows ? "" : `<button class="primary" id="install" ${state.busy ? "disabled" : ""}>${state.busy ? "Setting up…" : "Set up"}</button>`}
+      <button class="primary" id="install" ${state.busy ? "disabled" : ""}>${
+        isWindows ? (state.busy ? "Fixing…" : "Fix it") : state.busy ? "Setting up…" : "Set up"
+      }</button>
     </main>`;
   $("#install")?.addEventListener("click", installHelper);
 }
 
 const GEAR = `<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.5 7.5 0 0 0 0-2l2.1-1.6-2-3.5-2.5 1a7.7 7.7 0 0 0-1.7-1l-.4-2.7h-4l-.4 2.7a7.7 7.7 0 0 0-1.7 1l-2.5-1-2 3.5L4.6 11a7.5 7.5 0 0 0 0 2l-2.1 1.6 2 3.5 2.5-1a7.7 7.7 0 0 0 1.7 1l.4 2.7h4l.4-2.7a7.7 7.7 0 0 0 1.7-1l2.5 1 2-3.5zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/></svg>`;
 
+/** How busy a location is, as a small bar. The number is in its hover note. */
 function loadBadge(l: Location): string {
   if (!l.load) return "";
-  return `<span class="load ${l.load.level}" title="How busy this location's server is, from everyone using it">
+  return `<span class="load ${l.load.level}" title="Load ${l.load.percent}%: how busy this location's server is, from everyone using it">
       <span class="load-bar"><i style="width:${Math.max(4, l.load.percent)}%"></i></span>
-      <span class="load-pct">Load ${l.load.percent}%</span>
     </span>`;
 }
 
-function locationRow(l: Location, selected: boolean, best = false): string {
+/** "18 ms", or "" when the location wasn't measured. */
+function pingText(l: Location): string {
   const ping = state.pings[l.id];
+  return ping != null ? `${ping} ms` : "";
+}
+
+function locationRow(l: Location, selected: boolean, best = false): string {
+  const city = placeOf(l)?.city;
+  const live = !best && tunnelState() === "connected" && state.overview?.locationId === l.id;
   return `
-    <button class="loc ${selected ? "selected" : ""}" data-loc="${best ? "best" : esc(l.id)}" ${l.online ? "" : "disabled"}>
+    <button class="loc ${selected ? "selected" : ""} ${live ? "live" : ""}" data-loc="${best ? "best" : esc(l.id)}" ${l.online ? "" : "disabled"}>
       ${flag(l.country)}
-      <span class="loc-name">${esc(best ? "Best location" : l.name)}${best ? `<small>${esc(l.name)}</small>` : ""}</span>
-      <span class="loc-meta">${loadBadge(l)}<span class="ping">${ping != null ? `${ping} ms` : ""}</span></span>
+      <span class="loc-name">${esc(best ? "Best location" : l.name)}<small>${esc(best ? l.name : city ?? "")}${
+        live ? `<span class="live-note">${city ? " · " : ""}Connected</span>` : ""
+      }</small></span>
+      <span class="loc-meta">${loadBadge(l)}<span class="ping">${pingText(l)}</span></span>
     </button>`;
 }
 
-function pickerHtml(): string {
+/** The list under the map: "Best location", then every location. */
+function locationsHtml(): string {
   const best = bestLocation();
   return `${best ? locationRow(best, state.choice === "best", true) : ""}
     ${(state.account?.locations ?? []).map((l) => locationRow(l, state.choice === l.id)).join("")}`;
 }
 
-function currentLocationHtml(): string {
-  const loc = shownLocation();
-  const ping = loc ? state.pings[loc.id] : null;
-  // "Best location" only when that is really where this is, not while the VPN is connected somewhere else.
-  const isBest = state.choice === "best" && !!loc && loc.id === bestLocation()?.id;
-  return `${loc ? flag(loc.country) : ""}
-    <span class="loc-name">${loc ? esc(loc.name) : "No location online"}${isBest ? "<small>Best location</small>" : ""}</span>
-    <span class="loc-meta">${loc ? loadBadge(loc) : ""}<span class="ping">${ping != null ? `${ping} ms` : ""}</span><span class="chevron">▾</span></span>`;
+/**
+ * The pins on the map, one per location that has a known place. The one the
+ * VPN is connected to pulses; the chosen one is filled. With a few locations
+ * every pin is named; with many, only the chosen one, so names don't pile up.
+ */
+function pinsHtml(): string {
+  const locations = state.account?.locations ?? [];
+  const shown = shownLocation();
+  const connected = tunnelState() === "connected" ? state.overview?.locationId : null;
+  const nameAll = locations.length <= 4;
+  // The chosen location is drawn last, so its pin and name are on top of its neighbors.
+  return [...locations]
+    .sort((a, b) => Number(a.id === shown?.id) - Number(b.id === shown?.id))
+    .map((l) => {
+      const place = placeOf(l);
+      if (!place) return "";
+      const isShown = l.id === shown?.id;
+      const ping = pingText(l);
+      const classes = ["pin", isShown ? "chosen" : "", l.id === connected ? "connected" : "", l.online ? "" : "offline"].join(" ");
+      // Names go to the side with more room: the country, then the city and the ping under it.
+      const left = place.x > WORLD_WIDTH * 0.8;
+      const x = left ? -17 : 17;
+      const where = [place.city, ping].filter(Boolean).join(" · ");
+      const label =
+        nameAll || isShown
+          ? `<text class="pin-label" text-anchor="${left ? "end" : "start"}">
+              <tspan x="${x}" y="-1">${esc(l.name)}</tspan>
+              <tspan class="pin-where" x="${x}" y="20">${esc(where)}</tspan>
+            </text>`
+          : "";
+      const note = `${l.name} (${place.city})${ping ? ` · ${ping}` : ""}${l.load ? ` · Load ${l.load.percent}%` : ""}${l.online ? "" : " · offline"}`;
+      return `<g class="${classes}" data-loc="${esc(l.id)}" transform="translate(${place.x.toFixed(1)},${place.y.toFixed(1)})">
+        <title>${esc(note)}</title>
+        <circle class="pin-pulse" r="11"></circle>
+        <circle class="pin-hit" r="22"></circle>
+        <circle class="pin-dot" r="8"></circle>
+        ${label}
+      </g>`;
+    })
+    .join("");
 }
 
 function renderHome() {
@@ -435,46 +480,54 @@ function renderHome() {
         <button id="update-now">Update now</button>
         <div class="progress-track" id="update-track"><i id="update-fill"></i></div>
       </div>
-      <button id="power" class="power">
-        <svg class="ring" viewBox="0 0 120 120" aria-hidden="true">
-          <circle class="ring-track" cx="60" cy="60" r="54"></circle>
-          <circle class="ring-arc" cx="60" cy="60" r="54"></circle>
-        </svg>
-        <span class="power-icon">⏻</span>
-        <span class="power-text" id="power-text"></span>
-      </button>
-      <div class="status-line" id="status-line"></div>
-      <div class="error hidden" id="action-error"></div>
-      <div class="notice hidden" id="move-notice"></div>
-      <div class="notice hidden" id="offline-notice">CakeVPN's sign-in server can't be reached on this network. You can still connect with your saved details.</div>
-      <div class="banner" id="banner"><span class="banner-icon"></span><span class="banner-text"></span></div>
+      <div class="home-grid">
+        <section class="side">
+          <button id="power" class="power">
+            <svg class="ring" viewBox="0 0 120 120" aria-hidden="true">
+              <circle class="ring-track" cx="60" cy="60" r="54"></circle>
+              <circle class="ring-arc" cx="60" cy="60" r="54"></circle>
+            </svg>
+            <span class="power-icon">⏻</span>
+            <span class="power-text" id="power-text"></span>
+          </button>
+          <div class="status-line" id="status-line"></div>
+          <div class="error hidden" id="action-error"></div>
+          <div class="notice hidden" id="move-notice"></div>
+          <div class="notice hidden" id="offline-notice">CakeVPN's sign-in server can't be reached on this network. You can still connect with your saved details.</div>
+          <div class="banner" id="banner"><span class="banner-icon"></span><span class="banner-text"></span></div>
 
-      <div class="card">
-        <div class="card-label">Location</div>
-        <button class="loc current" id="toggle-picker">${currentLocationHtml()}</button>
-        <div class="picker ${state.pickerOpen ? "open" : ""}" id="picker"><div class="picker-inner">${pickerHtml()}</div></div>
-        <div class="your-ip" id="your-ip"></div>
-      </div>
+          <div class="card stats">
+            <div><div class="card-label">Used this month</div><div class="big-number" id="usage"></div></div>
+            <div><div class="card-label">Speed now</div><div class="big-number small" id="speed"></div></div>
+          </div>
+          <div class="speedtest hidden" id="speedtest">
+            <button class="pill" id="run-speedtest">Run a speed test</button>
+            <div class="progress-track hidden" id="speedtest-track"><i id="speedtest-fill"></i></div>
+            <div class="speedtest-result" id="speedtest-result"></div>
+          </div>
+          <div class="muted small center-text" id="protection-line"></div>
+          <div class="muted small center-text">Unlimited traffic on every plan</div>
+          ${
+            invitesOn(account) && account.plan.mbps > 0
+              ? `<div class="invite-line">
+                  <button class="link invite-link" id="invite-link">🎁 Invite friends · +${account.referral.mbpsPerFriend} Mbps each</button>
+                  ${infoTip(moreSpeedTip(account))}
+                </div>`
+              : ""
+          }
+        </section>
 
-      <div class="card stats">
-        <div><div class="card-label">Used this month</div><div class="big-number" id="usage"></div></div>
-        <div><div class="card-label">Speed now</div><div class="big-number small" id="speed"></div></div>
+        <section class="stage">
+          <div class="card map-card">
+            <svg class="world" id="world" viewBox="0 0 ${WORLD_WIDTH} ${WORLD_HEIGHT}" role="img" aria-label="Map of the CakeVPN locations">
+              <path class="land" d="${WORLD_PATH}"></path>
+              <g id="map-pins">${pinsHtml()}</g>
+            </svg>
+            <div class="your-ip" id="your-ip"></div>
+          </div>
+          <div class="card locations" id="locations">${locationsHtml()}</div>
+        </section>
       </div>
-      <div class="speedtest hidden" id="speedtest">
-        <button class="pill" id="run-speedtest">Run a speed test</button>
-        <div class="progress-track hidden" id="speedtest-track"><i id="speedtest-fill"></i></div>
-        <div class="speedtest-result" id="speedtest-result"></div>
-      </div>
-      <div class="muted small center-text" id="protection-line"></div>
-      <div class="muted small center-text">Unlimited traffic on every plan</div>
-      ${
-        invitesOn(account) && account.plan.mbps > 0
-          ? `<div class="invite-line">
-              <button class="link invite-link" id="invite-link">🎁 Invite friends · +${account.referral.mbpsPerFriend} Mbps each</button>
-              ${infoTip(moreSpeedTip(account))}
-            </div>`
-          : ""
-      }
     </main>`;
 
   $("#power")!.addEventListener("click", togglePower);
@@ -484,21 +537,29 @@ function renderHome() {
   $("#announce-close")!.addEventListener("click", closeAnnouncement);
   $("#run-speedtest")!.addEventListener("click", runSpeedTest);
   updateLocations();
-  $("#toggle-picker")!.addEventListener("click", () => {
-    state.pickerOpen = !state.pickerOpen;
-    $("#picker")!.classList.toggle("open", state.pickerOpen);
-    $("#toggle-picker")!.classList.toggle("open", state.pickerOpen);
-  });
-  $("#picker")!.addEventListener("click", (e) => {
+  $("#locations")!.addEventListener("click", (e) => {
     const row = (e.target as HTMLElement).closest<HTMLButtonElement>(".loc");
     if (row && !row.disabled) chooseLocation(row.dataset.loc!);
+  });
+  // A pin on the map picks its location, like its row in the list.
+  $("#map-pins")!.addEventListener("click", (e) => {
+    const pin = (e.target as Element).closest<SVGGElement>(".pin");
+    if (pin && !pin.classList.contains("offline")) chooseLocation(pin.dataset.loc!);
   });
   updateHome();
 }
 
+/** What the map and list last showed, so they are redrawn when the VPN's state or the choice changes. */
+let shownPlaces = "";
+
 /** Updates the home screen in place. */
 function updateHome() {
   if (state.screen !== "home" || !state.account) return;
+  const places = `${tunnelState()}|${state.overview?.locationId}|${state.choice}`;
+  if (places !== shownPlaces) {
+    shownPlaces = places;
+    updateLocations();
+  }
   const status = state.overview?.status;
   const tstate = tunnelState();
   const power = $("#power") as HTMLButtonElement | null;
@@ -593,10 +654,10 @@ function ipsText(account: Account | null): string {
 /** Redraws the location parts after the account, pings or choice changed. */
 function updateLocations() {
   if (state.screen !== "home") return;
-  const current = $("#toggle-picker");
-  const inner = $("#picker .picker-inner");
-  if (current) current.innerHTML = currentLocationHtml();
-  if (inner) inner.innerHTML = pickerHtml();
+  const list = $("#locations");
+  const pins = $("#map-pins");
+  if (list) list.innerHTML = locationsHtml();
+  if (pins) pins.innerHTML = pinsHtml();
   // The addresses belong to the main location; other locations use their own.
   const main = shownLocation()?.id === "main";
   setText("#your-ip", main ? ipsText(state.account) : "");
@@ -1296,9 +1357,6 @@ async function chooseLocation(id: string) {
   state.choice = id;
   saved.set("location", id);
   state.moveNotice = "";
-  state.pickerOpen = false;
-  $("#picker")?.classList.remove("open");
-  $("#toggle-picker")?.classList.remove("open");
   updateLocations();
   // Switching while connected moves the tunnel right away.
   if (tunnelState() === "connected") {

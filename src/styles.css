@@ -56,6 +56,8 @@ body {
   display: flex;
   flex-direction: column;
   min-height: 100%;
+  /* A screen sliding in must not make the window scroll for a moment. */
+  overflow: clip;
 }
 
 button {
@@ -581,30 +583,12 @@ h1 {
   transition: width 0.6s var(--ease), background-color 0.6s var(--ease);
 }
 
-.load-pct {
-  font-size: 12px;
-  font-weight: 600;
-  min-width: 62px;
-  white-space: nowrap;
-  text-align: right;
-  color: var(--green);
-  font-variant-numeric: tabular-nums;
-}
-
 .load.medium .load-bar i {
   background: var(--amber);
 }
 
-.load.medium .load-pct {
-  color: var(--amber);
-}
-
 .load.high .load-bar i {
   background: var(--red);
-}
-
-.load.high .load-pct {
-  color: var(--red);
 }
 
 .ping {
@@ -617,42 +601,6 @@ h1 {
 
 .ping:empty {
   display: none;
-}
-
-.chevron {
-  color: var(--muted);
-  font-size: 13px;
-  transition: transform 0.3s var(--ease);
-}
-
-.loc.current.open .chevron {
-  transform: rotate(180deg);
-}
-
-/* The location list opens by growing its row from 0 to its full height. */
-.picker {
-  display: grid;
-  grid-template-rows: 0fr;
-  opacity: 0;
-  transition: grid-template-rows 0.3s var(--ease), opacity 0.3s var(--ease);
-}
-
-.picker.open {
-  grid-template-rows: 1fr;
-  opacity: 1;
-}
-
-.picker-inner {
-  overflow: hidden;
-  min-height: 0;
-}
-
-.picker.open .picker-inner {
-  border-top: 1px solid var(--line);
-  margin-top: 6px;
-  padding-top: 6px;
-  max-height: 220px;
-  overflow-y: auto;
 }
 
 /* ---------- settings ---------- */
@@ -1341,4 +1289,183 @@ label.row {
   max-width: 60%;
   user-select: text;
   -webkit-user-select: text;
+}
+
+/* ---------- the wide window: controls on the left, the map on the right ---------- */
+
+.home {
+  padding: 4px 20px 14px;
+}
+
+.home-grid {
+  flex: 1;
+  margin-top: 8px;
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 18px;
+}
+
+.side {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  min-width: 0;
+}
+
+.side .power {
+  width: 150px;
+  height: 150px;
+  margin: 6px 0 8px;
+}
+
+.side .card {
+  margin-top: 12px;
+}
+
+.stage {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.stage .card {
+  margin-top: 0;
+}
+
+/* Other screens keep a comfortable column in the wide window. */
+.code-screen,
+.settings,
+.setup {
+  width: 100%;
+  max-width: 480px;
+  margin: 0 auto;
+}
+
+/* ---------- world map ---------- */
+
+/* The map takes the height the list leaves and sits in the middle of it. */
+.map-card {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 10px 12px 8px;
+}
+
+.world {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin: auto 0;
+  overflow: visible;
+}
+
+.world .land {
+  fill: var(--line);
+  transition: fill 0.3s var(--ease);
+}
+
+.pin {
+  cursor: pointer;
+}
+
+.pin.offline {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.pin-hit {
+  fill: transparent;
+}
+
+/* A ring in the card's color keeps a dot readable on the land and next to other dots. */
+.pin-dot {
+  fill: var(--muted);
+  stroke: var(--card);
+  stroke-width: 3;
+  transition: fill 0.2s var(--ease), r 0.2s var(--ease);
+}
+
+.pin:hover:not(.offline) .pin-dot {
+  r: 10;
+}
+
+.pin.chosen .pin-dot {
+  fill: var(--pink);
+}
+
+.pin.connected .pin-dot {
+  fill: var(--green);
+}
+
+.pin-pulse {
+  fill: var(--green);
+  opacity: 0;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.pin.connected .pin-pulse {
+  animation: pin-pulse 2.2s ease-out infinite;
+}
+
+@keyframes pin-pulse {
+  from {
+    opacity: 0.45;
+    transform: scale(0.8);
+  }
+  to {
+    opacity: 0;
+    transform: scale(3.2);
+  }
+}
+
+/* Names wear the text color, with a halo in the card's color so they read over the land. */
+.pin-label {
+  font-size: 22px;
+  font-weight: 650;
+  fill: var(--text);
+  stroke: var(--card);
+  stroke-width: 5px;
+  stroke-linejoin: round;
+  paint-order: stroke;
+  pointer-events: none;
+}
+
+/* The city and the ping, under the name. */
+.pin-where {
+  font-size: 18px;
+  font-weight: 500;
+  fill: var(--muted);
+}
+
+/* ---------- location list under the map ---------- */
+
+.locations {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 10px;
+  padding: 8px;
+  max-height: 156px;
+  overflow-y: auto;
+}
+
+.locations .loc {
+  padding: 7px 8px;
+}
+
+.locations .ping {
+  min-width: 46px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.load-bar {
+  width: 30px;
+}
+
+/* The location the VPN is connected to says so, in green. */
+.live-note {
+  color: var(--green);
+  font-weight: 600;
 }

@@ -4,7 +4,7 @@
 //!
 //! Usage:
 //!   cakevpn-helper run          run in the foreground (macOS LaunchDaemon, testing)
-//!   cakevpn-helper install      Windows: register and start the service
+//!   cakevpn-helper install      Windows: register the service if needed and (re)start it
 //!   cakevpn-helper uninstall    Windows: stop and remove the service
 //!
 //! For testing without touching routes, set CAKEVPN_HELPER_LOCAL_PORT to get a
@@ -70,7 +70,8 @@ pub async fn serve(shutdown: impl std::future::Future<Output = ()>) -> std::io::
         r = ipc::listen(Arc::clone(&tunnel), &path) => r,
         _ = shutdown => Ok(()),
     };
-    tunnel.disconnect().await;
+    // Stopping must not hang on a tunnel that is busy; sing-box ends with the helper anyway.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tunnel.disconnect()).await;
     result
 }
 

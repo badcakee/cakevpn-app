@@ -418,9 +418,20 @@ async fn install_helper() -> Result<(), String> {
         }
         Err("The helper was installed but did not start. Restart your Mac and try again.".into())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     {
-        Err("The CakeVPN service is not running. Reinstall CakeVPN to fix it.".into())
+        tokio::task::spawn_blocking(helper::install).await.map_err(|e| e.to_string())??;
+        for _ in 0..40 {
+            if helper::ask(Request::Status).await.is_ok() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        Err("The CakeVPN service still isn't running. Restart your PC and install CakeVPN again.".into())
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        Err("The CakeVPN helper is not running.".into())
     }
 }
 
@@ -494,7 +505,12 @@ struct UpdateInfo {
 #[tauri::command]
 async fn check_update(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
     let updater = app.updater().map_err(|e| e.to_string())?;
-    let update = updater.check().await.map_err(|e| format!("Could not check for updates: {e}"))?;
+    let update = match updater.check().await {
+        Ok(update) => update,
+        // The newest release has no build for this kind of computer (yet): nothing to update to.
+        Err(e) if e.to_string().contains("platforms") => None,
+        Err(e) => return Err(format!("Could not check for updates: {e}")),
+    };
     Ok(update.map(|u| UpdateInfo { version: u.version.clone(), notes: u.body.clone() }))
 }
 

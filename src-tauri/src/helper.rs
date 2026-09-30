@@ -49,6 +49,37 @@ pub async fn ask(request: Request) -> Result<Response, String> {
         .map_err(|_| "the helper did not answer".to_string())?
 }
 
+/// Registers and starts the Windows service again, for when an update or
+/// Windows itself left it stopped. Windows asks for permission once.
+#[cfg(windows)]
+pub fn install() -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let helper = std::env::current_exe()
+        .map_err(|e| e.to_string())?
+        .parent()
+        .ok_or("cannot find the app folder")?
+        .join("cakevpn-helper.exe");
+    if !helper.exists() {
+        return Err("A file is missing from CakeVPN. Install CakeVPN again to fix it.".into());
+    }
+    // "RunAs" is what makes Windows show its permission prompt.
+    let script = format!(
+        "$p = Start-Process -FilePath '{}' -ArgumentList 'install' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode",
+        helper.to_string_lossy().replace('\'', "''")
+    );
+    let status = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("The CakeVPN service could not be started. Choose Yes when Windows asks for permission. If it still fails, restart your PC and install CakeVPN again.".into())
+    }
+}
+
 /// Installs the macOS LaunchDaemon. Asks for an admin password once.
 #[cfg(target_os = "macos")]
 pub fn install() -> Result<(), String> {

@@ -75,12 +75,23 @@ pub async fn listen(tunnel: Arc<Tunnel>, path: &str) -> std::io::Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
     let security = pipe_security::Attributes::new()?;
     let mut first = true;
+    let mut tries = 0;
     loop {
         // first_pipe_instance stops another program from grabbing the name before us.
-        let server = unsafe {
+        let created = unsafe {
             ServerOptions::new()
                 .first_pipe_instance(first)
-                .create_with_security_attributes_raw(path, security.as_ptr())?
+                .create_with_security_attributes_raw(path, security.as_ptr())
+        };
+        let server = match created {
+            Ok(server) => server,
+            // Right after an update the older helper may still hold the name for a moment.
+            Err(_) if first && tries < 60 => {
+                tries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
         };
         first = false;
         server.connect().await?;

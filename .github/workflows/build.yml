@@ -1,8 +1,9 @@
 name: Build CakeVPN
 
 # Run it from the Actions tab ("Run workflow"), or push a tag like v1.3.0.
-# Each run publishes a GitHub release named after the version in
-# src-tauri/tauri.conf.json. The apps check that release for updates.
+# Each run makes a GitHub release named after the version in
+# src-tauri/tauri.conf.json: a draft while the two platforms build, published
+# once both are in it. The apps check the newest published release for updates.
 on:
   workflow_dispatch:
   push:
@@ -48,7 +49,9 @@ jobs:
           tagName: v__VERSION__
           releaseName: CakeVPN __VERSION__
           releaseBody: Download CakeVPN for Windows (.exe) or Mac (.dmg) below. Installed apps update themselves.
-          releaseDraft: false
+          # A draft until both platforms are in it (see the last step), so apps
+          # never find a release that lacks their platform.
+          releaseDraft: true
           prerelease: false
           args: --target x86_64-pc-windows-msvc --bundles nsis
 
@@ -86,6 +89,14 @@ jobs:
           tagName: v__VERSION__
           releaseName: CakeVPN __VERSION__
           releaseBody: Download CakeVPN for Windows (.exe) or Mac (.dmg) below. Installed apps update themselves.
-          releaseDraft: false
+          # A draft until both platforms are in it (see the last step), so apps
+          # never find a release that lacks their platform.
+          releaseDraft: true
           prerelease: false
           args: --target universal-apple-darwin --bundles app,dmg
+      - name: Publish the release now that Windows and Mac are both in it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          gh release edit "v$version" --draft=false --latest

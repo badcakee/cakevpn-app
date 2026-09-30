@@ -17,6 +17,8 @@ export interface Location {
   id: string;
   name: string;
   country: string;
+  /** Where the server is, for the map; empty when the panel doesn't say. */
+  city?: string;
   online: boolean;
   load: Load | null;
   /** The speed test can run against this location. */
