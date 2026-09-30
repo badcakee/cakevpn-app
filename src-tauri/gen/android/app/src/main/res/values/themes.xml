@@ -1,0 +1,8 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- The app's own background, which also shows behind the system bars. -->
+    <style name="Theme.cakevpn" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:windowBackground">@color/cake_background</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+</resources>

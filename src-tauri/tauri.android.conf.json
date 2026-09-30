@@ -1,0 +1,14 @@
+{
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "CakeVPN",
+        "visible": true
+      }
+    ]
+  },
+  "bundle": {
+    "externalBin": []
+  }
+}

@@ -381,8 +381,12 @@ h1 {
 }
 
 .power-icon {
-  font-size: 44px;
-  line-height: 1;
+  width: 42px;
+  height: 42px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  stroke-linecap: round;
   color: var(--muted);
   transition: color 0.5s var(--ease), transform 0.5s var(--ease);
 }
@@ -1812,4 +1816,90 @@ label.row {
 
 .account-grid .card {
   margin: 0 0 14px;
+}
+
+/* ---------- phones: one column, and the page scrolls ---------- */
+
+@media (max-width: 700px) {
+  #app[data-screen="home"],
+  #app[data-screen="settings"] {
+    height: auto;
+  }
+
+  .home {
+    padding: 4px 14px 20px;
+  }
+
+  .home-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .side {
+    overflow: visible;
+    margin: 0;
+    padding: 0;
+  }
+
+  .side .power {
+    width: 168px;
+    height: 168px;
+  }
+
+  .stage .map-card {
+    flex: none;
+    height: 240px;
+  }
+
+  .locations {
+    grid-template-columns: 1fr;
+    max-height: none;
+    overflow: visible;
+  }
+
+  /* The sections become a row of tabs that scrolls sideways. */
+  .settings-wide {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 4px 14px 20px;
+  }
+
+  .settings-nav {
+    flex-direction: row;
+    align-self: stretch;
+    gap: 6px;
+    margin: 0 -14px;
+    padding: 2px 14px 8px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .settings-nav::-webkit-scrollbar {
+    display: none;
+  }
+
+  .nav-item {
+    flex: none;
+    white-space: nowrap;
+    padding: 8px 12px;
+  }
+
+  .settings-pane {
+    overflow: visible;
+    padding: 0;
+    margin: 0;
+  }
+
+  .account-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* A phone keeps still: endless animations make the whole map redraw
+   without pause, which costs battery. The spinner while connecting stays. */
+html.phone .power.connected,
+html.phone .pin.connected .pin-pulse {
+  animation: none;
 }

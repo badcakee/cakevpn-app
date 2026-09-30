@@ -11,26 +11,9 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 const MAX_LINE: usize = 64 * 1024;
 
 async fn handle(tunnel: &Arc<Tunnel>, line: &str) -> Response {
-    let request: Request = match serde_json::from_str(line) {
-        Ok(r) => r,
-        Err(e) => {
-            return Response { ok: false, error: Some(format!("bad request: {e}")), status: tunnel.status().await, pings: None }
-        }
-    };
-    let mut pings = None;
-    let result = match request {
-        Request::Connect { params } => tunnel.connect(params).await,
-        Request::Disconnect => {
-            tunnel.disconnect().await;
-            Ok(())
-        }
-        Request::Status => Ok(()),
-        Request::Ping { targets } => tunnel.ping(targets).await.map(|measured| pings = Some(measured)),
-    };
-    let status = tunnel.status().await;
-    match result {
-        Ok(()) => Response { ok: true, error: None, status, pings },
-        Err(e) => Response { ok: false, error: Some(e), status, pings: None },
+    match serde_json::from_str::<Request>(line) {
+        Ok(request) => tunnel.answer(request).await,
+        Err(e) => Response { ok: false, error: Some(format!("bad request: {e}")), status: tunnel.status().await, pings: None },
     }
 }
 

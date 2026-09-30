@@ -147,6 +147,11 @@ const state = {
 
 const app = document.getElementById("app")!;
 const isWindows = navigator.userAgent.includes("Windows");
+/** A phone: no tray, no start at login, no keyboard shortcut; updates install through the browser. */
+const isAndroid = navigator.userAgent.includes("Android");
+/** How the settings speak of this device. */
+const THIS_DEVICE = isAndroid ? "this phone" : "this computer";
+document.documentElement.classList.toggle("phone", isAndroid);
 
 // ---------- helpers ----------
 
@@ -543,7 +548,7 @@ function renderHome() {
               <circle class="ring-track" cx="60" cy="60" r="54"></circle>
               <circle class="ring-arc" cx="60" cy="60" r="54"></circle>
             </svg>
-            <span class="power-icon">⏻</span>
+            <svg class="power-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5v8"/><path d="M6.6 6.9a7.6 7.6 0 1 0 10.8 0"/></svg>
             <span class="power-text" id="power-text"></span>
           </button>
           <div class="status-line" id="status-line"></div>
@@ -762,7 +767,7 @@ function settingsTabs(): { id: SettingsTab; label: string }[] {
   const tabs: { id: SettingsTab; label: string }[] = [
     { id: "general", label: "General" },
     { id: "connection", label: "Connection" },
-    { id: "notifications", label: "Notifications" },
+    ...(isAndroid ? [] : [{ id: "notifications" as SettingsTab, label: "Notifications" }]),
     { id: "protection", label: "Protection" },
     { id: "skip", label: "Skip the VPN" },
   ];
@@ -802,22 +807,29 @@ function acceleratorOf(e: KeyboardEvent): string {
 function generalTab(): string {
   const themeButton = (value: Theme, label: string) =>
     `<button class="seg ${state.theme === value ? "active" : ""}" data-theme="${value}">${label}</button>`;
-  const closeButton = (value: boolean, label: string) =>
-    `<button class="seg ${state.closeToTray === value ? "active" : ""}" data-close="${value ? "tray" : "quit"}">${label}</button>`;
   return `
     <div class="card list">
       <div class="row">
         <span><b>Language</b><small>The language CakeVPN is shown in</small></span>
         <select id="set-lang" class="select" data-keep>
-          <option value="auto" ${state.lang === "auto" ? "selected" : ""}>${esc(t("Same as this computer"))}</option>
+          <option value="auto" ${state.lang === "auto" ? "selected" : ""}>${esc(t(`Same as ${THIS_DEVICE}`))}</option>
           ${LANGUAGES.map((l) => `<option value="${l.code}" ${state.lang === l.code ? "selected" : ""}>${esc(l.name)}</option>`).join("")}
         </select>
       </div>
       <div class="row">
-        <span><b>Appearance</b><small>Light, dark, or the same as this computer</small></span>
+        <span><b>Appearance</b><small>Light, dark, or the same as ${THIS_DEVICE}</small></span>
         <div class="segmented small" id="theme">${themeButton("system", "Automatic")}${themeButton("light", "Light")}${themeButton("dark", "Dark")}</div>
       </div>
     </div>
+    ${isAndroid ? "" : computerCard()}
+    ${state.settingsError ? `<div class="error">${esc(state.settingsError)}</div>` : ""}`;
+}
+
+/** Start at login, the close button and the keyboard shortcut: things only a computer has. */
+function computerCard(): string {
+  const closeButton = (value: boolean, label: string) =>
+    `<button class="seg ${state.closeToTray === value ? "active" : ""}" data-close="${value ? "tray" : "quit"}">${label}</button>`;
+  return `
     <div class="card list">
       ${switchRow("set-autostart", "Open at startup", "Start CakeVPN in the tray when your computer starts", state.autostart)}
       <div class="row">
@@ -839,8 +851,7 @@ function generalTab(): string {
         </span>
       </div>
       ${state.shortcutError ? `<div class="error">${esc(state.shortcutError)}</div>` : ""}
-    </div>
-    ${state.settingsError ? `<div class="error">${esc(state.settingsError)}</div>` : ""}`;
+    </div>`;
 }
 
 function connectionTab(): string {
@@ -852,6 +863,11 @@ function connectionTab(): string {
       ${switchRow("set-autoconnect", "Connect when CakeVPN opens", "Turns the VPN on as soon as CakeVPN starts", state.autoConnect)}
       ${switchRow("set-reconnect", "Reconnect by itself", "If the connection drops, CakeVPN connects again", state.autoReconnect)}
     </div>
+    ${isAndroid ? "" : publicWifiCard(here, trusted, net)}`;
+}
+
+function publicWifiCard(here: string, trusted: string[], net: typeof state.network): string {
+  return `
     <div class="card list">
       ${switchRow("set-autowifi", "Connect on public Wi-Fi", "Turns the VPN on by itself on any Wi-Fi that isn't in your trusted list, like in a café or hotel", state.autoWifi)}
       <div class="row column">
@@ -894,8 +910,8 @@ function reconnectNotice(): string {
 function protectionTab(): string {
   return `
     <div class="card list">
-      ${switchRow("set-ads", "Block ads and trackers", "Stops known ad and tracking sites, in every app on this computer", state.options.blockAds)}
-      ${switchRow("set-kill", "Kill switch", "If the VPN drops, your internet stays blocked until it reconnects or you disconnect", state.options.killSwitch)}
+      ${switchRow("set-ads", "Block ads and trackers", `Stops known ad and tracking sites, in every app on ${THIS_DEVICE}`, state.options.blockAds)}
+      ${isAndroid ? "" : switchRow("set-kill", "Kill switch", "If the VPN drops, your internet stays blocked until it reconnects or you disconnect", state.options.killSwitch)}
     </div>
     ${reconnectNotice()}`;
 }
@@ -903,17 +919,21 @@ function protectionTab(): string {
 function skipTab(): string {
   return `
     <div class="card skip">
-      <p class="muted small">These websites and apps use your normal internet instead of the VPN.</p>
+      <p class="muted small">${isAndroid ? "These websites use your normal internet instead of the VPN." : "These websites and apps use your normal internet instead of the VPN."}</p>
       ${skipListHtml("domain", state.options.bypassDomains)}
       <form class="skip-add" id="add-domain">
         <input type="text" id="new-domain" placeholder="Website, like mybank.com" autocomplete="off" spellcheck="false">
         <button class="outline small-btn">Add</button>
       </form>
-      ${skipListHtml("app", state.options.bypassApps)}
+      ${
+        isAndroid
+          ? ""
+          : `${skipListHtml("app", state.options.bypassApps)}
       <form class="skip-add" id="add-app">
         <input type="text" id="new-app" placeholder="${isWindows ? "App, like steam.exe" : "App, like Steam"}" autocomplete="off" spellcheck="false">
         <button class="outline small-btn">Add</button>
-      </form>
+      </form>`
+      }
       ${state.skipError ? `<div class="error">${esc(state.skipError)}</div>` : ""}
     </div>
     ${reconnectNotice()}`;
@@ -1605,6 +1625,9 @@ async function openSettings(toInvites = false) {
   state.skipError = "";
   if (toInvites) state.settingsTab = "invites";
   state.recordingShortcut = false;
+  // Android's back button goes back through the page's history, so
+  // Settings adds a step to it: back then closes Settings, not the app.
+  if (isAndroid && state.screen !== "settings") history.pushState({ settings: true }, "");
   setScreen("settings");
   // The usage graph is only asked for while its tab is open.
   if (state.settingsTab === "account" && state.account) loadHistory();
@@ -1661,6 +1684,13 @@ async function installUpdate() {
   try {
     // CakeVPN restarts by itself once the update is installed.
     await backend.installUpdate();
+    if (isAndroid) {
+      clearInterval(watch);
+      state.updating = false;
+      state.updateMessage = `The download opened in your browser. Open it when it's done to install CakeVPN ${state.update?.version ?? ""}.`;
+      if (state.screen === "settings") render();
+      else updateHome();
+    }
   } catch (e) {
     clearInterval(watch);
     state.updating = false;
@@ -1735,8 +1765,17 @@ async function copyCode(button: HTMLButtonElement) {
 }
 
 function closeSettings() {
+  // Closed with its own button: take back the history step it added.
+  if (isAndroid && history.state?.settings) {
+    history.back();
+    return; // the back step lands in the listener below, which closes it
+  }
   setScreen(state.account ? "home" : "code");
 }
+
+window.addEventListener("popstate", () => {
+  if (state.screen === "settings") setScreen(state.account ? "home" : "code");
+});
 
 async function submitCode(code: string) {
   if (state.busy || state.lockedUntil > Date.now()) return;

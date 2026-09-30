@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The same color as the app background in src/styles.css. -->
+    <color name="cake_background">#FFFFF8F3</color>
+</resources>
