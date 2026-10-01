@@ -21,7 +21,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 ///    the tunnel is up.
 /// 7: on a Mac, name lookups go into the tunnel even when the network's own
 ///    DNS server is on the local network.
-pub const HELPER_REVISION: u32 = 7;
+/// 8: sing-box starts over after the computer wakes up, and whenever nothing
+///    gets through the tunnel any more (sites said "no internet" after
+///    opening the lid).
+pub const HELPER_REVISION: u32 = 8;
 
 /// Most locations one ping request can name.
 pub const MAX_PING_TARGETS: usize = 32;

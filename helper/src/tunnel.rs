@@ -25,6 +25,13 @@ const SETTLE_AFTER_WAKE: Duration = Duration::from_secs(20);
 /// A pause between two measurements this much longer than planned means the
 /// computer was asleep.
 const WAKE_GAP_SECS: u64 = 12;
+/// After waking up, how long to wait for the network to come back before
+/// sing-box starts over anyway.
+const WAIT_FOR_NETWORK_AFTER_WAKE: u64 = 15;
+/// Tunnel checks in a row that may fail before sing-box starts over, and
+/// how long it waits before doing that again.
+const RESTART_AFTER_FAILURES: u32 = 3;
+const RESTART_AT_MOST_EVERY: Duration = Duration::from_secs(30);
 /// Traffic totals older than this are read again when the app asks.
 const FRESH_TOTALS: Duration = Duration::from_millis(900);
 
@@ -63,6 +70,8 @@ struct Inner {
     config_path: Option<PathBuf>,
     /// When sing-box was started again after stopping (kill switch only).
     restarts: Vec<Instant>,
+    /// When sing-box last started over to recover (after a sleep, or when stuck).
+    started_over: Option<Instant>,
     /// Goes up on every connect and disconnect, so old background checks stop.
     generation: u64,
     tracker: Tracker,
@@ -367,6 +376,48 @@ impl Tunnel {
         false
     }
 
+    /// Starts sing-box over with the same settings, while the tunnel stays
+    /// "connected". After the computer slept, or the network changed under
+    /// it, what sing-box knew (routes, the network card it sent through, its
+    /// connections to the server) can be stale, and some computers then pass
+    /// nothing at all: every site says there is no internet until the VPN
+    /// reconnects. Starting over is that reconnect, done by itself.
+    async fn start_over(&self, generation: u64) -> bool {
+        let mut inner = self.inner.lock().await;
+        if inner.generation != generation {
+            return false;
+        }
+        let Some(path) = inner.config_path.clone() else { return false };
+        stop_child(&mut inner).await;
+        match self.spawn(&path, false) {
+            Ok(child) => inner.child = Some(child),
+            Err(why) => {
+                drop(inner);
+                self.fail(generation, why).await;
+                return false;
+            }
+        }
+        inner.started_over = Some(Instant::now());
+        inner.tracker.reset();
+        let api = inner.api.clone();
+        drop(inner);
+        if let Some((port, secret)) = api {
+            for _ in 0..30 {
+                if clash_get(port, &secret, "/version").await.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+        // A Mac's DNS goes back into the tunnel (it already points there
+        // unless something changed it), and names cached before are forgotten.
+        if self.paths.capture == singbox::Capture::Tun {
+            let dir = self.paths.data_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || dns::into_tunnel(&dir)).await;
+        }
+        true
+    }
+
     async fn watch(self: Arc<Self>, generation: u64) {
         // 1. Wait for sing-box to start.
         let mut started = false;
@@ -450,12 +501,19 @@ impl Tunnel {
             let slept = now.saturating_sub(last) >= WAKE_GAP_SECS || now < last;
             last = now;
             if slept {
-                settle_until = Some(Instant::now() + SETTLE_AFTER_WAKE);
-                let mut inner = self.inner.lock().await;
-                if inner.generation != generation {
+                // Once the network is back (or after a while anyway), sing-box
+                // starts over on it, so sites work right away after opening the lid.
+                for _ in 0..WAIT_FOR_NETWORK_AFTER_WAKE {
+                    if tokio::task::spawn_blocking(ping::gateway).await.ok().flatten().is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                if !self.start_over(generation).await {
                     return;
                 }
-                inner.tracker.reset();
+                last = now_secs();
+                settle_until = Some(Instant::now() + SETTLE_AFTER_WAKE);
             }
             if let Some(until) = settle_until {
                 if Instant::now() < until {
@@ -507,10 +565,22 @@ impl Tunnel {
                 inner.tracker.tunnel_sample(through_tunnel);
                 inner.tracker.direct_sample(outside);
             }
+            // Nothing gets through any more: start over, like reconnecting by
+            // hand would. If the server itself is down, that changes nothing,
+            // and the app moves to another location.
+            let stuck = inner.tracker.quality().tunnel_failures >= RESTART_AFTER_FAILURES
+                && inner.started_over.is_none_or(|at| at.elapsed() >= RESTART_AT_MOST_EVERY);
             if let Some((up, down)) = totals {
                 inner.up_bytes = up;
                 inner.down_bytes = down;
                 inner.totals_at = Some(Instant::now());
+            }
+            if stuck {
+                drop(inner);
+                if !self.start_over(generation).await {
+                    return;
+                }
+                continue;
             }
             if tick % 30 == 0 {
                 // The Wi-Fi may have changed; look the router up again.
