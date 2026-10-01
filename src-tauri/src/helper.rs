@@ -6,6 +6,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 
 /// Why the helper could not be asked.
 pub const HELPER_MISSING: &str = "helper_missing";
+/// The helper hung up without answering.
+pub const HELPER_STOPPED: &str = "CakeVPN's background service stopped while working. Press Fix it to start it again.";
 
 async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(stream: S, request: &Request) -> Result<Response, String> {
     let (read, mut write) = tokio::io::split(stream);
@@ -14,6 +16,10 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(stream: S, request: &Reques
     write.write_all(&line).await.map_err(|e| e.to_string())?;
     let mut answer = String::new();
     BufReader::new(read).read_line(&mut answer).await.map_err(|e| e.to_string())?;
+    if answer.trim().is_empty() {
+        // It hung up without answering: it stopped (or was stopped) while working.
+        return Err(HELPER_STOPPED.to_string());
+    }
     serde_json::from_str(&answer).map_err(|e| format!("the helper sent something unexpected: {e}"))
 }
 

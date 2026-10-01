@@ -93,15 +93,53 @@ async fn shutdown_signal() {
     }
 }
 
+/// Stack for the helper's threads. Windows gives a program 1 MB unless it
+/// asks (Linux gives 8): a deep call must not end the whole helper there.
+const STACK: usize = 8 * 1024 * 1024;
+
+/// The runtime everything runs on, with big-stack threads.
+pub fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread().enable_all().thread_stack_size(STACK).build()
+}
+
+/// Runs `work` on a thread with a big stack and waits for it; None when it
+/// panicked (which helper-crash.log then explains).
+pub fn on_big_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    std::thread::Builder::new().stack_size(STACK).spawn(work).ok()?.join().ok()
+}
+
+/// Writes every panic to helper-crash.log in the data folder (only its last
+/// few KB are kept), so the app can show what went wrong.
+fn note_crashes() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let when = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let text = info.to_string().replace(['\r', '\n'], " ");
+        let dir = data_dir();
+        let path = dir.join("helper-crash.log");
+        let _ = std::fs::create_dir_all(&dir);
+        let old = std::fs::read(&path).unwrap_or_default();
+        let mut log = old[old.len().saturating_sub(8 * 1024)..].to_vec();
+        log.extend_from_slice(format!("{when} {} {text}\n", env!("CARGO_PKG_VERSION")).as_bytes());
+        let _ = std::fs::write(&path, log);
+        previous(info);
+    }));
+}
+
 fn run_foreground() {
-    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    if let Err(e) = runtime.block_on(serve(shutdown_signal())) {
-        eprintln!("cakevpn-helper: {e}");
-        std::process::exit(1);
+    let served = on_big_stack(|| runtime().and_then(|runtime| runtime.block_on(serve(shutdown_signal()))));
+    match served {
+        Some(Ok(())) => {}
+        Some(Err(e)) => {
+            eprintln!("cakevpn-helper: {e}");
+            std::process::exit(1);
+        }
+        None => std::process::exit(1),
     }
 }
 
 fn main() {
+    note_crashes();
     let arg = std::env::args().nth(1).unwrap_or_default();
     match arg.as_str() {
         "run" => run_foreground(),

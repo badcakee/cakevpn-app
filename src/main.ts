@@ -443,6 +443,8 @@ function windowsProblemText(): string {
       return "CakeVPN was updated and its background service needs a restart. Press Fix it; Windows will ask for permission once.";
     case "not_answering":
       return "CakeVPN's background service is running but not answering. Press Fix it to restart it; Windows will ask for permission once.";
+    case "crashed":
+      return "CakeVPN's background service stopped unexpectedly. Press Fix it to start it again. If it keeps happening, send us the line below.";
     default:
       return "CakeVPN's background service isn't running. Fix it here; Windows will ask for permission once.";
   }
@@ -1938,7 +1940,11 @@ async function togglePower() {
   } catch (e) {
     const err = asApiError(e);
     if (err.message === "helper_missing") state.screen = "setup";
-    else state.actionError = err.message;
+    else {
+      state.actionError = err.message;
+      // The service hung up while connecting: the fix screen has the way out.
+      if (err.message.startsWith("CakeVPN's background service stopped while working")) state.screen = "setup";
+    }
   }
   state.busy = false;
   await refreshOverview();

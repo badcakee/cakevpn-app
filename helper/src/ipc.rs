@@ -11,9 +11,30 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 const MAX_LINE: usize = 64 * 1024;
 
 async fn handle(tunnel: &Arc<Tunnel>, line: &str) -> Response {
-    match serde_json::from_str::<Request>(line) {
-        Ok(request) => tunnel.answer(request).await,
-        Err(e) => Response { ok: false, error: Some(format!("bad request: {e}")), status: tunnel.status().await, pings: None },
+    let request = match serde_json::from_str::<Request>(line) {
+        Ok(request) => request,
+        Err(e) => {
+            return Response { ok: false, error: Some(format!("bad request: {e}")), status: tunnel.status().await, pings: None }
+        }
+    };
+    // Each request runs on its own: if it hits a bug, the app is told what
+    // happened (helper-crash.log has it too) and the helper keeps running.
+    let worker = Arc::clone(tunnel);
+    match tokio::spawn(async move { worker.answer(request).await }).await {
+        Ok(response) => response,
+        Err(failed) => {
+            let why = failed
+                .try_into_panic()
+                .ok()
+                .and_then(|p| p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()))
+                .unwrap_or_else(|| "stopped unexpectedly".into());
+            Response {
+                ok: false,
+                error: Some(format!("CakeVPN's background service ran into a problem: {why}")),
+                status: tunnel.status().await,
+                pings: None,
+            }
+        }
     }
 }
 

@@ -628,7 +628,7 @@ async fn install_helper() -> Result<(), String> {
 #[serde(rename_all = "camelCase")]
 struct HelperProblem {
     /// "file_missing", "not_installed", "stopped", "starting", "elsewhere",
-    /// "outdated", "not_answering" or "unknown".
+    /// "outdated", "not_answering", "crashed" or "unknown".
     kind: &'static str,
     /// What Windows says, for when someone asks for help.
     detail: String,
@@ -651,9 +651,72 @@ fn sc_field(text: &str, name: &str) -> Option<String> {
         .map(|l| l.split_once(':').map(|x| x.1).unwrap_or("").trim().to_string())
 }
 
+/// What Windows and the helper noted about the helper stopping in the last
+/// day: its own crash note (helper-crash.log), Windows' "Application Error"
+/// (with the exception code) and the service manager's "terminated
+/// unexpectedly". Empty when there is nothing.
+#[cfg(windows)]
+fn helper_crash_notes() -> String {
+    use std::os::windows::process::CommandExt;
+    let mut notes = vec![];
+    let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
+    let log = std::path::Path::new(&base).join("CakeVPN").join("helper-crash.log");
+    let recent = std::fs::metadata(&log)
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| t.elapsed().is_ok_and(|age| age.as_secs() < 86_400));
+    if recent {
+        if let Some(last) = std::fs::read_to_string(&log).ok().and_then(|t| t.lines().last().map(str::to_string)) {
+            notes.push(last.chars().take(300).collect::<String>());
+        }
+    }
+    let wevtutil = |log: &str, query: &str| -> String {
+        std::process::Command::new("wevtutil.exe")
+            .args(["qe", log, &format!("/q:{query}"), "/c:20", "/rd:true", "/f:text"])
+            .creation_flags(0x0800_0000)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    let day = "TimeCreated[timediff(@SystemTime) <= 86400000]";
+    let errors = wevtutil("Application", &format!("*[System[Provider[@Name='Application Error'] and {day}]]"));
+    let crashes: Vec<&str> = errors.split("Event[").filter(|e| e.to_lowercase().contains("cakevpn-helper")).collect();
+    if let Some(first) = crashes.first() {
+        let code = first
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .find(|w| w.len() == 10 && w.to_lowercase().starts_with("0xc"))
+            .unwrap_or("?");
+        notes.push(format!("Windows: helper crashed {} time(s) today, code {code}", crashes.len()));
+    }
+    let stops = wevtutil("System", &format!("*[System[Provider[@Name='Service Control Manager'] and (EventID=7031 or EventID=7034) and {day}]]"));
+    let ended = stops.split("Event[").filter(|e| e.contains("CakeVPN")).count();
+    if ended > 0 {
+        notes.push(format!("service ended unexpectedly {ended} time(s) today"));
+    }
+    notes.join(" · ")
+}
+
 #[tauri::command]
 async fn helper_problem() -> HelperProblem {
     #[cfg(windows)]
+    {
+        let crashes = tokio::task::spawn_blocking(helper_crash_notes).await.unwrap_or_default();
+        let mut problem = windows_helper_problem().await;
+        if !crashes.is_empty() {
+            if matches!(problem.kind, "stopped" | "starting" | "not_answering" | "unknown") {
+                problem.kind = "crashed";
+            }
+            problem.detail = if problem.detail.is_empty() { crashes } else { format!("{} · {crashes}", problem.detail) };
+        }
+        problem
+    }
+    #[cfg(not(windows))]
+    {
+        HelperProblem { kind: "unknown", ..Default::default() }
+    }
+}
+
+#[cfg(windows)]
+async fn windows_helper_problem() -> HelperProblem {
     {
         let dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf()));
         for file in ["cakevpn-helper.exe", "sing-box.exe"] {
@@ -691,10 +754,6 @@ async fn helper_problem() -> HelperProblem {
             _ => "unknown",
         };
         HelperProblem { kind, detail }
-    }
-    #[cfg(not(windows))]
-    {
-        HelperProblem { kind: "unknown", ..Default::default() }
     }
 }
 

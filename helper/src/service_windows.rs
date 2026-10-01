@@ -55,7 +55,8 @@ fn service_main(_args: Vec<OsString>) {
         });
     };
     report(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, 0);
-    let served = match tokio::runtime::Runtime::new() {
+    // On a thread with a big stack: Windows gives this one only 1 MB.
+    let served = crate::on_big_stack(move || match crate::runtime() {
         Ok(runtime) => {
             let served = runtime.block_on(crate::serve(async {
                 let _ = stop_rx.await;
@@ -65,7 +66,8 @@ fn service_main(_args: Vec<OsString>) {
             served.is_ok()
         }
         Err(_) => false,
-    };
+    })
+    .unwrap_or(false);
     // Stopping with an error has Windows start the helper again (see restart_after_failures).
     report(ServiceState::Stopped, ServiceControlAccept::empty(), if served { 0 } else { 1 });
 }
