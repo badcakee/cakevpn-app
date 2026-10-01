@@ -14,3 +14,4 @@ pub mod ping;
 pub mod quality;
 pub mod singbox;
 pub mod tunnel;
+pub mod update;

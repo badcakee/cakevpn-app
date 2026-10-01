@@ -30,6 +30,9 @@ export interface Announcement {
   id: number;
   text: string;
   kind: "info" | "warning";
+  /** Pop up a notification (1.8.6 and newer). */
+  notify?: boolean;
+  createdAt?: number;
 }
 
 export interface DayUsage {
@@ -70,6 +73,8 @@ export interface Account {
   /** Where this user's traffic leaves from; empty strings when shared or unknown. */
   ips?: { ipv4: string; ipv6: string };
   announcement?: Announcement | null;
+  /** Every announcement for this app's version, newest first (newer panels). */
+  announcements?: Announcement[];
   /** Messages from the panel for this person only, newest first. */
   messages?: PersonalMessage[];
   /** Every recent message, closed ones too, newest first. */
@@ -83,6 +88,8 @@ export interface PersonalMessage {
   createdAt: number;
   /** In the inbox: when it was closed (absent or 0 while open). */
   closedAt?: number;
+  /** Pop up a notification (absent from older panels: yes). */
+  notify?: boolean;
 }
 
 export interface ApiError {

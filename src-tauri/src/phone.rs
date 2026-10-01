@@ -121,8 +121,21 @@ fn watch_messages(app: AppHandle, dir: PathBuf) {
                     let mut changed = false;
                     for message in account.messages.iter().rev() {
                         if !told.contains(&message.id) {
-                            let _ = app.notification().builder().title("CakeVPN").body(&message.text).show();
+                            if message.notify {
+                                let _ = app.notification().builder().title("CakeVPN").body(&message.text).show();
+                            }
                             told.push(message.id);
+                            changed = true;
+                        }
+                    }
+                    // Announcements count apart from messages (their ids are their own).
+                    for a in account.announcements.iter().rev() {
+                        let id = -a.id;
+                        if !told.contains(&id) {
+                            if a.notify {
+                                let _ = app.notification().builder().title("CakeVPN").body(&a.text).show();
+                            }
+                            told.push(id);
                             changed = true;
                         }
                     }

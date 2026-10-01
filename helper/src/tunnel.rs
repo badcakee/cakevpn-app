@@ -105,6 +105,23 @@ impl Tunnel {
         Arc::new(Tunnel { paths, inner: Mutex::new(Inner::default()) })
     }
 
+    /// Installs a signed CakeVPN update without asking for permission (Windows).
+    async fn install_update(&self, path: String, signature: String) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            let dir = self.paths.data_dir.clone();
+            tokio::task::spawn_blocking(move || crate::update::install(&dir, &path, &signature))
+                .await
+                .map_err(|e| e.to_string())?
+                .map(|_| ())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (path, signature);
+            Err("Updates install themselves only on Windows.".into())
+        }
+    }
+
     /// Carries out one request from the app and says how the tunnel is now.
     pub async fn answer(self: &Arc<Self>, request: Request) -> Response {
         let mut pings = None;
@@ -116,6 +133,7 @@ impl Tunnel {
             }
             Request::Status => Ok(()),
             Request::Ping { targets } => self.ping(targets).await.map(|measured| pings = Some(measured)),
+            Request::InstallUpdate { path, signature } => self.install_update(path, signature).await,
         };
         let status = self.status().await;
         match result {

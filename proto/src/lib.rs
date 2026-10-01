@@ -24,7 +24,13 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// 8: sing-box starts over after the computer wakes up, and whenever nothing
 ///    gets through the tunnel any more (sites said "no internet" after
 ///    opening the lid).
-pub const HELPER_REVISION: u32 = 8;
+/// 9: on Windows, installs signed CakeVPN updates without asking (InstallUpdate).
+pub const HELPER_REVISION: u32 = 9;
+
+/// The oldest helper the app still works with. Revision 9 only adds
+/// silent updates on Windows, where the installer updates the helper anyway,
+/// so a Mac doesn't have to run "Set up" again for it.
+pub const MIN_HELPER_REVISION: u32 = 8;
 
 /// Most locations one ping request can name.
 pub const MAX_PING_TARGETS: usize = 32;
@@ -170,6 +176,9 @@ pub enum Request {
     Status,
     /// Measures the locations outside the tunnel. Only answered while connected.
     Ping { targets: Vec<PingTarget> },
+    /// Windows: checks the CakeVPN installer at `path` against the update key
+    /// (`signature` as in latest.json) and runs it silently. Revision 9 and newer.
+    InstallUpdate { path: String, signature: String },
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]

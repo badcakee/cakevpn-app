@@ -18,7 +18,7 @@ use desktop as platform;
 use phone as platform;
 
 use api::{Account, ApiError, Load};
-use cakevpn_proto::{PingTarget, Request, Status, TunnelState, HELPER_REVISION, PROTOCOL_VERSION};
+use cakevpn_proto::{PingTarget, Request, Status, TunnelState, MIN_HELPER_REVISION, PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -502,7 +502,7 @@ async fn overview(state: State<'_, AppState>) -> Result<Overview, String> {
     let status = response.status;
     // Only a helper change needs a new helper; plain app updates keep the installed one.
     let helper_state =
-        if status.protocol != PROTOCOL_VERSION || status.revision < HELPER_REVISION { "outdated" } else { "ok" };
+        if status.protocol != PROTOCOL_VERSION || status.revision < MIN_HELPER_REVISION { "outdated" } else { "ok" };
     let location_id = state.location.lock().await.clone();
 
     let window_visible = state.visible.load(Ordering::Relaxed);
@@ -758,7 +758,7 @@ async fn windows_helper_problem() -> HelperProblem {
             "1" | "3" => "stopped",
             "2" => "starting",
             "4" => match helper::ask(Request::Status).await {
-                Ok(r) if r.status.protocol != PROTOCOL_VERSION || r.status.revision < HELPER_REVISION => "outdated",
+                Ok(r) if r.status.protocol != PROTOCOL_VERSION || r.status.revision < MIN_HELPER_REVISION => "outdated",
                 Ok(_) => "unknown",
                 Err(_) => "not_answering",
             },

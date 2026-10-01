@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { Account, asApiError, backend, ConnectOptions, DayUsage, Location, Overview } from "./backend";
+import { Account, Announcement, asApiError, backend, ConnectOptions, DayUsage, Location, Overview } from "./backend";
 import { LANGUAGES, locale, pickLanguage, setLanguage, t, watch } from "./i18n";
 import { attachMap, drawMap, mapHtml, markCountries, setPlaces, showPlace } from "./map";
 import { placeOf } from "./places";
@@ -103,6 +103,11 @@ const state = {
   skipError: "",
   /** The id of the panel message this person closed. */
   closedAnnouncement: Number(saved.get("closedAnnouncement") || 0),
+  /** Announcements closed here. */
+  closedAnnouncements: new Set<number>(savedList("closedAnnouncements").map(Number)),
+  /** Announcements a notification was already shown for. */
+  notifiedAnnouncements: new Set<number>(savedList("notifiedAnnouncements").map(Number)),
+  shownAnnouncements: "",
   /** Messages for this person that they closed here (the server is told too). */
   closedMessages: new Set<number>(),
   /** Messages a notification was already shown for. */
@@ -624,11 +629,7 @@ function renderHome() {
       <button class="icon-btn inbox-btn" id="open-inbox" title="Messages">${ENVELOPE}<span class="inbox-count hidden" id="inbox-count"></span></button>
       <button class="icon-btn" id="open-settings" title="Settings">${GEAR}</button>`)}
     <main class="home screen">
-      <div class="announce hidden" id="announce">
-        <span class="announce-icon" id="announce-icon"></span>
-        <span class="announce-text" id="announce-text"></span>
-        <button id="announce-close" title="Close" aria-label="Close this message">×</button>
-      </div>
+      <div class="announcements" id="announcements"></div>
       <div class="personal-messages" id="personal-messages"></div>
       <div class="update-bar" id="update-bar">
         <span id="update-text"></span>
@@ -694,7 +695,10 @@ function renderHome() {
   });
   $("#invite-link")?.addEventListener("click", () => openSettings(true));
   $("#update-now")!.addEventListener("click", installUpdate);
-  $("#announce-close")!.addEventListener("click", closeAnnouncement);
+  $("#announcements")!.addEventListener("click", (e) => {
+    const button = (e.target as HTMLElement).closest<HTMLButtonElement>(".announce-close");
+    if (button) closeAnnouncement(Number(button.dataset.id));
+  });
   $("#personal-messages")!.addEventListener("click", (e) => {
     const button = (e.target as HTMLElement).closest<HTMLButtonElement>(".message-close");
     if (button) closeMessage(Number(button.dataset.id));
@@ -783,18 +787,10 @@ function updateHome() {
     setText("#banner .banner-text", b.message);
   }
 
-  // The panel's message, until this person closes it.
-  const message = state.account.announcement;
-  const showMessage = !!message && message.id !== state.closedAnnouncement;
-  const announce = $("#announce")!;
-  announce.className = `announce ${!showMessage ? "hidden" : message!.kind === "warning" ? "is-warning" : ""}`;
-  if (showMessage) {
-    setText("#announce-icon", message!.kind === "warning" ? "⚠️" : "📣");
-    setText("#announce-text", message!.text);
-  }
+  drawAnnouncements();
 
   drawMessages();
-  const unread = openMessages().length;
+  const unread = openMessages().length + openAnnouncements().length;
   const count = $("#inbox-count");
   if (count) {
     count.classList.toggle("hidden", unread === 0);
@@ -1073,26 +1069,44 @@ function accountTab(): string {
     <button class="danger-outline" id="sign-out">Sign out of this device</button>`;
 }
 
-/** Every message from CakeVPN, newest first: an inbox. */
+/** Every message from CakeVPN, newest first: an inbox (announcements too). */
 function messagesTab(): string {
   const account = state.account;
-  const list = account?.inbox?.length ? account.inbox : (account?.messages ?? []);
+  const personal = (account?.inbox?.length ? account.inbox : (account?.messages ?? [])).map((m) => ({
+    key: `m${m.id}`,
+    id: m.id,
+    everyone: false,
+    text: m.text,
+    kind: m.kind,
+    createdAt: m.createdAt,
+    open: !m.closedAt && !state.closedMessages.has(m.id),
+  }));
+  const everyone = allAnnouncements().map((a) => ({
+    key: `a${a.id}`,
+    id: a.id,
+    everyone: true,
+    text: a.text,
+    kind: a.kind,
+    createdAt: a.createdAt ?? 0,
+    open: !state.closedAnnouncements.has(a.id) && a.id !== state.closedAnnouncement,
+  }));
+  const list = [...personal, ...everyone].sort((a, b) => b.createdAt - a.createdAt);
   if (!list.length) return `<p class="muted">No messages yet. When CakeVPN writes to you, it shows up here and as a notification.</p>`;
   const when = (seconds: number) =>
-    new Date(seconds * 1000).toLocaleString(locale(), { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    seconds ? new Date(seconds * 1000).toLocaleString(locale(), { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
   return `<div class="inbox">${list
-    .map((m) => {
-      const open = !m.closedAt && !state.closedMessages.has(m.id);
-      return `<div class="card inbox-item ${open ? "unread" : ""} ${m.kind === "warning" ? "is-warning" : ""}">
+    .map(
+      (m) => `<div class="card inbox-item ${m.open ? "unread" : ""} ${m.kind === "warning" ? "is-warning" : ""}">
         <div class="inbox-head">
-          <span>${m.kind === "warning" ? "⚠️" : "✉️"}</span>
+          <span>${m.kind === "warning" ? "⚠️" : m.everyone ? "📣" : "✉️"}</span>
+          ${m.everyone ? `<span class="muted small">To everyone</span>` : ""}
           <span class="muted small" data-keep>${esc(when(m.createdAt))}</span>
-          ${open ? `<span class="inbox-new">New</span>` : ""}
+          ${m.open ? `<span class="inbox-new">New</span>` : ""}
         </div>
         <div class="inbox-text" data-keep>${esc(m.text)}</div>
-        ${open ? `<button class="link inbox-read" data-id="${m.id}">Mark as read</button>` : ""}
-      </div>`;
-    })
+        ${m.open ? `<button class="link inbox-read" data-id="${m.id}" data-everyone="${m.everyone ? 1 : 0}">Mark as read</button>` : ""}
+      </div>`,
+    )
     .join("")}</div>`;
 }
 
@@ -1290,7 +1304,13 @@ function renderSettings() {
   );
   $("#reconnect")?.addEventListener("click", reconnect);
   document.querySelectorAll<HTMLButtonElement>(".inbox-read").forEach((button) =>
-    button.addEventListener("click", () => closeMessage(Number(button.dataset.id))),
+    button.addEventListener("click", () => {
+      const id = Number(button.dataset.id);
+      if (button.dataset.everyone === "1") {
+        closeAnnouncement(id);
+        render();
+      } else closeMessage(id);
+    }),
   );
 
   // Account and invites
@@ -2011,7 +2031,7 @@ function drawMessages() {
 
 async function closeMessage(id: number) {
   state.closedMessages.add(id);
-  drawMessages();
+  updateHome();
   if (state.screen === "settings" && state.settingsTab === "messages") render();
   try {
     await backend.closeMessage(id);
@@ -2027,17 +2047,54 @@ async function closeMessage(id: number) {
 function notifyNewMessages() {
   const messages = state.account?.messages ?? [];
   const fresh = messages.filter((m) => !state.notifiedMessages.has(m.id));
-  if (!fresh.length) return;
   fresh.forEach((m) => state.notifiedMessages.add(m.id));
-  saved.set("notifiedMessages", JSON.stringify([...state.notifiedMessages].slice(-50).map(String)));
+  if (fresh.length) saved.set("notifiedMessages", JSON.stringify([...state.notifiedMessages].slice(-50).map(String)));
+  const news = allAnnouncements().filter((a) => !state.notifiedAnnouncements.has(a.id));
+  news.forEach((a) => state.notifiedAnnouncements.add(a.id));
+  if (news.length) saved.set("notifiedAnnouncements", JSON.stringify([...state.notifiedAnnouncements].slice(-100).map(String)));
+  // Android shows these from the app itself (see phone.rs), also when the page sleeps.
   if (isAndroid || !state.notifyMessages) return;
-  for (const m of fresh.reverse()) backend.notify(t("Message from CakeVPN"), m.text).catch(() => {});
+  for (const m of fresh.reverse()) {
+    if (m.notify !== false) backend.notify(t("Message from CakeVPN"), m.text).catch(() => {});
+  }
+  for (const a of news.reverse()) {
+    if (a.notify) backend.notify("CakeVPN", a.text).catch(() => {});
+  }
 }
 
-function closeAnnouncement() {
-  const id = state.account?.announcement?.id ?? 0;
-  state.closedAnnouncement = id;
-  saved.set("closedAnnouncement", String(id));
+/** The panel's announcements for this app (older panels send just one). */
+function allAnnouncements(): Announcement[] {
+  const account = state.account;
+  if (account?.announcements) return account.announcements;
+  return account?.announcement ? [account.announcement] : [];
+}
+
+function openAnnouncements(): Announcement[] {
+  return allAnnouncements().filter((a) => !state.closedAnnouncements.has(a.id) && a.id !== state.closedAnnouncement);
+}
+
+/** Each announcement at the top, until this person closes it. */
+function drawAnnouncements() {
+  const box = $("#announcements");
+  if (!box) return;
+  const list = openAnnouncements();
+  const key = list.map((a) => `${a.id}:${a.kind}:${a.text}`).join("|");
+  if (key === state.shownAnnouncements) return;
+  state.shownAnnouncements = key;
+  box.innerHTML = list
+    .map(
+      (a) => `<div class="announce ${a.kind === "warning" ? "is-warning" : ""}">
+        <span class="announce-icon">${a.kind === "warning" ? "⚠️" : "📣"}</span>
+        <span class="announce-text" data-keep>${esc(a.text)}</span>
+        <button class="announce-close" data-id="${a.id}" title="Close" aria-label="Close this message">×</button>
+      </div>`,
+    )
+    .join("");
+}
+
+function closeAnnouncement(id: number) {
+  state.closedAnnouncements.add(id);
+  saved.set("closedAnnouncements", JSON.stringify([...state.closedAnnouncements].slice(-100).map(String)));
   updateHome();
 }
 

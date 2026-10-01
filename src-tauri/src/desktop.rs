@@ -112,7 +112,10 @@ pub async fn check_update(app: &AppHandle) -> Result<Option<UpdateInfo>, String>
     Ok(update.map(|u| UpdateInfo { version: u.version.clone(), notes: u.body.clone() }))
 }
 
-/// Downloads and installs the newer release, then restarts CakeVPN.
+/// Downloads and installs the newer release, then restarts CakeVPN. On
+/// Windows the helper installs it (it checks the signature itself), so
+/// Windows doesn't ask for permission; older helpers fall back to the
+/// installer that asks.
 pub async fn install_update(app: &AppHandle, state: &AppState) -> Result<(), String> {
     let updater = app.updater().map_err(|e| e.to_string())?;
     let update = updater
@@ -125,19 +128,53 @@ pub async fn install_update(app: &AppHandle, state: &AppState) -> Result<(), Str
     let (done, total) = (Arc::clone(&state.update_done), Arc::clone(&state.update_total));
     done.store(0, Ordering::Relaxed);
     total.store(0, Ordering::Relaxed);
-    update
-        .download_and_install(
-            move |chunk, size| {
-                done.fetch_add(chunk as u64, Ordering::Relaxed);
-                if let Some(size) = size {
-                    total.store(size, Ordering::Relaxed);
-                }
-            },
-            || {},
-        )
-        .await
-        .map_err(|e| format!("The update could not be installed: {e}"))?;
+    let progress = move |chunk: usize, size: Option<u64>| {
+        done.fetch_add(chunk as u64, Ordering::Relaxed);
+        if let Some(size) = size {
+            total.store(size, Ordering::Relaxed);
+        }
+    };
+    // The updater checks the download's signature before handing it over.
+    let bytes = update.download(progress, || {}).await.map_err(|e| format!("The update could not be downloaded: {e}"))?;
+    #[cfg(windows)]
+    if helper_installs_updates().await {
+        let path = std::env::temp_dir().join(format!("CakeVPN_{}_update.exe", update.version));
+        std::fs::write(&path, &bytes).map_err(|e| format!("The update could not be saved: {e}"))?;
+        let request = Request::InstallUpdate { path: path.to_string_lossy().into_owned(), signature: update.signature.clone() };
+        match helper::ask(request).await {
+            Ok(response) if response.ok => {
+                start_again_after_install();
+                app.exit(0);
+                return Ok(());
+            }
+            // Not installed by the helper: the installer that asks for permission does it.
+            _ => {}
+        }
+    }
+    update.install(&bytes).map_err(|e| format!("The update could not be installed: {e}"))?;
     app.restart()
+}
+
+/// Whether the helper can install updates by itself (revision 9 and newer).
+#[cfg(windows)]
+async fn helper_installs_updates() -> bool {
+    helper::ask(Request::Status).await.is_ok_and(|r| r.status.revision >= 9)
+}
+
+/// Opens CakeVPN again once the helper's installer has finished: a hidden
+/// PowerShell in this person's session waits for it, then starts the app.
+#[cfg(windows)]
+fn start_again_after_install() {
+    use std::os::windows::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else { return };
+    let exe = exe.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "Start-Sleep 6; $t = 0; while ((Get-Process cakevpn-update-setup -ErrorAction SilentlyContinue) -and $t -lt 600) {{ Start-Sleep 2; $t += 2 }}; Start-Sleep 3; Start-Process '{exe}'"
+    );
+    let _ = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
+        .creation_flags(0x0800_0000 | 0x0000_0008) // no window, detached
+        .spawn();
 }
 
 /// Sets the keyboard shortcut that turns the VPN on and off ("Control+Alt+Shift+V"), or none.

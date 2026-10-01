@@ -62,6 +62,24 @@ pub struct Announcement {
     pub kind: String,
 }
 
+/// An announcement from the panel for many apps (1.8.6 and newer get every one meant for them).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AppAnnouncement {
+    pub id: i64,
+    pub text: String,
+    pub kind: String,
+    /// Pop up a notification for it.
+    #[serde(default)]
+    pub notify: bool,
+    #[serde(default)]
+    pub created_at: i64,
+}
+
+fn yes() -> bool {
+    true
+}
+
 /// A message from the panel for this person only, shown until they close it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -75,6 +93,9 @@ pub struct PersonalMessage {
     /// In the inbox: when the person closed it (0 while it is still open).
     #[serde(default)]
     pub closed_at: i64,
+    /// Pop up a notification for it (older panels didn't say: yes).
+    #[serde(default = "yes")]
+    pub notify: bool,
 }
 
 /// One day of the usage graph.
@@ -130,6 +151,9 @@ pub struct Account {
     pub ips: Ips,
     #[serde(default)]
     pub announcement: Option<Announcement>,
+    /// Every announcement for this app's version, newest first.
+    #[serde(default)]
+    pub announcements: Vec<AppAnnouncement>,
     /// Newest first; empty from servers that don't send messages yet.
     #[serde(default)]
     pub messages: Vec<PersonalMessage>,
