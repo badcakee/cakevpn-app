@@ -622,6 +622,82 @@ async fn install_helper() -> Result<(), String> {
     }
 }
 
+/// Why the app can't use the helper, for the fix screen on Windows: the
+/// same "isn't running" covers very different problems.
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct HelperProblem {
+    /// "file_missing", "not_installed", "stopped", "starting", "elsewhere",
+    /// "outdated", "not_answering" or "unknown".
+    kind: &'static str,
+    /// What Windows says, for when someone asks for help.
+    detail: String,
+}
+
+/// Runs `sc.exe` and returns its exit code and output. No admin rights needed.
+#[cfg(windows)]
+fn sc(args: &[&str]) -> Option<(i32, String)> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("sc.exe").args(args).creation_flags(0x0800_0000).output().ok()?;
+    Some((out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned()))
+}
+
+/// The value after "NAME :" in sc.exe's output (the names are not translated).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn sc_field(text: &str, name: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|l| l.starts_with(name) && l[name.len()..].trim_start().starts_with(':'))
+        .map(|l| l.split_once(':').map(|x| x.1).unwrap_or("").trim().to_string())
+}
+
+#[tauri::command]
+async fn helper_problem() -> HelperProblem {
+    #[cfg(windows)]
+    {
+        let dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf()));
+        for file in ["cakevpn-helper.exe", "sing-box.exe"] {
+            if dir.as_ref().is_some_and(|d| !d.join(file).exists()) {
+                return HelperProblem { kind: "file_missing", detail: file.to_string() };
+            }
+        }
+        let service = cakevpn_proto::WINDOWS_SERVICE;
+        let Some((code, query)) = tokio::task::spawn_blocking(move || sc(&["query", service])).await.ok().flatten() else {
+            return HelperProblem { kind: "unknown", detail: "sc.exe did not run".into() };
+        };
+        if code == 1060 {
+            return HelperProblem { kind: "not_installed", detail: "the service does not exist".into() };
+        }
+        let state = sc_field(&query, "STATE").unwrap_or_default();
+        let exit = sc_field(&query, "WIN32_EXIT_CODE").unwrap_or_default();
+        let detail = format!("STATE {state} · exit {exit}");
+        let path = tokio::task::spawn_blocking(move || sc(&["qc", service])).await.ok().flatten()
+            .and_then(|(_, qc)| sc_field(&qc, "BINARY_PATH_NAME"));
+        if let (Some(path), Some(dir)) = (&path, &dir) {
+            let here = dir.join("cakevpn-helper.exe").to_string_lossy().to_lowercase();
+            if !path.to_lowercase().contains(&here) {
+                return HelperProblem { kind: "elsewhere", detail: path.clone() };
+            }
+        }
+        let number = state.split_whitespace().next().unwrap_or("");
+        let kind = match number {
+            "1" | "3" => "stopped",
+            "2" => "starting",
+            "4" => match helper::ask(Request::Status).await {
+                Ok(r) if r.status.protocol != PROTOCOL_VERSION || r.status.revision < HELPER_REVISION => "outdated",
+                Ok(_) => "unknown",
+                Err(_) => "not_answering",
+            },
+            _ => "unknown",
+        };
+        HelperProblem { kind, detail }
+    }
+    #[cfg(not(windows))]
+    {
+        HelperProblem { kind: "unknown", ..Default::default() }
+    }
+}
+
 /// Measures how far each location is, in milliseconds. While the tunnel is
 /// down the app connects to them itself. While it is up, everything the app
 /// sends goes through the tunnel, so the helper measures outside it instead.
@@ -805,6 +881,7 @@ pub fn run() {
             disconnect,
             overview,
             install_helper,
+            helper_problem,
             ping_locations,
             settings_info,
             set_autostart,
@@ -839,6 +916,16 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_sc_exe() {
+        let query = "\r\nSERVICE_NAME: CakeVPNHelper \r\n        TYPE               : 10  WIN32_OWN_PROCESS  \r\n        STATE              : 1  STOPPED \r\n        WIN32_EXIT_CODE    : 1  (0x1)\r\n        SERVICE_EXIT_CODE  : 0  (0x0)\r\n";
+        assert_eq!(sc_field(query, "STATE").as_deref(), Some("1  STOPPED"));
+        assert_eq!(sc_field(query, "WIN32_EXIT_CODE").as_deref(), Some("1  (0x1)"));
+        let qc = "        BINARY_PATH_NAME   : \"C:\\Program Files\\CakeVPN\\cakevpn-helper.exe\" service\r\n";
+        assert_eq!(sc_field(qc, "BINARY_PATH_NAME").as_deref(), Some("\"C:\\Program Files\\CakeVPN\\cakevpn-helper.exe\" service"));
+        assert_eq!(sc_field(query, "SERVICE_NAME").as_deref(), Some("CakeVPNHelper"));
+    }
     use cakevpn_proto::Quality;
 
     fn connected(q: Quality) -> Status {

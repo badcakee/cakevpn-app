@@ -80,6 +80,8 @@ const state = {
   updateMessage: "",
   lastBytes: null as { at: number; up: number; down: number } | null,
   speed: { up: 0, down: 0 },
+  /** What Windows says is wrong with the background service (fix screen). */
+  helperProblem: null as { kind: string; detail: string } | null,
   /** Why CakeVPN moved to another location, shown under the button until moveNoticeUntil. */
   moveNotice: "",
   moveNoticeUntil: 0,
@@ -424,7 +426,46 @@ function updateCodeMessage() {
   setText("#code-error", locked ? `Too many wrong codes. Try again in ${formatDuration(wait)}.` : state.codeError);
 }
 
+/** What is wrong with the Windows service, in words (see helper_problem). */
+function windowsProblemText(): string {
+  switch (state.helperProblem?.kind) {
+    case "file_missing":
+      return "A CakeVPN file is missing. Windows Security may have removed it: open Windows Security, then Virus & threat protection, then Protection history, allow CakeVPN there, and install CakeVPN again.";
+    case "not_installed":
+      return "CakeVPN's background service isn't installed. Press Fix it; Windows will ask for permission once.";
+    case "stopped":
+      return "CakeVPN's background service is stopped. Press Fix it to start it; Windows will ask for permission once.";
+    case "starting":
+      return "CakeVPN's background service is starting…";
+    case "elsewhere":
+      return "CakeVPN's background service belongs to another copy of CakeVPN. Press Fix it to use this one; Windows will ask for permission once.";
+    case "outdated":
+      return "CakeVPN was updated and its background service needs a restart. Press Fix it; Windows will ask for permission once.";
+    case "not_answering":
+      return "CakeVPN's background service is running but not answering. Press Fix it to restart it; Windows will ask for permission once.";
+    default:
+      return "CakeVPN's background service isn't running. Fix it here; Windows will ask for permission once.";
+  }
+}
+
+/** Asks Windows what is wrong with the service, and shows it. */
+async function readHelperProblem() {
+  if (!isWindows) return;
+  try {
+    state.helperProblem = await backend.helperProblem();
+  } catch {
+    state.helperProblem = null;
+  }
+  if (state.screen === "setup") render();
+}
+
+let problemAsked = false;
+
 function renderSetup() {
+  if (isWindows && !problemAsked) {
+    problemAsked = true;
+    void readHelperProblem();
+  }
   const outdated = state.overview?.helper === "outdated";
   app.innerHTML = `
     ${header()}
@@ -433,11 +474,12 @@ function renderSetup() {
       <h1>${isWindows ? "One quick fix" : outdated ? "Update needed" : "One-time setup"}</h1>
       <p class="muted">${
         isWindows
-          ? "CakeVPN's background service isn't running. Fix it here; Windows will ask for permission once."
+          ? windowsProblemText()
           : outdated
             ? "CakeVPN was updated and its network helper needs updating too."
             : "CakeVPN needs to install a small network helper. Your Mac will ask for your password once."
       }</p>
+      ${isWindows && state.helperProblem?.detail ? `<p class="muted small" data-keep>${esc(state.helperProblem.detail)}</p>` : ""}
       ${state.actionError ? `<div class="error">${esc(state.actionError)}</div>` : ""}
       <button class="primary" id="install" ${state.busy ? "disabled" : ""}>${
         isWindows ? (state.busy ? "Fixing…" : "Fix it") : state.busy ? "Setting up…" : "Set up"
@@ -1946,6 +1988,7 @@ async function installHelper() {
     state.screen = state.account ? "home" : "code";
   } catch (e) {
     state.actionError = asApiError(e).message;
+    await readHelperProblem();
   }
   state.busy = false;
   render();
@@ -1988,7 +2031,11 @@ async function refreshOverview() {
     }
     showSpeed(state.speed);
     if ((ov.helper === "missing" || ov.helper === "outdated") && state.screen === "home") setScreen("setup");
-    if (ov.helper === "ok" && state.screen === "setup") setScreen(state.account ? "home" : "code");
+    if (ov.helper === "ok" && state.screen === "setup") {
+      problemAsked = false;
+      state.helperProblem = null;
+      setScreen(state.account ? "home" : "code");
+    }
   } catch {
     /* keep the last view; the next poll tries again */
   }

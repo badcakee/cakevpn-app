@@ -133,6 +133,7 @@ export const backend = {
   disconnect: () => invoke<Status>("disconnect"),
   overview: () => invoke<Overview>("overview"),
   installHelper: () => invoke<void>("install_helper"),
+  helperProblem: () => invoke<{ kind: string; detail: string }>("helper_problem"),
   pingLocations: () => invoke<Record<string, number | null>>("ping_locations"),
   settingsInfo: () => invoke<{ version: string; autostart: boolean }>("settings_info"),
   setAutostart: (enabled: boolean) => invoke<boolean>("set_autostart", { enabled }),
