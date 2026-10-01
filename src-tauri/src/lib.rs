@@ -387,6 +387,13 @@ async fn delete_invite(state: State<'_, AppState>, code: String) -> Result<Accou
     fetch_account(&state).await
 }
 
+/// The person closed one of the panel's messages for them.
+#[tauri::command]
+async fn close_message(id: i64) -> Result<(), ApiError> {
+    let token = store::token().ok_or_else(not_signed_in)?;
+    api::close_message(&token, id).await
+}
+
 #[tauri::command]
 async fn sign_out(state: State<'_, AppState>) -> Result<(), String> {
     let _ = helper::ask(Request::Disconnect).await;
@@ -946,6 +953,7 @@ pub fn run() {
             set_autostart,
             create_invite,
             delete_invite,
+            close_message,
             usage_history,
             dns_check,
             current_network,

@@ -1078,6 +1078,17 @@ label.row {
   animation: screen-in 0.25s var(--ease);
 }
 
+.announce.personal .announce-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.announce.personal .message-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .announce.hidden {
   display: none;
 }

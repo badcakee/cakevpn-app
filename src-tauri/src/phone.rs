@@ -94,6 +94,51 @@ fn system_property(name: &str) -> Option<String> {
     (len > 0).then(|| String::from_utf8_lossy(&value[..len as usize]).trim().to_string()).filter(|v| !v.is_empty())
 }
 
+/// Android pauses the app's page whenever it isn't on screen, so the panel's
+/// messages are looked for here too (every 3 minutes while CakeVPN runs,
+/// which it does while the VPN is on) and shown as notifications.
+fn watch_messages(app: AppHandle, dir: PathBuf) {
+    use tauri_plugin_notification::{NotificationExt, PermissionState};
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        // Android 13 and newer ask the person once whether notifications may show.
+        let asker = app.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            if matches!(asker.notification().permission_state(), Ok(PermissionState::Prompt | PermissionState::PromptWithRationale)) {
+                let _ = asker.notification().request_permission();
+            }
+        })
+        .await;
+        let file = dir.join("messages-notified");
+        loop {
+            if let Some(token) = crate::store::token() {
+                if let Ok(account) = crate::api::account(&token).await {
+                    let mut told: Vec<i64> = std::fs::read_to_string(&file)
+                        .unwrap_or_default()
+                        .split(',')
+                        .filter_map(|n| n.trim().parse().ok())
+                        .collect();
+                    let mut changed = false;
+                    for message in account.messages.iter().rev() {
+                        if !told.contains(&message.id) {
+                            let _ = app.notification().builder().title("CakeVPN").body(&message.text).show();
+                            told.push(message.id);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        let keep = told.len().saturating_sub(50);
+                        let list: Vec<String> = told[keep..].iter().map(|n| n.to_string()).collect();
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::fs::write(&file, list.join(","));
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(180)).await;
+        }
+    });
+}
+
 pub fn setup(app: &tauri::App, _shown: bool) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(model) = system_property("ro.product.model") {
         let _ = MODEL.set(model);
@@ -107,6 +152,7 @@ pub fn setup(app: &tauri::App, _shown: bool) -> Result<(), Box<dyn std::error::E
         attach: Some(Arc::new(PhoneAttach { app: app.handle().clone(), running: Mutex::new(None) })),
     });
     let _ = TUNNEL.set(tunnel);
+    watch_messages(app.handle().clone(), app.path().app_data_dir()?);
     Ok(())
 }
 

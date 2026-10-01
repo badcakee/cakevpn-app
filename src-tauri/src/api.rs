@@ -62,6 +62,18 @@ pub struct Announcement {
     pub kind: String,
 }
 
+/// A message from the panel for this person only, shown until they close it.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonalMessage {
+    pub id: i64,
+    pub text: String,
+    /// "info" or "warning".
+    pub kind: String,
+    #[serde(default)]
+    pub created_at: i64,
+}
+
 /// One day of the usage graph.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DayUsage {
@@ -115,6 +127,9 @@ pub struct Account {
     pub ips: Ips,
     #[serde(default)]
     pub announcement: Option<Announcement>,
+    /// Newest first; empty from servers that don't send messages yet.
+    #[serde(default)]
+    pub messages: Vec<PersonalMessage>,
 }
 
 /// Where this user's traffic leaves from; empty when unknown or shared.
@@ -183,6 +198,15 @@ pub async fn redeem(code: &str, device_id: &str, device_name: &str) -> Result<St
 
 pub async fn account(token: &str) -> Result<Account, ApiError> {
     read(client().get(format!("{API_BASE}/cakevpn/api/v1/account")).bearer_auth(token).send().await).await
+}
+
+/// The person closed one of the panel's messages.
+pub async fn close_message(token: &str, id: i64) -> Result<(), ApiError> {
+    let body = serde_json::json!({ "id": id });
+    let _: serde_json::Value =
+        read(client().post(format!("{API_BASE}/cakevpn/api/v1/message/close")).bearer_auth(token).json(&body).send().await)
+            .await?;
+    Ok(())
 }
 
 /// Makes an invite code for a friend.

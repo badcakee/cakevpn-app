@@ -207,6 +207,9 @@ T = [
 ("{wifi} is a public Wi-Fi, so the VPN is on.", "{wifi} est un Wi-Fi public, le VPN est donc activé.", "{wifi} es una Wi-Fi pública, así que la VPN está activada.", "{wifi} è una Wi-Fi pubblica, quindi la VPN è attiva.", "{wifi} ist ein öffentliches WLAN, deshalb ist das VPN an.", "{wifi}은(는) 공용 Wi-Fi라서 VPN이 켜졌습니다."),
 ("This Wi-Fi isn't trusted, so the VPN is on.", "Ce Wi-Fi n'est pas de confiance, le VPN est donc activé.", "Esta Wi-Fi no es de confianza, así que la VPN está activada.", "Questa Wi-Fi non è fidata, quindi la VPN è attiva.", "Diesem WLAN wird nicht vertraut, deshalb ist das VPN an.", "신뢰하지 않는 Wi-Fi라서 VPN이 켜졌습니다."),
 ("CakeVPN moved you", "CakeVPN vous a déplacé", "CakeVPN te ha movido", "CakeVPN ti ha spostato", "CakeVPN hat dich verschoben", "CakeVPN이 위치를 옮겼습니다"),
+("Message from CakeVPN", "Message de CakeVPN", "Mensaje de CakeVPN", "Messaggio da CakeVPN", "Nachricht von CakeVPN", "CakeVPN 메시지"),
+("Messages from CakeVPN", "Messages de CakeVPN", "Mensajes de CakeVPN", "Messaggi da CakeVPN", "Nachrichten von CakeVPN", "CakeVPN 메시지"),
+("When CakeVPN sends you a message", "Quand CakeVPN vous envoie un message", "Cuando CakeVPN te envía un mensaje", "Quando CakeVPN ti invia un messaggio", "Wenn CakeVPN dir eine Nachricht schickt", "CakeVPN이 메시지를 보낼 때"),
 ("Open CakeVPN to install it.", "Ouvrez CakeVPN pour l'installer.", "Abre CakeVPN para instalarla.", "Apri CakeVPN per installarlo.", "Öffne CakeVPN, um es zu installieren.", "설치하려면 CakeVPN을 여세요."),
 # ---- warnings ----
 ("Your Wi-Fi ({name}) is unstable.", "Votre Wi-Fi ({name}) est instable.", "Tu Wi-Fi ({name}) es inestable.", "La tua Wi-Fi ({name}) è instabile.", "Dein WLAN ({name}) ist instabil.", "Wi-Fi({name})가 불안정합니다."),

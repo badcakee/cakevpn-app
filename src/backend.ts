@@ -70,6 +70,15 @@ export interface Account {
   /** Where this user's traffic leaves from; empty strings when shared or unknown. */
   ips?: { ipv4: string; ipv6: string };
   announcement?: Announcement | null;
+  /** Messages from the panel for this person only, newest first. */
+  messages?: PersonalMessage[];
+}
+
+export interface PersonalMessage {
+  id: number;
+  text: string;
+  kind: "info" | "warning";
+  createdAt: number;
 }
 
 export interface ApiError {
@@ -139,6 +148,7 @@ export const backend = {
   setAutostart: (enabled: boolean) => invoke<boolean>("set_autostart", { enabled }),
   createInvite: () => invoke<Account>("create_invite"),
   deleteInvite: (code: string) => invoke<Account>("delete_invite", { code }),
+  closeMessage: (id: number) => invoke<void>("close_message", { id }),
   /** The last 30 days, oldest first. */
   usageHistory: () => invoke<DayUsage[]>("usage_history"),
   /** Whether this computer is on a Wi-Fi, and its name when the system says. */

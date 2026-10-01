@@ -99,6 +99,12 @@ const state = {
   skipError: "",
   /** The id of the panel message this person closed. */
   closedAnnouncement: Number(saved.get("closedAnnouncement") || 0),
+  /** Messages for this person that they closed here (the server is told too). */
+  closedMessages: new Set<number>(),
+  /** Messages a notification was already shown for. */
+  notifiedMessages: new Set<number>(savedList("notifiedMessages").map(Number)),
+  /** Which messages are on screen, to redraw them only when they change. */
+  shownMessages: "",
   speedTest: { phase: "" as "" | "down" | "up", down: null as number | null, up: null as number | null, error: "" },
   /** "auto" follows the computer's language. */
   lang: saved.get("lang") || "auto",
@@ -120,6 +126,7 @@ const state = {
   shortcutError: "",
   notifyConnection: saved.get("notifyConnection") !== "0",
   notifyUpdates: saved.get("notifyUpdates") !== "0",
+  notifyMessages: saved.get("notifyMessages") !== "0",
   /** Until when a change of the tunnel was asked for by the person or by CakeVPN itself, so it isn't taken for a drop. */
   expectedUntil: 0,
   /** The connection dropped by itself, and CakeVPN is bringing it back. */
@@ -580,6 +587,7 @@ function renderHome() {
         <span class="announce-text" id="announce-text"></span>
         <button id="announce-close" title="Close" aria-label="Close this message">×</button>
       </div>
+      <div class="personal-messages" id="personal-messages"></div>
       <div class="update-bar" id="update-bar">
         <span id="update-text"></span>
         <button id="update-now">Update now</button>
@@ -641,6 +649,10 @@ function renderHome() {
   $("#invite-link")?.addEventListener("click", () => openSettings(true));
   $("#update-now")!.addEventListener("click", installUpdate);
   $("#announce-close")!.addEventListener("click", closeAnnouncement);
+  $("#personal-messages")!.addEventListener("click", (e) => {
+    const button = (e.target as HTMLElement).closest<HTMLButtonElement>(".message-close");
+    if (button) closeMessage(Number(button.dataset.id));
+  });
   $("#run-speedtest")!.addEventListener("click", runSpeedTest);
   updateLocations();
   $("#locations")!.addEventListener("click", (e) => {
@@ -734,6 +746,8 @@ function updateHome() {
     setText("#announce-icon", message!.kind === "warning" ? "⚠️" : "📣");
     setText("#announce-text", message!.text);
   }
+
+  drawMessages();
 
   // The speed test runs against the location this computer is connected to.
   const test = state.speedTest;
@@ -939,6 +953,7 @@ function notificationsTab(): string {
     <div class="card list">
       ${switchRow("set-notify-connection", "The connection", "When the VPN drops, comes back, turns on by itself on public Wi-Fi, or moves you to another location", state.notifyConnection)}
       ${switchRow("set-notify-updates", "Updates", "When a new version of CakeVPN is ready", state.notifyUpdates)}
+      ${switchRow("set-notify-messages", "Messages from CakeVPN", "When CakeVPN sends you a message", state.notifyMessages)}
     </div>
     <p class="muted small">Notifications only appear while the CakeVPN window isn't in front of you.</p>
     <button class="outline" id="test-notification">Send a test notification</button>`;
@@ -1166,6 +1181,10 @@ function renderSettings() {
   toggle("#set-notify-updates", (on) => {
     state.notifyUpdates = on;
     saved.set("notifyUpdates", on ? "1" : "0");
+  });
+  toggle("#set-notify-messages", (on) => {
+    state.notifyMessages = on;
+    saved.set("notifyMessages", on ? "1" : "0");
   });
   $("#test-notification")?.addEventListener("click", () =>
     backend.notify("CakeVPN", t("Notifications work. This is how CakeVPN tells you about your connection.")).catch(() => {}),
@@ -1878,6 +1897,49 @@ function formatMbps(mbps: number): string {
   return `${mbps >= 100 ? Math.round(mbps) : mbps.toFixed(1)} Mbps`;
 }
 
+/** The panel's messages for this person, until they close each one. */
+function drawMessages() {
+  const box = $("#personal-messages");
+  if (!box) return;
+  const list = (state.account?.messages ?? []).filter((m) => !state.closedMessages.has(m.id));
+  const key = list.map((m) => `${m.id}:${m.kind}:${m.text}`).join("|");
+  if (key === state.shownMessages) return;
+  state.shownMessages = key;
+  box.innerHTML = list
+    .map(
+      (m) => `<div class="announce personal ${m.kind === "warning" ? "is-warning" : ""}">
+        <span class="announce-icon">${m.kind === "warning" ? "⚠️" : "✉️"}</span>
+        <span class="announce-text"><b>Message from CakeVPN</b><span class="message-body" data-keep>${esc(m.text)}</span></span>
+        <button class="message-close" data-id="${m.id}" title="Close" aria-label="Close this message">×</button>
+      </div>`,
+    )
+    .join("");
+}
+
+async function closeMessage(id: number) {
+  state.closedMessages.add(id);
+  drawMessages();
+  try {
+    await backend.closeMessage(id);
+  } catch {
+    /* it stays closed here; the server hears of it next time */
+  }
+}
+
+/**
+ * A notification for each message not seen before (on a computer: the
+ * page keeps running in the tray; on a phone the app does it by itself).
+ */
+function notifyNewMessages() {
+  const messages = state.account?.messages ?? [];
+  const fresh = messages.filter((m) => !state.notifiedMessages.has(m.id));
+  if (!fresh.length) return;
+  fresh.forEach((m) => state.notifiedMessages.add(m.id));
+  saved.set("notifiedMessages", JSON.stringify([...state.notifiedMessages].slice(-50).map(String)));
+  if (isAndroid || !state.notifyMessages) return;
+  for (const m of fresh.reverse()) backend.notify(t("Message from CakeVPN"), m.text).catch(() => {});
+}
+
 function closeAnnouncement() {
   const id = state.account?.announcement?.id ?? 0;
   state.closedAnnouncement = id;
@@ -2052,6 +2114,7 @@ async function refreshAccount() {
   state.lastRefresh = Date.now();
   try {
     state.account = await backend.refreshAccount();
+    notifyNewMessages();
     state.offline = false;
     syncTray();
     updateLocations();
@@ -2169,6 +2232,8 @@ async function start() {
     state.offline = !!session.offline;
     state.lastRefresh = Date.now();
     state.screen = session.signedIn && session.account ? "home" : "code";
+    // Messages sent while CakeVPN was closed get their notification now.
+    if (!session.offline) notifyNewMessages();
   } catch (e) {
     const err = asApiError(e);
     state.screen = "code";
