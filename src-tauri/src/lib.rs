@@ -341,8 +341,8 @@ async fn load_session(state: State<'_, AppState>) -> Result<Session, ApiError> {
     };
     let error = match tokio::time::timeout(SERVER_WAIT, fetch_account(&state)).await {
         Ok(Ok(account)) => return Ok(Session { signed_in: true, account: Some(account), offline: false }),
-        // Signed out or turned off: the saved copy must not be used.
-        Ok(Err(e)) if e.error == "signed_out" || e.error == "code_disabled" => return Err(e),
+        // Signed out, turned off or too old: the saved copy must not be used.
+        Ok(Err(e)) if e.error == "signed_out" || e.error == "code_disabled" || e.error == "update_required" => return Err(e),
         Ok(Err(e)) => e,
         Err(_) => ApiError::new("offline", "Can't reach CakeVPN. Check your internet connection and try again."),
     };
@@ -421,6 +421,10 @@ async fn connect(
     // Use fresh details when the server answers: signing in elsewhere changes them.
     let account = match tokio::time::timeout(SERVER_WAIT, fetch_account(&state)).await {
         Ok(Ok(a)) => a,
+        // The window updates CakeVPN when it sees this.
+        Ok(Err(e)) if e.error == "update_required" => {
+            return Err(format!("update_required:{}", e.version.unwrap_or_default()))
+        }
         Ok(Err(e)) if e.error != "offline" => return Err(e.message),
         _ => state
             .account

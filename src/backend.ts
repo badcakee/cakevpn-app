@@ -72,6 +72,8 @@ export interface Account {
   announcement?: Announcement | null;
   /** Messages from the panel for this person only, newest first. */
   messages?: PersonalMessage[];
+  /** Every recent message, closed ones too, newest first. */
+  inbox?: PersonalMessage[];
 }
 
 export interface PersonalMessage {
@@ -79,6 +81,8 @@ export interface PersonalMessage {
   text: string;
   kind: "info" | "warning";
   createdAt: number;
+  /** In the inbox: when it was closed (absent or 0 while open). */
+  closedAt?: number;
 }
 
 export interface ApiError {
@@ -86,6 +90,8 @@ export interface ApiError {
   message: string;
   retryAfter?: number;
   triesLeft?: number;
+  /** With "update_required": the version needed. */
+  version?: string;
 }
 
 export type TunnelState = "disconnected" | "connecting" | "connected" | "failed";

@@ -1918,3 +1918,72 @@ html.phone .power.connected,
 html.phone .pin.connected .pin-pulse {
   animation: none;
 }
+
+/* ---------- messages: the envelope button and the inbox ---------- */
+
+.inbox-btn {
+  position: relative;
+}
+
+.inbox-count {
+  position: absolute;
+  top: -2px;
+  right: -4px;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 4px;
+  border-radius: 9px;
+  background: var(--pink);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 17px;
+  text-align: center;
+}
+
+.inbox {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.inbox-item {
+  margin: 0;
+  opacity: 0.75;
+}
+
+.inbox-item.unread {
+  opacity: 1;
+  border-left: 3px solid var(--pink);
+}
+
+.inbox-item.unread.is-warning {
+  border-left-color: var(--amber);
+}
+
+.inbox-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.inbox-new {
+  margin-left: auto;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--pink);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.inbox-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.inbox-read {
+  margin-top: 6px;
+  font-size: 12px;
+}

@@ -6,9 +6,9 @@ import { placeOf } from "./places";
 
 // ---------- state ----------
 
-type Screen = "loading" | "code" | "home" | "setup" | "settings";
+type Screen = "loading" | "code" | "home" | "setup" | "settings" | "forced";
 type Theme = "system" | "light" | "dark";
-type SettingsTab = "general" | "connection" | "notifications" | "protection" | "skip" | "account" | "invites" | "about";
+type SettingsTab = "general" | "connection" | "notifications" | "protection" | "skip" | "account" | "messages" | "invites" | "about";
 /** What is wrong with the connected location: nothing, it stopped responding, or it got slow from high load. */
 type Trouble = "" | "down" | "slow";
 
@@ -80,6 +80,10 @@ const state = {
   updateMessage: "",
   lastBytes: null as { at: number; up: number; down: number } | null,
   speed: { up: 0, down: 0 },
+  /** The CakeVPN version the panel requires (the forced-update screen). */
+  forcedVersion: "",
+  /** The forced update was started by itself once; again only with the button. */
+  forcedTried: false,
   /** What Windows says is wrong with the background service (fix screen). */
   helperProblem: null as { kind: string; detail: string } | null,
   /** Why CakeVPN moved to another location, shown under the button until moveNoticeUntil. */
@@ -374,6 +378,8 @@ function render() {
     renderSetup();
   } else if (state.screen === "settings") {
     renderSettings();
+  } else if (state.screen === "forced") {
+    renderForced();
   } else {
     renderHome();
   }
@@ -431,6 +437,39 @@ function updateCodeMessage() {
   const locked = state.lockedUntil > Date.now();
   const wait = Math.ceil((state.lockedUntil - Date.now()) / 1000);
   setText("#code-error", locked ? `Too many wrong codes. Try again in ${formatDuration(wait)}.` : state.codeError);
+}
+
+/** The panel requires a newer CakeVPN: a screen that updates it. */
+function enterForcedUpdate(version: string) {
+  state.forcedVersion = version || state.forcedVersion;
+  state.update = { version: state.forcedVersion };
+  if (state.screen !== "forced") setScreen("forced");
+  // A computer updates by itself; Android only installs what the person taps.
+  if (!isAndroid && !state.updating && !state.forcedTried) {
+    state.forcedTried = true;
+    void installUpdate();
+  }
+}
+
+function renderForced() {
+  const v = state.forcedVersion;
+  app.innerHTML = `
+    ${header()}
+    <main class="center setup screen">
+      <div class="logo big">⬆️</div>
+      <h1>Update required</h1>
+      <p class="muted">${
+        isAndroid
+          ? `This version of CakeVPN is too old. Download version ${esc(v)} and install it to keep using CakeVPN.`
+          : `This version of CakeVPN is too old. It is updating itself to version ${esc(v)}.`
+      }</p>
+      ${state.updating ? `<div class="progress-track"><i id="forced-fill" style="width:${Math.round((state.updateProgress ?? 0) * 100)}%"></i></div>` : ""}
+      ${state.updateMessage ? `<p class="muted small">${esc(state.updateMessage)}</p>` : ""}
+      <button class="primary" id="forced-update" ${state.updating ? "disabled" : ""}>${
+        state.updating ? esc(updatingText()) : isAndroid ? "Download the update" : "Update now"
+      }</button>
+    </main>`;
+  $("#forced-update")?.addEventListener("click", () => void installUpdate());
 }
 
 /** What is wrong with the Windows service, in words (see helper_problem). */
@@ -496,6 +535,8 @@ function renderSetup() {
     </main>`;
   $("#install")?.addEventListener("click", installHelper);
 }
+
+const ENVELOPE = `<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><rect x="3" y="5.5" width="18" height="13" rx="2.5"/><path d="M4 7.5l8 6 8-6" stroke-linecap="round"/></svg>`;
 
 // Eight even teeth around the middle, so it stands straight.
 const GEAR = `<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" fill-rule="evenodd" d="M9.62 4.68 L10.09 1.98 L13.91 1.98 L14.38 4.68 L15.50 5.14 L17.73 3.56 L20.44 6.27 L18.86 8.50 L19.32 9.62 L22.02 10.09 L22.02 13.91 L19.32 14.38 L18.86 15.50 L20.44 17.73 L17.73 20.44 L15.50 18.86 L14.38 19.32 L13.91 22.02 L10.09 22.02 L9.62 19.32 L8.50 18.86 L6.27 20.44 L3.56 17.73 L5.14 15.50 L4.68 14.38 L1.98 13.91 L1.98 10.09 L4.68 9.62 L5.14 8.50 L3.56 6.27 L6.27 3.56 L8.50 5.14 Z M15.2 12 A3.2 3.2 0 1 0 8.8 12 A3.2 3.2 0 1 0 15.2 12 Z"/></svg>`;
@@ -580,6 +621,7 @@ function renderHome() {
   const account = state.account!;
   app.innerHTML = `
     ${header(`<span class="plan ${account.plan.id}">${esc(planLabel(account))}</span>
+      <button class="icon-btn inbox-btn" id="open-inbox" title="Messages">${ENVELOPE}<span class="inbox-count hidden" id="inbox-count"></span></button>
       <button class="icon-btn" id="open-settings" title="Settings">${GEAR}</button>`)}
     <main class="home screen">
       <div class="announce hidden" id="announce">
@@ -646,6 +688,10 @@ function renderHome() {
     updateHome();
   });
   $("#open-settings")!.addEventListener("click", () => openSettings());
+  $("#open-inbox")!.addEventListener("click", () => {
+    state.settingsTab = "messages";
+    openSettings();
+  });
   $("#invite-link")?.addEventListener("click", () => openSettings(true));
   $("#update-now")!.addEventListener("click", installUpdate);
   $("#announce-close")!.addEventListener("click", closeAnnouncement);
@@ -748,6 +794,12 @@ function updateHome() {
   }
 
   drawMessages();
+  const unread = openMessages().length;
+  const count = $("#inbox-count");
+  if (count) {
+    count.classList.toggle("hidden", unread === 0);
+    setText("#inbox-count", unread > 9 ? "9+" : String(unread));
+  }
 
   // The speed test runs against the location this computer is connected to.
   const test = state.speedTest;
@@ -819,6 +871,7 @@ const TAB_ICONS: Record<SettingsTab, string> = {
   account: '<circle cx="12" cy="8" r="4"/><path d="M4 20c1.5-4 4.5-6 8-6s6.5 2 8 6"/>',
   invites: '<rect x="4" y="9" width="16" height="11" rx="2"/><path d="M12 9v11M4 13h16M12 9c-2-4-6-3-5 0M12 9c2-4 6-3 5 0"/>',
   about: '<circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16v.5"/>',
+  messages: '<rect x="3" y="5.5" width="18" height="13" rx="2.5"/><path d="M4 7.5l8 6 8-6"/>',
 };
 
 function settingsTabs(): { id: SettingsTab; label: string }[] {
@@ -829,7 +882,7 @@ function settingsTabs(): { id: SettingsTab; label: string }[] {
     { id: "protection", label: "Protection" },
     { id: "skip", label: "Skip the VPN" },
   ];
-  if (state.account) tabs.push({ id: "account", label: "Account" });
+  if (state.account) tabs.push({ id: "account", label: "Account" }, { id: "messages", label: "Messages" });
   if (invitesOn(state.account)) tabs.push({ id: "invites", label: "Invite friends" });
   tabs.push({ id: "about", label: "Updates & about" });
   return tabs;
@@ -1020,6 +1073,29 @@ function accountTab(): string {
     <button class="danger-outline" id="sign-out">Sign out of this device</button>`;
 }
 
+/** Every message from CakeVPN, newest first: an inbox. */
+function messagesTab(): string {
+  const account = state.account;
+  const list = account?.inbox?.length ? account.inbox : (account?.messages ?? []);
+  if (!list.length) return `<p class="muted">No messages yet. When CakeVPN writes to you, it shows up here and as a notification.</p>`;
+  const when = (seconds: number) =>
+    new Date(seconds * 1000).toLocaleString(locale(), { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  return `<div class="inbox">${list
+    .map((m) => {
+      const open = !m.closedAt && !state.closedMessages.has(m.id);
+      return `<div class="card inbox-item ${open ? "unread" : ""} ${m.kind === "warning" ? "is-warning" : ""}">
+        <div class="inbox-head">
+          <span>${m.kind === "warning" ? "⚠️" : "✉️"}</span>
+          <span class="muted small" data-keep>${esc(when(m.createdAt))}</span>
+          ${open ? `<span class="inbox-new">New</span>` : ""}
+        </div>
+        <div class="inbox-text" data-keep>${esc(m.text)}</div>
+        ${open ? `<button class="link inbox-read" data-id="${m.id}">Mark as read</button>` : ""}
+      </div>`;
+    })
+    .join("")}</div>`;
+}
+
 function aboutTab(): string {
   const helperVersion = state.overview?.status?.version;
   return `
@@ -1059,6 +1135,8 @@ function settingsPaneHtml(tab: SettingsTab): string {
       return state.account && invitesOn(state.account) ? invitesHtml(state.account) : "";
     case "about":
       return aboutTab();
+    case "messages":
+      return messagesTab();
   }
 }
 
@@ -1211,6 +1289,9 @@ function renderSettings() {
     button.addEventListener("click", () => removeSkipped(button.dataset.kind as "domain" | "app", button.dataset.value!)),
   );
   $("#reconnect")?.addEventListener("click", reconnect);
+  document.querySelectorAll<HTMLButtonElement>(".inbox-read").forEach((button) =>
+    button.addEventListener("click", () => closeMessage(Number(button.dataset.id))),
+  );
 
   // Account and invites
   wireUsageChart();
@@ -1723,6 +1804,13 @@ function updatingText(): string {
 /** Shows the download's progress where the update was started, without redrawing the screen. */
 function drawUpdateProgress() {
   if (state.screen === "home") return updateHome();
+  if (state.screen === "forced") {
+    const fill = $("#forced-fill") as HTMLElement | null;
+    if (fill) fill.style.width = `${Math.round((state.updateProgress ?? 0) * 100)}%`;
+    const button = $("#forced-update");
+    if (button) button.textContent = updatingText();
+    return;
+  }
   const fill = $("#settings-update-fill") as HTMLElement | null;
   if (fill) fill.style.width = `${Math.round((state.updateProgress ?? 0) * 100)}%`;
   const button = $("#settings-update");
@@ -1733,8 +1821,8 @@ async function installUpdate() {
   state.updating = true;
   state.updateMessage = "";
   state.updateProgress = null;
-  if (state.screen === "settings") render();
-  else updateHome();
+  if (state.screen === "home") updateHome();
+  else render();
   const watch = setInterval(async () => {
     try {
       const p = await backend.updateProgress();
@@ -1751,16 +1839,16 @@ async function installUpdate() {
       clearInterval(watch);
       state.updating = false;
       state.updateMessage = `The download opened in your browser. Open it when it's done to install CakeVPN ${state.update?.version ?? ""}.`;
-      if (state.screen === "settings") render();
-      else updateHome();
+      if (state.screen === "home") updateHome();
+      else render();
     }
   } catch (e) {
     clearInterval(watch);
     state.updating = false;
     state.updateMessage = asApiError(e).message;
     state.actionError = state.screen === "home" ? state.updateMessage : state.actionError;
-    if (state.screen === "settings") render();
-    else updateHome();
+    if (state.screen === "home") updateHome();
+    else render();
   }
 }
 
@@ -1897,11 +1985,16 @@ function formatMbps(mbps: number): string {
   return `${mbps >= 100 ? Math.round(mbps) : mbps.toFixed(1)} Mbps`;
 }
 
+/** Messages this person hasn't closed yet. */
+function openMessages() {
+  return (state.account?.messages ?? []).filter((m) => !state.closedMessages.has(m.id));
+}
+
 /** The panel's messages for this person, until they close each one. */
 function drawMessages() {
   const box = $("#personal-messages");
   if (!box) return;
-  const list = (state.account?.messages ?? []).filter((m) => !state.closedMessages.has(m.id));
+  const list = openMessages();
   const key = list.map((m) => `${m.id}:${m.kind}:${m.text}`).join("|");
   if (key === state.shownMessages) return;
   state.shownMessages = key;
@@ -1919,6 +2012,7 @@ function drawMessages() {
 async function closeMessage(id: number) {
   state.closedMessages.add(id);
   drawMessages();
+  if (state.screen === "settings" && state.settingsTab === "messages") render();
   try {
     await backend.closeMessage(id);
   } catch {
@@ -2002,7 +2096,11 @@ async function togglePower() {
   } catch (e) {
     const err = asApiError(e);
     if (err.message === "helper_missing") state.screen = "setup";
-    else {
+    else if (err.message.startsWith("update_required")) {
+      state.busy = false;
+      enterForcedUpdate(err.message.split(":")[1] ?? "");
+      return;
+    } else {
       state.actionError = err.message;
       // The service hung up while connecting: the fix screen has the way out.
       if (err.message.startsWith("CakeVPN's background service stopped while working")) state.screen = "setup";
@@ -2127,6 +2225,7 @@ async function refreshAccount() {
     }
     if (err.error === "signed_out") handleSignedOut("You were signed out because this code was used on another device.");
     if (err.error === "code_disabled") handleSignedOut("This code has been turned off. Ask for a new one.");
+    if (err.error === "update_required") enterForcedUpdate(err.version ?? "");
   }
 }
 
@@ -2237,13 +2336,18 @@ async function start() {
   } catch (e) {
     const err = asApiError(e);
     state.screen = "code";
-    if (err.error === "signed_out") state.codeNotice = "You were signed out because this code was used on another device.";
+    if (err.error === "update_required") {
+      state.forcedVersion = err.version ?? "";
+      state.screen = "forced";
+    } else if (err.error === "signed_out") state.codeNotice = "You were signed out because this code was used on another device.";
     else if (err.error === "code_disabled") state.codeNotice = "This code has been turned off. Ask for a new one.";
     else state.codeNotice = err.message;
   }
   await refreshOverview();
-  if (state.overview && state.overview.helper !== "ok") state.screen = "setup";
+  if (state.overview && state.overview.helper !== "ok" && state.screen !== "forced") state.screen = "setup";
   render();
+  // Too old for the panel: on a computer the update starts right away.
+  if (state.screen === "forced") enterForcedUpdate(state.forcedVersion);
   await refreshPings();
 
   syncTray(true);

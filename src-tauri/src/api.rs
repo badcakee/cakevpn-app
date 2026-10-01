@@ -72,6 +72,9 @@ pub struct PersonalMessage {
     pub kind: String,
     #[serde(default)]
     pub created_at: i64,
+    /// In the inbox: when the person closed it (0 while it is still open).
+    #[serde(default)]
+    pub closed_at: i64,
 }
 
 /// One day of the usage graph.
@@ -130,6 +133,9 @@ pub struct Account {
     /// Newest first; empty from servers that don't send messages yet.
     #[serde(default)]
     pub messages: Vec<PersonalMessage>,
+    /// Every recent message, closed ones too, newest first.
+    #[serde(default)]
+    pub inbox: Vec<PersonalMessage>,
 }
 
 /// Where this user's traffic leaves from; empty when unknown or shared.
@@ -151,11 +157,14 @@ pub struct ApiError {
     pub retry_after: Option<u64>,
     #[serde(default)]
     pub tries_left: Option<u32>,
+    /// With "update_required": the CakeVPN version the panel requires.
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 impl ApiError {
     pub fn new(code: &str, message: impl Into<String>) -> Self {
-        ApiError { error: code.into(), message: message.into(), retry_after: None, tries_left: None }
+        ApiError { error: code.into(), message: message.into(), retry_after: None, tries_left: None, version: None }
     }
 }
 
