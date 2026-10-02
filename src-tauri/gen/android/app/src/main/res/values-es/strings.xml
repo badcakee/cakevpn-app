@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="tile_on">Conectado</string>
+    <string name="tile_off">Desactivado</string>
+</resources>

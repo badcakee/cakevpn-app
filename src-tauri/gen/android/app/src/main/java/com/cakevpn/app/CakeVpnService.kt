@@ -26,8 +26,20 @@ class CakeVpnService : VpnService() {
         private var skipApps: List<String> = emptyList()
         private var running: CakeVpnService? = null
 
+        /** The Quick Settings tile asked to turn the VPN off; the app does it. */
+        @Volatile
+        var stopRequested = false
+
+        fun isRunning() = running?.tun != null
+
+        /** Has the Quick Settings tile show the VPN as it is now. */
+        fun refreshTile(context: Context) {
+            CakeTileService.refresh(context)
+        }
+
         /** Opens the interface; `done` gets its file descriptor, or why it failed. */
         fun start(context: Context, skip: List<String>, done: (Int?, String?) -> Unit) {
+            stopRequested = false
             pending = done
             skipApps = skip
             try {
@@ -88,6 +100,7 @@ class CakeVpnService : VpnService() {
             tun = opened
             running = this
             done?.invoke(opened.fd, null)
+            refreshTile(this)
         } catch (e: Exception) {
             done?.invoke(null, e.message ?: "The VPN could not be started.")
             if (tun == null) stopSelf()
@@ -102,6 +115,8 @@ class CakeVpnService : VpnService() {
         }
         tun = null
         if (running === this) running = null
+        stopRequested = false
+        refreshTile(this)
         stopSelf()
     }
 

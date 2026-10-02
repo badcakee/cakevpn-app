@@ -133,6 +133,15 @@ export interface Overview {
   locationId: string | null;
   /** False while the window is hidden and CakeVPN sits in the tray. */
   windowVisible?: boolean;
+  /** Android: the VPN was turned off outside the app (the tile, or Android). */
+  stoppedOutside?: boolean;
+}
+
+/** An app on the phone (Android), for choosing which skip the VPN. */
+export interface PhoneApp {
+  id: string;
+  name: string;
+  icon: string;
 }
 
 export interface TrayModel {
@@ -162,6 +171,10 @@ export const backend = {
   createInvite: () => invoke<Account>("create_invite"),
   deleteInvite: (code: string) => invoke<Account>("delete_invite", { code }),
   closeMessage: (id: number) => invoke<void>("close_message", { id }),
+  problemDetails: () => invoke<string>("problem_details"),
+  reportProblem: (text: string, details: string) => invoke<void>("report_problem", { text, details }),
+  listApps: () => invoke<PhoneApp[]>("list_apps"),
+  takeLaunchAction: () => invoke<string | null>("take_launch_action"),
   /** The last 30 days, oldest first. */
   usageHistory: () => invoke<DayUsage[]>("usage_history"),
   /** Whether this computer is on a Wi-Fi, and its name when the system says. */

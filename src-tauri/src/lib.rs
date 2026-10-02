@@ -140,6 +140,9 @@ struct Overview {
     banner: Option<Banner>,
     location_id: Option<String>,
     window_visible: bool,
+    /// Android: the VPN was turned off outside the app (the Quick Settings
+    /// tile, or Android itself), so it isn't a drop to reconnect from.
+    stopped_outside: bool,
 }
 
 /// What the app knows besides the helper's own checks.
@@ -387,6 +390,115 @@ async fn delete_invite(state: State<'_, AppState>, code: String) -> Result<Accou
     fetch_account(&state).await
 }
 
+/// The system CakeVPN runs on, like "Windows 10.0.26100 (x86_64)".
+async fn os_description() -> String {
+    let arch = std::env::consts::ARCH;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let ver = tokio::task::spawn_blocking(|| {
+            std::process::Command::new("cmd.exe").args(["/c", "ver"]).creation_flags(0x0800_0000).output().ok()
+        })
+        .await
+        .ok()
+        .flatten()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+        let number = ver.split("Version").nth(1).unwrap_or("").trim_matches(|c: char| !c.is_ascii_digit() && c != '.').to_string();
+        return format!("Windows {number} ({arch})");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let ver = tokio::task::spawn_blocking(|| std::process::Command::new("sw_vers").arg("-productVersion").output().ok())
+            .await
+            .ok()
+            .flatten()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        return format!("macOS {ver} ({arch})");
+    }
+    #[cfg(target_os = "android")]
+    {
+        return format!("Android {} · {} ({arch})", phone::android_version().unwrap_or_default(), phone::model().unwrap_or_default());
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "android")))]
+    {
+        format!("{} ({arch})", std::env::consts::OS)
+    }
+}
+
+/// What a problem report says about this computer and the VPN, besides
+/// what the window adds. Shown to the person before it is sent.
+#[tauri::command]
+async fn problem_details() -> String {
+    let mut lines = vec![format!("CakeVPN {}", env!("CARGO_PKG_VERSION")), format!("System: {}", os_description().await)];
+    match helper::ask(Request::Status).await {
+        Ok(r) => {
+            let s = r.status;
+            let q = s.quality;
+            lines.push(format!(
+                "Service: {} (revision {}), tunnel {:?}{}",
+                s.version,
+                s.revision,
+                s.state,
+                s.error.map(|e| format!(": {e}")).unwrap_or_default()
+            ));
+            let ms = |v: Option<u32>| v.map(|v| format!("{v} ms")).unwrap_or_else(|| "-".into());
+            lines.push(format!(
+                "Checks: through the VPN {} ({} failed), outside {} ({} failed)",
+                ms(q.tunnel_delay_ms),
+                q.tunnel_failures,
+                ms(q.direct_delay_ms),
+                q.direct_failures
+            ));
+        }
+        Err(e) => lines.push(format!("Service: can't be reached ({e})")),
+    }
+    #[cfg(windows)]
+    {
+        let problem = windows_helper_problem().await;
+        if problem.kind != "unknown" || !problem.detail.is_empty() {
+            lines.push(format!("Windows service: {} · {}", problem.kind, problem.detail));
+        }
+        let crashes = tokio::task::spawn_blocking(helper_crash_notes).await.unwrap_or_default();
+        if !crashes.is_empty() {
+            lines.push(format!("Crashes: {crashes}"));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Sends a problem report: what the person wrote and the details they saw.
+#[tauri::command]
+async fn report_problem(text: String, details: String) -> Result<(), ApiError> {
+    let token = store::token().ok_or_else(not_signed_in)?;
+    api::report(&token, &text, &details).await
+}
+
+/// Android: the installed apps, for choosing which skip the VPN.
+#[tauri::command]
+async fn list_apps(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    #[cfg(mobile)]
+    return phone::list_apps(&app).await;
+    #[cfg(desktop)]
+    {
+        let _ = app;
+        Ok(vec![])
+    }
+}
+
+/// Android: what the Quick Settings tile asked for when it opened the app ("connect"), once.
+#[tauri::command]
+async fn take_launch_action(app: AppHandle) -> Option<String> {
+    #[cfg(mobile)]
+    return phone::take_launch_action(&app).await;
+    #[cfg(desktop)]
+    {
+        let _ = app;
+        None
+    }
+}
+
 /// The person closed one of the panel's messages for them.
 #[tauri::command]
 async fn close_message(id: i64) -> Result<(), ApiError> {
@@ -495,6 +607,7 @@ async fn overview(state: State<'_, AppState>) -> Result<Overview, String> {
                 banner: None,
                 location_id: None,
                 window_visible: state.visible.load(Ordering::Relaxed),
+                stopped_outside: false,
             })
         }
         Err(e) => return Err(e),
@@ -551,7 +664,11 @@ async fn overview(state: State<'_, AppState>) -> Result<Overview, String> {
     };
     let dns_outside = dns_outside(&state, &status).await;
     let banner = banner(&status, &Around { load: load.as_ref(), wifi: &wifi, busy, tunnel_slow, direct_slow, dns_outside });
-    Ok(Overview { helper: helper_state, status: Some(status), banner, location_id, window_visible })
+    #[cfg(mobile)]
+    let stopped_outside = phone::stopped_outside();
+    #[cfg(desktop)]
+    let stopped_outside = false;
+    Ok(Overview { helper: helper_state, status: Some(status), banner, location_id, window_visible, stopped_outside })
 }
 
 /// Once per connection, a little after it is made, checks in the background
@@ -958,6 +1075,10 @@ pub fn run() {
             create_invite,
             delete_invite,
             close_message,
+            problem_details,
+            report_problem,
+            list_apps,
+            take_launch_action,
             usage_history,
             dns_check,
             current_network,

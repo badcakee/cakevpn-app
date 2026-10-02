@@ -1,5 +1,6 @@
 package com.cakevpn.app
 
+import android.content.Intent
 import android.os.Bundle
 import android.view.View
 import androidx.activity.enableEdgeToEdge
@@ -7,7 +8,23 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 
 class MainActivity : TauriActivity() {
+  companion object {
+    /** What the Quick Settings tile opened CakeVPN for ("connect"). */
+    const val EXTRA_ACTION = "com.cakevpn.app.ACTION"
+  }
+
+  private fun takeAction(intent: Intent?) {
+    intent?.getStringExtra(EXTRA_ACTION)?.let { VpnPlugin.pendingAction = it }
+    intent?.removeExtra(EXTRA_ACTION)
+  }
+
+  override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    takeAction(intent)
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
+    takeAction(intent)
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
     // Keep the app clear of the status bar, the navigation bar and camera

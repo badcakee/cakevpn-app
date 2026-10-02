@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { Account, Announcement, asApiError, backend, ConnectOptions, DayUsage, Location, Overview } from "./backend";
+import { Account, Announcement, asApiError, backend, ConnectOptions, DayUsage, Location, Overview, PhoneApp } from "./backend";
 import { LANGUAGES, locale, pickLanguage, setLanguage, t, watch } from "./i18n";
 import { attachMap, drawMap, mapHtml, markCountries, setPlaces, showPlace } from "./map";
 import { placeOf } from "./places";
@@ -8,7 +8,7 @@ import { placeOf } from "./places";
 
 type Screen = "loading" | "code" | "home" | "setup" | "settings" | "forced";
 type Theme = "system" | "light" | "dark";
-type SettingsTab = "general" | "connection" | "notifications" | "protection" | "skip" | "account" | "messages" | "invites" | "about";
+type SettingsTab = "general" | "connection" | "notifications" | "protection" | "skip" | "account" | "messages" | "invites" | "help" | "about";
 /** What is wrong with the connected location: nothing, it stopped responding, or it got slow from high load. */
 type Trouble = "" | "down" | "slow";
 
@@ -80,6 +80,11 @@ const state = {
   updateMessage: "",
   lastBytes: null as { at: number; up: number; down: number } | null,
   speed: { up: 0, down: 0 },
+  /** Help: the problem being written, the details sent with it, and how sending went. */
+  report: { text: "", details: "", showDetails: false, sending: false, sent: false, error: "" },
+  /** Android: the phone's apps (once read) and the app chooser. */
+  phoneApps: null as PhoneApp[] | null,
+  choosingApps: false,
   /** The CakeVPN version the panel requires (the forced-update screen). */
   forcedVersion: "",
   /** The forced update was started by itself once; again only with the button. */
@@ -534,11 +539,13 @@ function renderSetup() {
       }</p>
       ${isWindows && state.helperProblem?.detail ? `<p class="muted small" data-keep>${esc(state.helperProblem.detail)}</p>` : ""}
       ${state.actionError ? `<div class="error">${esc(state.actionError)}</div>` : ""}
+      ${state.account ? `<button class="link" id="report-from-setup">Report this problem</button>` : ""}
       <button class="primary" id="install" ${state.busy ? "disabled" : ""}>${
         isWindows ? (state.busy ? "Fixing…" : "Fix it") : state.busy ? "Setting up…" : "Set up"
       }</button>
     </main>`;
   $("#install")?.addEventListener("click", installHelper);
+  $("#report-from-setup")?.addEventListener("click", openHelp);
 }
 
 const ENVELOPE = `<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><rect x="3" y="5.5" width="18" height="13" rx="2.5"/><path d="M4 7.5l8 6 8-6" stroke-linecap="round"/></svg>`;
@@ -624,6 +631,9 @@ function pinsHtml(): string {
 
 function renderHome() {
   const account = state.account!;
+  // The cards are drawn into a new, empty page: they must be drawn again.
+  state.shownMessages = "";
+  state.shownAnnouncements = "";
   app.innerHTML = `
     ${header(`<span class="plan ${account.plan.id}">${esc(planLabel(account))}</span>
       <button class="icon-btn inbox-btn" id="open-inbox" title="Messages">${ENVELOPE}<span class="inbox-count hidden" id="inbox-count"></span></button>
@@ -868,6 +878,7 @@ const TAB_ICONS: Record<SettingsTab, string> = {
   invites: '<rect x="4" y="9" width="16" height="11" rx="2"/><path d="M12 9v11M4 13h16M12 9c-2-4-6-3-5 0M12 9c2-4 6-3 5 0"/>',
   about: '<circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16v.5"/>',
   messages: '<rect x="3" y="5.5" width="18" height="13" rx="2.5"/><path d="M4 7.5l8 6 8-6"/>',
+  help: '<circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .9-1 1.6v.6M12 17v.5"/>',
 };
 
 function settingsTabs(): { id: SettingsTab; label: string }[] {
@@ -880,6 +891,7 @@ function settingsTabs(): { id: SettingsTab; label: string }[] {
   ];
   if (state.account) tabs.push({ id: "account", label: "Account" }, { id: "messages", label: "Messages" });
   if (invitesOn(state.account)) tabs.push({ id: "invites", label: "Invite friends" });
+  if (state.account) tabs.push({ id: "help", label: "Help" });
   tabs.push({ id: "about", label: "Updates & about" });
   return tabs;
 }
@@ -1027,7 +1039,7 @@ function protectionTab(): string {
 function skipTab(): string {
   return `
     <div class="card skip">
-      <p class="muted small">${isAndroid ? "These websites use your normal internet instead of the VPN." : "These websites and apps use your normal internet instead of the VPN."}</p>
+      <p class="muted small">These websites and apps use your normal internet instead of the VPN.</p>
       ${skipListHtml("domain", state.options.bypassDomains)}
       <form class="skip-add" id="add-domain">
         <input type="text" id="new-domain" placeholder="Website, like mybank.com" autocomplete="off" spellcheck="false">
@@ -1035,7 +1047,7 @@ function skipTab(): string {
       </form>
       ${
         isAndroid
-          ? ""
+          ? phoneAppsHtml()
           : `${skipListHtml("app", state.options.bypassApps)}
       <form class="skip-add" id="add-app">
         <input type="text" id="new-app" placeholder="${isWindows ? "App, like steam.exe" : "App, like Steam"}" autocomplete="off" spellcheck="false">
@@ -1045,6 +1057,50 @@ function skipTab(): string {
       ${state.skipError ? `<div class="error">${esc(state.skipError)}</div>` : ""}
     </div>
     ${reconnectNotice()}`;
+}
+
+/** Android: the apps that skip the VPN, and the chooser to pick them. */
+function phoneAppsHtml(): string {
+  const chosen = state.options.bypassApps;
+  const nameOf = (id: string) => state.phoneApps?.find((a) => a.id === id)?.name ?? id;
+  if (!state.choosingApps) {
+    return `<div class="skip-list" data-keep>${chosen
+      .map(
+        (id) =>
+          `<span class="chip">▣ ${esc(nameOf(id))}<button class="skip-remove" data-kind="app" data-value="${esc(id)}" title="Remove" aria-label="Remove">×</button></span>`,
+      )
+      .join("")}</div>
+      <button class="outline small-btn" id="choose-apps">${chosen.length ? "Change apps" : "Choose apps"}</button>`;
+  }
+  if (!state.phoneApps) return `<p class="muted small">Reading the apps on this phone…</p>`;
+  return `<div class="app-chooser">
+      <input type="search" id="app-search" placeholder="Search apps" autocomplete="off">
+      <div class="app-list" data-keep>${state.phoneApps
+        .map(
+          (a) => `<label class="app-row" data-name="${esc(a.name.toLowerCase())}">
+            <img src="${a.icon}" alt="" width="32" height="32">
+            <span>${esc(a.name)}</span>
+            <input type="checkbox" class="switch" value="${esc(a.id)}" ${chosen.includes(a.id) ? "checked" : ""}>
+          </label>`,
+        )
+        .join("")}</div>
+      <button class="primary" id="apps-done">Done</button>
+    </div>`;
+}
+
+function toggleSkippedApp(id: string, skip: boolean) {
+  const list = state.options.bypassApps;
+  if (skip && !list.includes(id)) {
+    if (list.length >= MAX_SKIPPED.app) {
+      state.skipError = "That's the most apps that can skip the VPN.";
+      render();
+      return;
+    }
+    list.push(id);
+  }
+  if (!skip) state.options.bypassApps = list.filter((x) => x !== id);
+  // Saved without drawing the list again, so the place in it stays.
+  saved.set("bypassApps", JSON.stringify(state.options.bypassApps));
 }
 
 function accountTab(): string {
@@ -1110,6 +1166,78 @@ function messagesTab(): string {
     .join("")}</div>`;
 }
 
+/** "Report a problem": what the person writes, plus what the app knows, to the panel. */
+function helpTab(): string {
+  const r = state.report;
+  if (r.sent) {
+    return `<div class="card">
+        <p><b>Thanks, your report was sent.</b></p>
+        <p class="muted small">CakeVPN looks at it and may write back: replies show up in Messages and as a notification.</p>
+        <button class="outline small-btn" id="report-another">Report something else</button>
+      </div>`;
+  }
+  return `<div class="card report">
+      <p class="muted small">Something not working? Say what happened and when. Your report goes to CakeVPN together with the details below, so the problem can be found faster.</p>
+      <textarea id="report-text" rows="5" maxlength="1000" placeholder="What went wrong? For example: after opening my laptop, websites don't load.">${esc(r.text)}</textarea>
+      <button class="link" id="report-show-details">${r.showDetails ? "Hide what is sent with it" : "See what is sent with it"}</button>
+      ${r.showDetails ? `<pre class="report-details" data-keep>${esc(r.details || "…")}</pre>` : ""}
+      <p class="muted small">No passwords, websites you visit or addresses are sent.</p>
+      ${r.error ? `<div class="error">${esc(r.error)}</div>` : ""}
+      <button class="primary" id="report-send" ${r.sending ? "disabled" : ""}>${r.sending ? "Sending…" : "Send report"}</button>
+    </div>`;
+}
+
+/** What a report says about the app's state, besides what the computer adds. */
+async function reportDetails(): Promise<string> {
+  const ov = state.overview;
+  const loc = state.account?.locations.find((l) => l.id === ov?.locationId) ?? chosenLocation();
+  const lines = [
+    `Screen: ${state.screen}${state.settingsTab ? ` (${state.settingsTab})` : ""}`,
+    `Connection: ${tunnelState()}${loc ? ` to ${loc.name}${loc.city ? ` (${loc.city})` : ""}` : ""}${ov?.status?.connectedSince ? `, for ${Math.round(Date.now() / 1000 - ov.status.connectedSince)} s` : ""}`,
+    `Plan: ${state.account?.plan.name ?? "-"}`,
+    `Warning shown: ${ov?.banner?.message ?? "none"}`,
+    `Last error shown: ${state.actionError || state.settingsError || ov?.status?.error || "none"}`,
+    `Protection: ads ${state.options.blockAds ? "blocked" : "allowed"}, kill switch ${state.options.killSwitch ? "on" : "off"}, ${state.options.bypassDomains.length} sites and ${state.options.bypassApps.length} apps skip the VPN`,
+    `Reconnect by itself: ${state.autoReconnect ? "on" : "off"} · Language: ${state.lang}`,
+  ];
+  if (state.helperProblem) lines.push(`Fix screen: ${state.helperProblem.kind} · ${state.helperProblem.detail}`);
+  let system = "";
+  try {
+    system = await backend.problemDetails();
+  } catch {
+    system = "(the system details could not be read)";
+  }
+  return `${system}\n${lines.join("\n")}`;
+}
+
+async function sendReport() {
+  const text = (($("#report-text") as HTMLTextAreaElement | null)?.value ?? state.report.text).trim();
+  state.report.text = text;
+  if (!text) {
+    state.report.error = "Write what went wrong first.";
+    render();
+    return;
+  }
+  state.report.sending = true;
+  state.report.error = "";
+  render();
+  try {
+    state.report.details = await reportDetails();
+    await backend.reportProblem(text, state.report.details);
+    state.report = { text: "", details: "", showDetails: false, sending: false, sent: true, error: "" };
+  } catch (e) {
+    state.report.sending = false;
+    state.report.error = asApiError(e).message;
+  }
+  render();
+}
+
+/** Opens Help, for the link on the fix screen. */
+function openHelp() {
+  state.settingsTab = "help";
+  void openSettings();
+}
+
 function aboutTab(): string {
   const helperVersion = state.overview?.status?.version;
   return `
@@ -1151,6 +1279,8 @@ function settingsPaneHtml(tab: SettingsTab): string {
       return aboutTab();
     case "messages":
       return messagesTab();
+    case "help":
+      return helpTab();
   }
 }
 
@@ -1303,6 +1433,48 @@ function renderSettings() {
     button.addEventListener("click", () => removeSkipped(button.dataset.kind as "domain" | "app", button.dataset.value!)),
   );
   $("#reconnect")?.addEventListener("click", reconnect);
+  $("#report-text")?.addEventListener("input", (e) => (state.report.text = (e.target as HTMLTextAreaElement).value));
+  $("#report-send")?.addEventListener("click", () => void sendReport());
+  $("#report-another")?.addEventListener("click", () => {
+    state.report.sent = false;
+    render();
+  });
+  $("#report-show-details")?.addEventListener("click", async () => {
+    state.report.showDetails = !state.report.showDetails;
+    if (state.report.showDetails) {
+      state.report.details = "";
+      render();
+      state.report.details = await reportDetails();
+    }
+    render();
+  });
+  // Android: choosing the apps that skip the VPN.
+  $("#choose-apps")?.addEventListener("click", async () => {
+    state.choosingApps = true;
+    render();
+    if (!state.phoneApps) {
+      try {
+        state.phoneApps = await backend.listApps();
+      } catch (e) {
+        state.skipError = asApiError(e).message;
+        state.choosingApps = false;
+      }
+      render();
+    }
+  });
+  $("#apps-done")?.addEventListener("click", () => {
+    state.choosingApps = false;
+    render();
+  });
+  $("#app-search")?.addEventListener("input", (e) => {
+    const q = (e.target as HTMLInputElement).value.trim().toLowerCase();
+    app.querySelectorAll<HTMLElement>(".app-row").forEach((row) => {
+      row.hidden = !!q && !(row.dataset.name ?? "").includes(q);
+    });
+  });
+  app.querySelectorAll<HTMLInputElement>(".app-row input").forEach((box) =>
+    box.addEventListener("change", () => toggleSkippedApp(box.value, box.checked)),
+  );
   document.querySelectorAll<HTMLButtonElement>(".inbox-read").forEach((button) =>
     button.addEventListener("click", () => {
       const id = Number(button.dataset.id);
@@ -1693,6 +1865,8 @@ function watchConnection(before: string, after: string) {
     return;
   }
   if (before !== "connected" || Date.now() < state.expectedUntil) return;
+  // Turned off from Android's Quick Settings (or by Android): meant.
+  if (state.overview?.stoppedOutside) return;
   state.dropped = true;
   const coming = state.autoReconnect || state.options.killSwitch;
   notifyUser(
@@ -2405,6 +2579,7 @@ async function start() {
   render();
   // Too old for the panel: on a computer the update starts right away.
   if (state.screen === "forced") enterForcedUpdate(state.forcedVersion);
+  void takeLaunchAction();
   await refreshPings();
 
   syncTray(true);
@@ -2416,8 +2591,20 @@ async function start() {
   // Coming back to the window catches up right away.
   window.addEventListener("focus", () => tick(true));
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) tick(true);
+    if (!document.hidden) {
+      tick(true);
+      void takeLaunchAction();
+    }
   });
+}
+
+/** Android: the Quick Settings tile opened CakeVPN to connect. */
+async function takeLaunchAction() {
+  if (!isAndroid) return;
+  const action = await backend.takeLaunchAction().catch(() => null);
+  if (action !== "connect" || state.screen !== "home" || state.busy) return;
+  const tstate = tunnelState();
+  if (tstate !== "connected" && tstate !== "connecting") await togglePower();
 }
 
 /** False while CakeVPN sits in the tray or the window is minimized. */

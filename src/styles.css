@@ -1987,3 +1987,84 @@ html.phone .pin.connected .pin-pulse {
   margin-top: 6px;
   font-size: 12px;
 }
+
+/* ---------- Help: report a problem ---------- */
+
+.report textarea {
+  width: 100%;
+  margin: 8px 0 4px;
+  padding: 10px 12px;
+  border: 1.5px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  resize: vertical;
+}
+
+.report textarea:focus {
+  outline: none;
+  border-color: var(--pink);
+}
+
+.report-details {
+  margin: 6px 0;
+  padding: 10px 12px;
+  max-height: 220px;
+  overflow: auto;
+  border-radius: 10px;
+  background: var(--bg);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.report .primary {
+  margin-top: 8px;
+}
+
+/* ---------- Android: choosing the apps that skip the VPN ---------- */
+
+.app-chooser input[type="search"] {
+  width: 100%;
+  margin: 6px 0 8px;
+  padding: 9px 12px;
+  border: 1.5px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+
+.app-list {
+  max-height: 55vh;
+  overflow-y: auto;
+  margin-bottom: 10px;
+}
+
+.app-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--line);
+}
+
+.app-row[hidden] {
+  display: none;
+}
+
+.app-row img {
+  flex: none;
+  border-radius: 8px;
+}
+
+.app-row span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

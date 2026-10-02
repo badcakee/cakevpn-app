@@ -25,6 +25,17 @@ const RELEASE_API: &str = "https://api.github.com/repos/badcakee/cakevpn-app/rel
 
 static TUNNEL: OnceLock<Arc<Tunnel>> = OnceLock::new();
 static MODEL: OnceLock<String> = OnceLock::new();
+static ANDROID_VERSION: OnceLock<String> = OnceLock::new();
+/// The VPN was turned off outside the app (the tile, or Android itself).
+static STOPPED_OUTSIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn stopped_outside() -> bool {
+    STOPPED_OUTSIDE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn android_version() -> Option<String> {
+    ANDROID_VERSION.get().cloned()
+}
 
 pub fn tunnel() -> Option<Arc<Tunnel>> {
     TUNNEL.get().cloned()
@@ -53,6 +64,45 @@ struct Started {
 #[derive(Deserialize)]
 struct Allowed {
     granted: bool,
+}
+
+/// What the Kotlin side says about the phone's VPN.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VpnState {
+    running: bool,
+    stop_requested: bool,
+}
+
+#[derive(Deserialize)]
+struct Apps {
+    apps: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct Action {
+    action: Option<String>,
+}
+
+pub async fn list_apps(app: &AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<Vec<serde_json::Value>, String> {
+        let vpn = app.try_state::<Vpn>().ok_or("The VPN part of CakeVPN didn't start.")?;
+        vpn.0.run_mobile_plugin::<Apps>("listApps", ()).map(|a| a.apps).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+pub async fn take_launch_action(app: &AppHandle) -> Option<String> {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let vpn = app.try_state::<Vpn>()?;
+        vpn.0.run_mobile_plugin::<Action>("takeAction", ()).ok()?.action
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[derive(Serialize)]
@@ -156,6 +206,9 @@ pub fn setup(app: &tauri::App, _shown: bool) -> Result<(), Box<dyn std::error::E
     if let Some(model) = system_property("ro.product.model") {
         let _ = MODEL.set(model);
     }
+    if let Some(version) = system_property("ro.build.version.release") {
+        let _ = ANDROID_VERSION.set(version);
+    }
     let libs = native_library_dir().ok_or("cannot find the app's own files")?;
     let data_dir = app.path().app_data_dir()?.join("tunnel");
     let tunnel = Tunnel::new(Paths {
@@ -219,6 +272,7 @@ impl Attach for PhoneAttach {
         // A phone's browser opens many connections at once.
         args.max_sessions = 2000;
 
+        STOPPED_OUTSIDE.store(false, std::sync::atomic::Ordering::Relaxed);
         let stop = tun2proxy::CancellationToken::new();
         let token = stop.clone();
         let done = tauri::async_runtime::spawn(async move {
@@ -226,8 +280,34 @@ impl Attach for PhoneAttach {
             if !token.is_cancelled() {
                 // It ended by itself: Android took the VPN away (another VPN
                 // app started, or the person turned it off in Settings).
-                if let Some(tunnel) = tunnel() {
-                    tauri::async_runtime::spawn(async move { tunnel.disconnect().await });
+                stopped_from_outside();
+            }
+        });
+        // The Quick Settings tile (or Android) may turn the VPN off while the
+        // app's window is closed: looked for every second, and the tunnel is
+        // then taken down the normal way, from here.
+        let watch = stop.clone();
+        let app = self.app.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if watch.is_cancelled() {
+                    return;
+                }
+                let app = app.clone();
+                let state = tauri::async_runtime::spawn_blocking(move || {
+                    app.try_state::<Vpn>().and_then(|vpn| vpn.0.run_mobile_plugin::<VpnState>("vpnState", ()).ok())
+                })
+                .await
+                .ok()
+                .flatten();
+                // Taken down by the app itself meanwhile: not from outside.
+                if watch.is_cancelled() {
+                    return;
+                }
+                if state.is_some_and(|s| s.stop_requested || !s.running) {
+                    stopped_from_outside();
+                    return;
                 }
             }
         });
@@ -240,6 +320,15 @@ impl Attach for PhoneAttach {
         if let Ok(vpn) = self.vpn() {
             let _ = vpn.0.run_mobile_plugin::<serde_json::Value>("stop", ());
         }
+    }
+}
+
+/// The VPN was turned off outside the app: the tunnel goes down, and the
+/// window is told it was meant (not a drop to reconnect from).
+fn stopped_from_outside() {
+    STOPPED_OUTSIDE.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(tunnel) = tunnel() {
+        tauri::async_runtime::spawn(async move { tunnel.disconnect().await });
     }
 }
 

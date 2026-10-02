@@ -233,6 +233,14 @@ pub async fn account(token: &str) -> Result<Account, ApiError> {
     read(client().get(format!("{API_BASE}/cakevpn/api/v1/account")).bearer_auth(token).send().await).await
 }
 
+/// Sends a problem report to the panel.
+pub async fn report(token: &str, text: &str, details: &str) -> Result<(), ApiError> {
+    let body = serde_json::json!({ "text": text, "details": details });
+    let _: serde_json::Value =
+        read(client().post(format!("{API_BASE}/cakevpn/api/v1/report")).bearer_auth(token).json(&body).send().await).await?;
+    Ok(())
+}
+
 /// The person closed one of the panel's messages.
 pub async fn close_message(token: &str, id: i64) -> Result<(), ApiError> {
     let body = serde_json::json!({ "id": id });
