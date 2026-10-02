@@ -172,6 +172,7 @@ export const backend = {
   deleteInvite: (code: string) => invoke<Account>("delete_invite", { code }),
   closeMessage: (id: number) => invoke<void>("close_message", { id }),
   problemDetails: () => invoke<string>("problem_details"),
+  waitForNews: (after: number) => invoke<number>("wait_for_news", { after }),
   reportProblem: (text: string, details: string) => invoke<void>("report_problem", { text, details }),
   listApps: () => invoke<PhoneApp[]>("list_apps"),
   takeLaunchAction: () => invoke<string | null>("take_launch_action"),

@@ -233,6 +233,24 @@ pub async fn account(token: &str) -> Result<Account, ApiError> {
     read(client().get(format!("{API_BASE}/cakevpn/api/v1/account")).bearer_auth(token).send().await).await
 }
 
+/// Waits (up to about 50 seconds) until the panel sends something for the
+/// apps, and answers with the news version; a different version than
+/// `after` means: ask for the account again.
+pub async fn news(token: &str, after: u64) -> Result<u64, ApiError> {
+    #[derive(Deserialize)]
+    struct News {
+        version: u64,
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(75))
+        .user_agent(concat!("CakeVPN/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("http client");
+    let news: News =
+        read(client.get(format!("{API_BASE}/cakevpn/api/v1/news?after={after}")).bearer_auth(token).send().await).await?;
+    Ok(news.version)
+}
+
 /// Sends a problem report to the panel.
 pub async fn report(token: &str, text: &str, details: &str) -> Result<(), ApiError> {
     let body = serde_json::json!({ "text": text, "details": details });

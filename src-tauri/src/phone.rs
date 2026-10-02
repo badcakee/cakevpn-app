@@ -160,6 +160,7 @@ fn watch_messages(app: AppHandle, dir: PathBuf) {
         })
         .await;
         let file = dir.join("messages-notified");
+        let mut version = 0u64;
         loop {
             if let Some(token) = crate::store::token() {
                 if let Ok(account) = crate::api::account(&token).await {
@@ -196,8 +197,26 @@ fn watch_messages(app: AppHandle, dir: PathBuf) {
                         let _ = std::fs::write(&file, list.join(","));
                     }
                 }
+                // Then wait until the panel sends something new; it answers at once when it does.
+                loop {
+                    match crate::api::news(&token, version).await {
+                        Ok(v) if v == version => continue,
+                        Ok(v) => {
+                            let first = version == 0;
+                            version = v;
+                            if !first {
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                tokio::time::sleep(Duration::from_secs(60)).await;
             }
-            tokio::time::sleep(Duration::from_secs(180)).await;
         }
     });
 }

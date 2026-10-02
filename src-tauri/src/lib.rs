@@ -18,7 +18,7 @@ use desktop as platform;
 use phone as platform;
 
 use api::{Account, ApiError, Load};
-use cakevpn_proto::{PingTarget, Request, Status, TunnelState, MIN_HELPER_REVISION, PROTOCOL_VERSION};
+use cakevpn_proto::{ConnectParams, PingTarget, Request, Status, TunnelState, MIN_HELPER_REVISION, PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,6 +26,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
+#[cfg(desktop)]
+use tauri::Emitter;
 use tauri_plugin_notification::NotificationExt;
 #[cfg(target_os = "macos")]
 use tauri::RunEvent;
@@ -92,6 +94,9 @@ pub(crate) struct AppState {
     pub(crate) close_to_tray: AtomicBool,
     /// The speed test in progress: its download and upload use one ticket.
     speed: Mutex<Option<api::SpeedTicket>>,
+    /// What the VPN was last connected with, to connect again by itself
+    /// after the computer wakes up with a tunnel that no longer works.
+    last_connect: Arc<Mutex<Option<ConnectParams>>>,
     /// Bytes of the update downloaded so far, and its size (0 while unknown).
     pub(crate) update_done: Arc<AtomicU64>,
     pub(crate) update_total: Arc<AtomicU64>,
@@ -468,6 +473,14 @@ async fn problem_details() -> String {
     lines.join("\n")
 }
 
+/// Returns as soon as the panel sends something for the apps (or after a
+/// while), with the news version: see api::news.
+#[tauri::command]
+async fn wait_for_news(after: u64) -> Result<u64, ApiError> {
+    let token = store::token().ok_or_else(not_signed_in)?;
+    api::news(&token, after).await
+}
+
 /// Sends a problem report: what the person wrote and the details they saw.
 #[tauri::command]
 async fn report_problem(text: String, details: String) -> Result<(), ApiError> {
@@ -558,6 +571,7 @@ async fn connect(
     params.bypass_domains = options.bypass_domains;
     params.bypass_apps = options.bypass_apps;
     *state.location.lock().await = Some(location.id.clone());
+    *state.last_connect.lock().await = Some(params.clone());
     let response = helper::ask(Request::Connect { params }).await?;
     if response.ok {
         Ok(response.status)
@@ -592,8 +606,78 @@ async fn speed_test_upload(state: State<'_, AppState>) -> Result<f64, ApiError> 
 }
 
 #[tauri::command]
-async fn disconnect() -> Result<Status, String> {
+async fn disconnect(state: State<'_, AppState>) -> Result<Status, String> {
+    *state.last_connect.lock().await = None;
     Ok(helper::ask(Request::Disconnect).await?.status)
+}
+
+/// Whether a website loads through the VPN, the way a browser would reach it.
+#[cfg(desktop)]
+async fn internet_works() -> bool {
+    let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(4)).build() else { return false };
+    matches!(client.get("https://www.gstatic.com/generate_204").send().await, Ok(r) if r.status().as_u16() == 204)
+}
+
+/// After the computer slept (a closed laptop lid), the tunnel can come back
+/// broken: every site says there is no internet until the VPN is
+/// disconnected and connected again. So once awake, CakeVPN checks a
+/// website through the VPN every few seconds, and when it fails twice it
+/// connects again by itself, the same as doing it by hand.
+#[cfg(desktop)]
+async fn watch_for_wake(app: AppHandle) {
+    let mut last = SystemTime::now();
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let now = SystemTime::now();
+        let gap = now.duration_since(last).unwrap_or_default();
+        last = now;
+        // The pause was much longer than asked: the computer was asleep.
+        if gap >= Duration::from_secs(20) {
+            recover_after_wake(&app).await;
+            last = SystemTime::now();
+        }
+    }
+}
+
+#[cfg(desktop)]
+async fn recover_after_wake(app: &AppHandle) {
+    let shared = Arc::clone(&app.state::<AppState>().last_connect);
+    let meant = |s: TunnelState| matches!(s, TunnelState::Connected | TunnelState::Connecting | TunnelState::Failed);
+    match helper::ask(Request::Status).await {
+        Ok(r) if meant(r.status.state) => {}
+        _ => return,
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut failed = 0;
+    let mut reconnects = 0;
+    for _ in 0..25 {
+        // Disconnected meanwhile (by the person): nothing to do.
+        let Some(params) = shared.lock().await.clone() else { return };
+        match helper::ask(Request::Status).await {
+            Ok(r) if meant(r.status.state) => {}
+            _ => return,
+        }
+        if internet_works().await {
+            return;
+        }
+        failed += 1;
+        if failed >= 2 && reconnects < 3 {
+            reconnects += 1;
+            failed = 0;
+            // The window is told, so this isn't shown as a dropped connection.
+            let _ = app.emit("wake-reconnect", reconnects);
+            let _ = helper::ask(Request::Connect { params }).await;
+            // Give the new tunnel time to come up before judging it.
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if matches!(helper::ask(Request::Status).await, Ok(r) if r.status.state != TunnelState::Connecting) {
+                    break;
+                }
+            }
+            continue;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
 }
 
 #[tauri::command]
@@ -1053,10 +1137,13 @@ pub fn run() {
                 visible: AtomicBool::new(shown),
                 close_to_tray: AtomicBool::new(true),
                 speed: Mutex::new(None),
+                last_connect: Arc::new(Mutex::new(None)),
                 update_done: Arc::new(AtomicU64::new(0)),
                 update_total: Arc::new(AtomicU64::new(0)),
             });
             platform::setup(app, shown)?;
+            #[cfg(desktop)]
+            tauri::async_runtime::spawn(watch_for_wake(app.handle().clone()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1076,6 +1163,7 @@ pub fn run() {
             delete_invite,
             close_message,
             problem_details,
+            wait_for_news,
             report_problem,
             list_apps,
             take_launch_action,

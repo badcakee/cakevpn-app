@@ -450,15 +450,30 @@ function updateCodeMessage() {
 }
 
 /** The panel requires a newer CakeVPN: a screen that updates it. */
-function enterForcedUpdate(version: string) {
+async function enterForcedUpdate(version: string) {
   state.forcedVersion = version || state.forcedVersion;
   state.update = { version: state.forcedVersion };
   if (state.screen !== "forced") setScreen("forced");
   // A computer updates by itself; Android only installs what the person taps.
-  if (!isAndroid && !state.updating && !state.forcedTried) {
-    state.forcedTried = true;
-    void installUpdate();
+  if (isAndroid || state.updating || state.forcedTried) return;
+  state.forcedTried = true;
+  // An update tried by itself that left this same version installed must
+  // not start again and again (a loop): the person is told instead.
+  let current = state.appVersion;
+  if (!current) current = await backend.settingsInfo().then((i) => i.version).catch(() => "");
+  let tried: { from?: string; at?: number } = {};
+  try {
+    tried = JSON.parse(saved.get("forcedTried") || "{}");
+  } catch {
+    tried = {};
   }
+  if (current && tried.from === current && Date.now() - (tried.at ?? 0) < 30 * 60_000) {
+    state.updateMessage = `The update didn't install by itself. Press the button to try again, or download CakeVPN ${state.forcedVersion} from cakevpn.net and install it.`;
+    render();
+    return;
+  }
+  saved.set("forcedTried", JSON.stringify({ from: current, at: Date.now() }));
+  void installUpdate();
 }
 
 function renderForced() {
@@ -2132,6 +2147,7 @@ async function submitCode(code: string) {
     state.codeNotice = "";
     state.screen = "home";
     refreshPings();
+    void newsLoop();
   } catch (e) {
     const err = asApiError(e);
     if (err.error === "locked" && err.retryAfter) {
@@ -2552,6 +2568,8 @@ async function start() {
   applyLanguage();
   render();
   listen<string>("tray-action", (e) => trayAction(e.payload)).catch(() => {});
+  // CakeVPN connects again by itself after the computer woke up with a broken tunnel: not a drop.
+  listen<number>("wake-reconnect", () => expectChange()).catch(() => {});
   backend.setCloseToTray(state.closeToTray).catch(() => {});
   if (state.shortcut) {
     backend.setShortcut(state.shortcut).catch((e) => (state.shortcutError = asApiError(e).message));
@@ -2580,6 +2598,7 @@ async function start() {
   // Too old for the panel: on a computer the update starts right away.
   if (state.screen === "forced") enterForcedUpdate(state.forcedVersion);
   void takeLaunchAction();
+  void newsLoop();
   await refreshPings();
 
   syncTray(true);
@@ -2596,6 +2615,38 @@ async function start() {
       void takeLaunchAction();
     }
   });
+}
+
+let newsRunning = false;
+
+/**
+ * Keeps one request open to the server, which answers the moment the panel
+ * sends a message or an announcement or forces an update: the account is
+ * then read again, and its notification shows right away.
+ */
+async function newsLoop() {
+  if (newsRunning) return;
+  newsRunning = true;
+  let version = 0;
+  let pause = 5_000;
+  while (state.account) {
+    try {
+      const v = await backend.waitForNews(version);
+      if (version !== 0 && v !== version) await refreshAccount();
+      version = v;
+      pause = 5_000;
+    } catch (e) {
+      const err = asApiError(e);
+      // Signed out, turned off or too old: the account check says so and handles it.
+      if (err.error === "signed_out" || err.error === "code_disabled" || err.error === "update_required") {
+        await refreshAccount();
+        break;
+      }
+      await new Promise((done) => setTimeout(done, pause));
+      pause = Math.min(pause * 2, 60_000);
+    }
+  }
+  newsRunning = false;
 }
 
 /** Android: the Quick Settings tile opened CakeVPN to connect. */
