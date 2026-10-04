@@ -66,6 +66,12 @@ const state = {
   autostart: false,
   appVersion: "",
   busy: false,
+  /**
+   * A click on the big button, shown at once: asking the server for fresh
+   * details and starting the tunnel take a few seconds before the service
+   * says "connecting", and a button that doesn't change looks broken.
+   */
+  pending: "" as "" | "connect" | "disconnect",
   codeError: "",
   codeNotice: "",
   lockedUntil: 0,
@@ -365,6 +371,13 @@ function chosenLocation(): Location | undefined {
 
 function tunnelState() {
   return state.overview?.status?.state ?? "disconnected";
+}
+
+/** What the big button shows: the tunnel's state, or the click being carried out. */
+function shownState() {
+  if (state.pending === "connect") return "connecting";
+  if (state.pending === "disconnect") return "disconnecting";
+  return tunnelState();
 }
 
 function applyTheme() {
@@ -775,23 +788,29 @@ function updateHome() {
   const tstate = tunnelState();
   const power = $("#power") as HTMLButtonElement | null;
   if (!power) return;
-  power.className = `power ${tstate}`;
+  const shown = shownState();
+  power.className = `power ${shown}`;
   power.disabled = state.busy;
-  setText("#power-text", { disconnected: "Connect", connecting: "Connecting…", connected: "Connected", failed: "Try again" }[tstate]);
+  setText(
+    "#power-text",
+    { disconnected: "Connect", connecting: "Connecting…", connected: "Connected", failed: "Try again", disconnecting: "Disconnecting…" }[shown],
+  );
 
   const since = status?.connectedSince ? Date.now() / 1000 - status.connectedSince : 0;
   const line = $("#status-line")!;
-  line.className = `status-line ${tstate}`;
+  line.className = `status-line ${shown}`;
   setText(
     "#status-line",
-    tstate === "connected"
+    shown === "connected"
       ? `Protected · ${formatDuration(since)}`
-      : tstate === "connecting"
+      : shown === "connecting"
         ? // With the kill switch on, the helper says why it is still trying.
-          status?.error || "Setting up a secure connection…"
-        : tstate === "failed"
-          ? status?.error || "Could not connect."
-          : "Not connected",
+          (tstate === "connecting" && status?.error) || "Setting up a secure connection…"
+        : shown === "disconnecting"
+          ? "Turning the VPN off…"
+          : shown === "failed"
+            ? status?.error || "Could not connect."
+            : "Not connected",
   );
 
   const error = $("#action-error")!;
@@ -1071,7 +1090,23 @@ function skipTab(): string {
       }
       ${state.skipError ? `<div class="error">${esc(state.skipError)}</div>` : ""}
     </div>
+    ${skipSetupNotice()}
     ${reconnectNotice()}`;
+}
+
+/** The background service that skips websites in games too (helper revision 10). */
+const SKIPS_EVERYWHERE = 10;
+
+/**
+ * A Mac's background service only changes when "Set up" runs again (it asks
+ * for the Mac's password), so older ones keep working but skip websites in
+ * browsers only. Windows updates it with the app, and Android has none.
+ */
+function skipSetupNotice(): string {
+  const revision = state.overview?.status?.revision ?? SKIPS_EVERYWHERE;
+  if (!isMac || isAndroid || !state.options.bypassDomains.length || revision >= SKIPS_EVERYWHERE) return "";
+  return `<div class="notice reconnect">Websites here skip the VPN in browsers. To make them skip it in games and other apps too, set up CakeVPN's background service again. Your Mac asks for your password once.
+      <button id="setup-again" ${state.busy ? "disabled" : ""}>Set up again</button></div>`;
 }
 
 /** Android: the apps that skip the VPN, and the chooser to pick them. */
@@ -1513,6 +1548,7 @@ function renderSettings() {
 
   // Updates
   $("#settings-update")?.addEventListener("click", installUpdate);
+  $("#setup-again")?.addEventListener("click", installHelper);
   $("#check-update")?.addEventListener("click", async () => {
     state.updateMessage = "Checking…";
     render();
@@ -2329,6 +2365,7 @@ async function togglePower() {
   // Turned off on a public Wi-Fi: it stays off there.
   if ((tstate === "connected" || tstate === "connecting") && state.network?.onWifi) state.declinedNetwork = state.network.name ?? "?";
   state.busy = true;
+  state.pending = tstate === "connected" || tstate === "connecting" ? "disconnect" : "connect";
   state.actionError = "";
   state.moveNotice = "";
   updateHome();
@@ -2345,6 +2382,7 @@ async function togglePower() {
     if (err.message === "helper_missing") state.screen = "setup";
     else if (err.message.startsWith("update_required")) {
       state.busy = false;
+      state.pending = "";
       enterForcedUpdate(err.message.split(":")[1] ?? "");
       return;
     } else {
@@ -2355,6 +2393,7 @@ async function togglePower() {
   }
   state.busy = false;
   await refreshOverview();
+  state.pending = "";
   if (state.screen === "setup") render();
   else updateHome();
 }
@@ -2370,6 +2409,7 @@ async function chooseLocation(id: string) {
     if (loc && loc.id !== state.overview?.locationId) {
       expectChange();
       state.busy = true;
+      state.pending = "connect";
       updateHome();
       try {
         await connectTo(loc.id);
@@ -2378,6 +2418,7 @@ async function chooseLocation(id: string) {
       }
       state.busy = false;
       await refreshOverview();
+      state.pending = "";
       updateHome();
     }
   }
@@ -2392,15 +2433,19 @@ async function signOut() {
 }
 
 async function installHelper() {
+  // "Set up again" in the skip settings stays there.
+  const fromSettings = state.screen === "settings";
   state.busy = true;
   state.actionError = "";
+  state.skipError = "";
   render();
   try {
     await backend.installHelper();
     await refreshOverview();
-    state.screen = state.account ? "home" : "code";
+    if (!fromSettings) state.screen = state.account ? "home" : "code";
   } catch (e) {
     state.actionError = asApiError(e).message;
+    if (fromSettings) state.skipError = state.actionError;
     await readHelperProblem();
   }
   state.busy = false;
@@ -2416,9 +2461,16 @@ function handleSignedOut(message: string) {
   render();
 }
 
+/** Counts the questions to the service, so only the newest answer is used. */
+let overviewAsked = 0;
+
 async function refreshOverview() {
+  const asked = ++overviewAsked;
   try {
     const ov = await backend.overview();
+    // An answer that was overtaken (the regular check, sent just before a
+    // click) would show a state that's already over.
+    if (asked !== overviewAsked) return;
     const before = tunnelState();
     state.overview = ov;
     watchConnection(before, tunnelState());
@@ -2534,6 +2586,7 @@ async function leaveTroubledLocation() {
   expectChange();
   followMove(target);
   state.busy = true;
+  state.pending = "connect";
   updateLocations();
   updateHome();
   try {
@@ -2545,6 +2598,7 @@ async function leaveTroubledLocation() {
   }
   state.busy = false;
   await refreshOverview();
+  state.pending = "";
   updateLocations();
   updateHome();
 }

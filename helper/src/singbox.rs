@@ -27,6 +27,8 @@ pub struct Settings<'a> {
     pub api_secret: &'a str,
     /// Where ADS_RULE_SET was written; needed when `params.block_ads` is on.
     pub ads_rule_set: Option<&'a Path>,
+    /// The addresses of the skipped websites (see skip.rs), when there are any.
+    pub skip_rule_set: Option<&'a Path>,
     /// The local port for `Capture::Device`.
     pub device_port: u16,
 }
@@ -50,9 +52,22 @@ pub fn config(s: &Settings) -> Value {
 
     // Split tunneling: these sites and apps go straight out, and their names
     // are looked up outside the VPN too, so they get nearby servers.
+    // A connection that names no site (a game such as Minecraft) is known by
+    // the name it looked up just before, or by an address one of the skipped
+    // names had. Web traffic always names its site, and many sites share one
+    // address, so the addresses only decide for everything else.
     if !p.bypass_domains.is_empty() {
         rules.push(json!({ "domain_suffix": p.bypass_domains, "outbound": "direct" }));
         dns_rules.push(json!({ "domain_suffix": p.bypass_domains, "server": "local" }));
+        if let Some(path) = s.skip_rule_set {
+            rule_sets.push(json!({ "type": "local", "tag": "skip-addresses", "format": "source", "path": path }));
+            rules.push(json!({
+                "type": "logical",
+                "mode": "and",
+                "rules": [{ "rule_set": "skip-addresses" }, { "protocol": ["tls", "http", "quic"], "invert": true }],
+                "outbound": "direct"
+            }));
+        }
     }
     // On Android, apps skip the VPN by being left out of the VPN itself.
     if !p.bypass_apps.is_empty() && !device {
@@ -126,7 +141,9 @@ pub fn config(s: &Settings) -> Value {
             ],
             "rules": dns_rules,
             "final": "remote",
-            "strategy": dns_strategy
+            "strategy": dns_strategy,
+            // Remembers which name each answer was for (see above).
+            "reverse_mapping": !p.bypass_domains.is_empty()
         },
         "inbounds": [inbound],
         "outbounds": [
@@ -187,7 +204,15 @@ mod tests {
     }
 
     fn settings(p: &ConnectParams) -> Settings<'_> {
-        Settings { params: p, capture: Capture::Tun, api_port: 9095, api_secret: "s", ads_rule_set: Some(Path::new("/x/ads.srs")), device_port: 0 }
+        Settings {
+            params: p,
+            capture: Capture::Tun,
+            api_port: 9095,
+            api_secret: "s",
+            ads_rule_set: Some(Path::new("/x/ads.srs")),
+            skip_rule_set: Some(Path::new("/x/skip-addresses.json")),
+            device_port: 0,
+        }
     }
 
     #[test]
@@ -196,6 +221,7 @@ mod tests {
         assert_eq!(c["dns"]["rules"], json!([]));
         assert_eq!(c["route"]["rule_set"], json!([]));
         assert_eq!(c["route"]["find_process"], false);
+        assert_eq!(c["dns"]["reverse_mapping"], false);
     }
 
     #[test]
@@ -222,6 +248,26 @@ mod tests {
         assert!(rules.iter().any(|r| r["process_name"] == json!(["steam.exe"]) && r["outbound"] == "direct"));
         assert_eq!(c["route"]["find_process"], true);
         assert!(c["dns"]["rules"].as_array().unwrap().iter().any(|r| r["domain_suffix"] == json!(["mybank.com"]) && r["server"] == "local"));
+    }
+
+    /// Minecraft connects to an address and names no site.
+    #[test]
+    fn skipped_sites_skip_by_address_too() {
+        let mut p = params();
+        p.bypass_domains = vec!["donutsmp.net".into()];
+        let c = config(&settings(&p));
+        assert_eq!(c["dns"]["reverse_mapping"], true);
+        assert!(c["route"]["rule_set"].as_array().unwrap().iter().any(|r| r["tag"] == "skip-addresses" && r["path"] == "/x/skip-addresses.json"));
+        let rules = c["route"]["rules"].as_array().unwrap();
+        let by_address = rules.iter().position(|r| r["type"] == "logical" && r["outbound"] == "direct").expect("no address rule");
+        let parts = &rules[by_address]["rules"];
+        assert_eq!(parts[0]["rule_set"], "skip-addresses");
+        assert_eq!(parts[1]["protocol"], json!(["tls", "http", "quic"]));
+        assert_eq!(parts[1]["invert"], true, "web traffic is decided by its own name");
+        // Before anything that would send it through the VPN or refuse it.
+        let private = rules.iter().position(|r| r["ip_is_private"] == true).unwrap();
+        let quic = rules.iter().position(|r| r["port"] == 443).unwrap();
+        assert!(by_address < private && by_address < quic);
     }
 
     #[test]
@@ -289,7 +335,17 @@ mod tests {
             ("tun-all-options", &all, Capture::Tun),
             ("android", &all, Capture::Device),
         ] {
-            let c = config(&Settings { params, capture, api_port: 9095, api_secret: "s", ads_rule_set: Some(Path::new(&ads)), device_port: 11096 });
+            let skip = format!("{dir}/skip-addresses.json");
+            std::fs::write(&skip, crate::skip::rule_set(&["40.223.14.113".parse().unwrap()]).to_string()).unwrap();
+            let c = config(&Settings {
+                params,
+                capture,
+                api_port: 9095,
+                api_secret: "s",
+                ads_rule_set: Some(Path::new(&ads)),
+                skip_rule_set: Some(Path::new(&skip)),
+                device_port: 11096,
+            });
             std::fs::write(format!("{dir}/{name}.json"), serde_json::to_string_pretty(&c).unwrap()).unwrap();
         }
     }

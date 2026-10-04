@@ -1,6 +1,6 @@
 //! Starts and stops sing-box and keeps track of how the tunnel is doing.
 
-use crate::{dns, ping, quality::Tracker, singbox};
+use crate::{dns, ping, quality::Tracker, singbox, skip};
 use cakevpn_proto::{ConnectParams, PingTarget, Request, Response, Status, TunnelState, HELPER_REVISION, MAX_PING_TARGETS, PROTOCOL_VERSION};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -79,6 +79,8 @@ struct Inner {
     up_bytes: u64,
     down_bytes: u64,
     totals_at: Option<Instant>,
+    /// The skipped websites' addresses (see skip.rs), kept between connections.
+    skip: skip::Addresses,
 }
 
 pub struct Tunnel {
@@ -207,12 +209,20 @@ impl Tunnel {
         if params.block_ads {
             write_private(&ads_path, singbox::ADS_RULE_SET).map_err(|e| format!("cannot write the ad list: {e}"))?;
         }
+        // The addresses known so far; they are looked up again once sing-box runs.
+        let skip_path = dir.join(skip::FILE);
+        let skips = !params.bypass_domains.is_empty();
+        if skips {
+            inner.skip.use_list(&params.bypass_domains);
+            skip::write(dir, &inner.skip.list()).map_err(|e| format!("cannot write the skip list: {e}"))?;
+        }
         let config = singbox::config(&singbox::Settings {
             params: &params,
             capture: self.paths.capture,
             api_port: port,
             api_secret: &secret,
             ads_rule_set: Some(&ads_path),
+            skip_rule_set: Some(&skip_path),
             device_port: inner.device_port,
         });
         let config_path = dir.join("config.json");
@@ -234,7 +244,39 @@ impl Tunnel {
 
         let me = Arc::clone(self);
         tokio::spawn(async move { me.watch(generation).await });
+        if skips {
+            let me = Arc::clone(self);
+            tokio::spawn(async move { me.look_up_skipped(generation).await });
+        }
         Ok(())
+    }
+
+    /// Keeps the skipped websites' addresses current while this connection
+    /// lasts. sing-box reads the file again by itself when it changes.
+    async fn look_up_skipped(self: Arc<Self>, generation: u64) {
+        let mut waits = skip::LOOK_AGAIN.into_iter().chain(std::iter::repeat(skip::LOOK_AGAIN[1]));
+        loop {
+            let domains = {
+                let inner = self.inner.lock().await;
+                let ended = matches!(inner.state, TunnelState::Disconnected | TunnelState::Failed);
+                match &inner.params {
+                    Some(p) if inner.generation == generation && !ended => p.bypass_domains.clone(),
+                    _ => return,
+                }
+            };
+            let found = skip::look_up(&domains).await;
+            {
+                let mut inner = self.inner.lock().await;
+                if inner.generation != generation {
+                    return;
+                }
+                if inner.skip.update(&found, Instant::now()) {
+                    let list = inner.skip.list();
+                    let _ = skip::write(&self.paths.data_dir, &list);
+                }
+            }
+            tokio::time::sleep(waits.next().unwrap_or(skip::LOOK_AGAIN[1])).await;
+        }
     }
 
     /// Measures the locations while the tunnel is up. The app can't: all it

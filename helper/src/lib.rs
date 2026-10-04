@@ -13,5 +13,6 @@ pub mod ipc;
 pub mod ping;
 pub mod quality;
 pub mod singbox;
+pub mod skip;
 pub mod tunnel;
 pub mod update;

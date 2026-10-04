@@ -117,6 +117,8 @@ export interface Quality {
 
 export interface Status {
   version: string;
+  /** What the background service can do (HELPER_REVISION); 0 from very old ones. */
+  revision?: number;
   state: TunnelState;
   error: string | null;
   connectedSince: number | null;

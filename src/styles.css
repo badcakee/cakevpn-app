@@ -347,6 +347,15 @@ h1 {
   stroke-dashoffset: 250;
 }
 
+.power.disconnecting .ring {
+  animation: spin 1.1s linear infinite;
+}
+
+.power.disconnecting .ring-arc {
+  stroke: var(--muted);
+  stroke-dashoffset: 250;
+}
+
 .power.connected .ring-arc {
   stroke: var(--green);
   stroke-dashoffset: 0;
