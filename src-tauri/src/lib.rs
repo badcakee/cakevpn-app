@@ -70,14 +70,19 @@ struct WifiSeen {
     network: netinfo::Network,
     name_at: Option<Instant>,
     signal_at: Option<Instant>,
+    /// A read is running in the background; the window gets the last one meanwhile.
+    reading: bool,
 }
 
 pub(crate) struct AppState {
     data_dir: PathBuf,
     account: Mutex<Option<Account>>,
+    /// When the server last sent the account, so connecting can use it
+    /// right away while it is fresh instead of asking again first.
+    account_at: std::sync::Mutex<Option<Instant>>,
     /// The location the tunnel was opened to, for the load warning.
     location: Mutex<Option<String>>,
-    wifi: Mutex<WifiSeen>,
+    wifi: Arc<Mutex<WifiSeen>>,
     /// How far each location last measured, for judging what "slow" is there.
     pings: Mutex<HashMap<String, u32>>,
     slow: Mutex<Slowness>,
@@ -321,6 +326,7 @@ async fn fetch_account(state: &AppState) -> Result<Account, ApiError> {
     match api::account(&token).await {
         Ok(account) => {
             *state.account.lock().await = Some(account.clone());
+            *state.account_at.lock().unwrap() = Some(Instant::now());
             remember_account(state, &token, &account).await;
             Ok(account)
         }
@@ -331,6 +337,7 @@ async fn fetch_account(state: &AppState) -> Result<Account, ApiError> {
                 store::forget_account(&state.data_dir);
                 *state.saved.lock().await = None;
                 *state.account.lock().await = None;
+                *state.account_at.lock().unwrap() = None;
                 let _ = helper::ask(Request::Disconnect).await;
             }
             Err(e)
@@ -341,6 +348,10 @@ async fn fetch_account(state: &AppState) -> Result<Account, ApiError> {
 /// How long starting and connecting wait for the server before they go on
 /// with the saved account.
 const SERVER_WAIT: Duration = Duration::from_secs(6);
+/// An account the server sent this recently is used to connect at once. The
+/// window asks for it every 10 seconds while it is open, so a click on
+/// Connect doesn't wait for the server first.
+const FRESH_ACCOUNT: Duration = Duration::from_secs(30);
 
 #[tauri::command]
 async fn load_session(state: State<'_, AppState>) -> Result<Session, ApiError> {
@@ -529,6 +540,7 @@ async fn sign_out(state: State<'_, AppState>) -> Result<(), String> {
     store::forget_account(&state.data_dir);
     *state.saved.lock().await = None;
     *state.account.lock().await = None;
+    *state.account_at.lock().unwrap() = None;
     Ok(())
 }
 
@@ -543,20 +555,26 @@ async fn connect(
     phone::allow_vpn(&app).await?;
     #[cfg(desktop)]
     let _ = &app;
-    // Use fresh details when the server answers: signing in elsewhere changes them.
-    let account = match tokio::time::timeout(SERVER_WAIT, fetch_account(&state)).await {
-        Ok(Ok(a)) => a,
-        // The window updates CakeVPN when it sees this.
-        Ok(Err(e)) if e.error == "update_required" => {
-            return Err(format!("update_required:{}", e.version.unwrap_or_default()))
-        }
-        Ok(Err(e)) if e.error != "offline" => return Err(e.message),
-        _ => state
-            .account
-            .lock()
-            .await
-            .clone()
-            .ok_or("Can't reach CakeVPN. Check your internet connection and try again.")?,
+    // Use fresh details: signing in elsewhere changes them. Ones the server
+    // sent moments ago are fresh enough, so the tunnel starts without waiting.
+    let fresh = state.account_at.lock().unwrap().is_some_and(|at| at.elapsed() < FRESH_ACCOUNT);
+    let cached = if fresh { state.account.lock().await.clone() } else { None };
+    let account = match cached {
+        Some(account) => account,
+        None => match tokio::time::timeout(SERVER_WAIT, fetch_account(&state)).await {
+            Ok(Ok(a)) => a,
+            // The window updates CakeVPN when it sees this.
+            Ok(Err(e)) if e.error == "update_required" => {
+                return Err(format!("update_required:{}", e.version.unwrap_or_default()))
+            }
+            Ok(Err(e)) if e.error != "offline" => return Err(e.message),
+            _ => state
+                .account
+                .lock()
+                .await
+                .clone()
+                .ok_or("Can't reach CakeVPN. Check your internet connection and try again.")?,
+        },
     };
     let location = account
         .locations
@@ -704,25 +722,37 @@ async fn overview(state: State<'_, AppState>) -> Result<Overview, String> {
 
     let window_visible = state.visible.load(Ordering::Relaxed);
     let connected = status.state == TunnelState::Connected;
-    // Reading about the Wi-Fi runs system tools, so it is done seldom, and
-    // not at all while the window is hidden.
+    // Reading about the Wi-Fi runs system tools, so it is done seldom, not
+    // at all while the window is hidden, and in the background: those tools
+    // can take seconds (on a Mac above all), and the window must not wait
+    // for them. It shows what was read last meanwhile.
     let wifi = {
         let mut seen = state.wifi.lock().await;
         let older = |at: Option<Instant>, secs| at.is_none_or(|at| at.elapsed() > Duration::from_secs(secs));
         let signal = connected && older(seen.signal_at, 60);
-        if (window_visible || seen.name_at.is_none()) && (signal || older(seen.name_at, 30)) {
-            let mut network = tokio::task::spawn_blocking(move || netinfo::network(signal)).await.unwrap_or_default();
-            let now = Instant::now();
-            if signal {
-                seen.signal_at = Some(now);
-            } else {
-                // The signal read earlier still holds until its minute is over.
-                network.signal = seen.network.signal.filter(|_| connected);
-            }
-            seen.name_at = Some(now);
-            seen.network = network;
+        if !seen.reading && (window_visible || seen.name_at.is_none()) && (signal || older(seen.name_at, 30)) {
+            seen.reading = true;
+            let shared = Arc::clone(&state.wifi);
+            tokio::spawn(async move {
+                let mut network = tokio::task::spawn_blocking(move || netinfo::network(signal)).await.unwrap_or_default();
+                let mut seen = shared.lock().await;
+                let now = Instant::now();
+                if signal {
+                    seen.signal_at = Some(now);
+                } else {
+                    // The signal read earlier still holds until its minute is over.
+                    network.signal = seen.network.signal;
+                }
+                seen.name_at = Some(now);
+                seen.network = network;
+                seen.reading = false;
+            });
         }
-        seen.network.clone()
+        let mut network = seen.network.clone();
+        if !connected {
+            network.signal = None;
+        }
+        network
     };
     let load = {
         let account = state.account.lock().await;
@@ -1117,8 +1147,7 @@ fn set_tray(app: AppHandle, model: TrayModel) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default().plugin(tauri_plugin_notification::init());
-    let builder = platform::plugins(builder);
+    let builder = platform::plugins(tauri::Builder::default()).plugin(tauri_plugin_notification::init());
     let app = builder
         .setup(|app| {
             let shown = platform::starts_shown();
@@ -1127,8 +1156,9 @@ pub fn run() {
             app.manage(AppState {
                 data_dir,
                 account: Mutex::new(None),
+                account_at: std::sync::Mutex::new(None),
                 location: Mutex::new(None),
-                wifi: Mutex::new(WifiSeen::default()),
+                wifi: Arc::new(Mutex::new(WifiSeen::default())),
                 pings: Mutex::new(HashMap::new()),
                 slow: Mutex::new(Slowness::default()),
                 dns: Arc::new(Mutex::new(None)),

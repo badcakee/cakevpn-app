@@ -33,6 +33,7 @@ tauri-plugin-autostart = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-global-shortcut = "2"
 keyring = "3"
+tauri-plugin-single-instance = "2"
 
 # Android: the tunnel runs inside the app (see src/phone.rs).
 [target.'cfg(target_os = "android")'.dependencies]

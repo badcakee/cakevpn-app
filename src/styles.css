@@ -366,8 +366,10 @@ h1 {
   stroke-dashoffset: 0;
 }
 
+/* A still green halo once connected. (It used to breathe, which redrew
+   the button every frame for as long as the VPN was on.) */
 .power.connected {
-  animation: glow 3.2s ease-in-out infinite;
+  box-shadow: 0 0 0 10px rgba(34, 181, 115, 0.11), var(--shadow);
 }
 
 @keyframes spin {
@@ -379,14 +381,12 @@ h1 {
   }
 }
 
-@keyframes glow {
-  0%,
-  100% {
-    box-shadow: 0 0 0 6px rgba(34, 181, 115, 0.08), var(--shadow);
-  }
-  50% {
-    box-shadow: 0 0 0 16px rgba(34, 181, 115, 0.14), var(--shadow);
-  }
+/* Nobody is looking (another app is in front, or CakeVPN is in the tray):
+   what still moves, like the connecting spinner, waits. */
+html.idle *,
+html.idle *::before,
+html.idle *::after {
+  animation-play-state: paused !important;
 }
 
 .power-icon {
@@ -1528,19 +1528,11 @@ label.row {
   transform-origin: center;
 }
 
+/* A still halo around the connected pin. (A pulsing one redrew the whole
+   map every frame, which kept the computer busy for as long as the VPN was on.) */
 .pin.connected .pin-pulse {
-  animation: pin-pulse 2.2s ease-out infinite;
-}
-
-@keyframes pin-pulse {
-  from {
-    opacity: 0.45;
-    transform: scale(0.8);
-  }
-  to {
-    opacity: 0;
-    transform: scale(3.2);
-  }
+  opacity: 0.22;
+  transform: scale(2);
 }
 
 /* Names wear the text color, with a halo in the card's color so they read over the land. */
@@ -1919,13 +1911,6 @@ label.row {
   .account-grid {
     grid-template-columns: 1fr;
   }
-}
-
-/* A phone keeps still: endless animations make the whole map redraw
-   without pause, which costs battery. The spinner while connecting stays. */
-html.phone .power.connected,
-html.phone .pin.connected .pin-pulse {
-  animation: none;
 }
 
 /* ---------- messages: the envelope button and the inbox ---------- */

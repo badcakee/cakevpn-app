@@ -17,6 +17,16 @@ const HIDDEN_ARG: &str = "--hidden";
 
 pub fn plugins(builder: tauri::Builder<Wry>) -> tauri::Builder<Wry> {
     builder
+        // Only one CakeVPN runs at a time. Opening it again (the shortcut, the
+        // Start menu, starting with the computer) shows the one already
+        // running instead of starting another, which would have its own tray
+        // icon and take the other one's disconnect for a dropped connection.
+        // It must be the first plugin, so a second copy quits before anything starts.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if !args.iter().any(|a| a == HIDDEN_ARG) {
+                show_window(app);
+            }
+        }))
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec![HIDDEN_ARG])))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(

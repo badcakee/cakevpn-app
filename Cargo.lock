@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "cakevpn"
-version = "1.8.9"
+version = "1.9.0"
 dependencies = [
  "bytes",
  "cakevpn-helper",
@@ -468,6 +468,7 @@ dependencies = [
  "tauri-plugin-autostart",
  "tauri-plugin-global-shortcut",
  "tauri-plugin-notification",
+ "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "tokio",
  "tun2proxy",
@@ -475,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "cakevpn-helper"
-version = "1.8.9"
+version = "1.9.0"
 dependencies = [
  "base64 0.22.1",
  "cakevpn-proto",
@@ -493,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "cakevpn-proto"
-version = "1.8.9"
+version = "1.9.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4822,6 +4823,22 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "url",
+]
+
+[[package]]
+name = "tauri-plugin-single-instance"
+version = "2.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee2c8fe2d6b75caed0153f91eda30ea1dea3bfb6710d5adb80456d2c035a569d"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "windows-sys 0.61.2",
+ "zbus",
 ]
 
 [[package]]

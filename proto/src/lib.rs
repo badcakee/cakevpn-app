@@ -27,12 +27,15 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// 9: on Windows, installs signed CakeVPN updates without asking (InstallUpdate).
 /// 10: skipped websites skip the VPN in games and other programs too, not
 ///     only in browsers (found by the name looked up and by address).
-pub const HELPER_REVISION: u32 = 10;
+/// 11: lighter while connected (traffic totals only read when the app asks),
+///     and a Mac's DNS no longer points into a tunnel that was just turned off.
+pub const HELPER_REVISION: u32 = 11;
 
 /// The oldest helper the app still works with. Revision 9 only adds
 /// silent updates on Windows, where the installer updates the helper anyway,
 /// so a Mac doesn't have to run "Set up" again for it. Neither for 10: a Mac
-/// with skipped websites is offered "Set up" in those settings instead.
+/// with skipped websites is offered "Set up" in those settings instead. Nor
+/// for 11, which works the same for the app.
 pub const MIN_HELPER_REVISION: u32 = 8;
 
 /// Most locations one ping request can name.

@@ -471,9 +471,16 @@ impl Tunnel {
         }
         // A Mac's DNS goes back into the tunnel (it already points there
         // unless something changed it), and names cached before are forgotten.
+        // Not when the person disconnected meanwhile: the DNS would then
+        // point into a tunnel that is gone, and no site would open.
         if self.paths.capture == singbox::Capture::Tun {
+            let inner = self.inner.lock().await;
+            if inner.generation != generation {
+                return false;
+            }
             let dir = self.paths.data_dir.clone();
             let _ = tokio::task::spawn_blocking(move || dns::into_tunnel(&dir)).await;
+            drop(inner);
         }
         true
     }
@@ -612,7 +619,8 @@ impl Tunnel {
             } else {
                 None
             };
-            let totals = read_totals(port, &secret).await;
+            // Traffic totals are not read here: `status` reads them when the
+            // app asks, so nothing extra runs while nobody is looking.
 
             let mut inner = self.inner.lock().await;
             if inner.generation != generation {
@@ -630,11 +638,6 @@ impl Tunnel {
             // and the app moves to another location.
             let stuck = inner.tracker.quality().tunnel_failures >= RESTART_AFTER_FAILURES
                 && inner.started_over.is_none_or(|at| at.elapsed() >= RESTART_AT_MOST_EVERY);
-            if let Some((up, down)) = totals {
-                inner.up_bytes = up;
-                inner.down_bytes = down;
-                inner.totals_at = Some(Instant::now());
-            }
             if stuck {
                 drop(inner);
                 if !self.start_over(generation).await {

@@ -72,6 +72,8 @@ const state = {
    * says "connecting", and a button that doesn't change looks broken.
    */
   pending: "" as "" | "connect" | "disconnect",
+  /** The button was pressed again while connecting: turn the VPN off once the connect is through. */
+  cancelConnect: false,
   codeError: "",
   codeNotice: "",
   lockedUntil: 0,
@@ -192,9 +194,23 @@ function $(selector: string): HTMLElement | null {
   return app.querySelector(selector);
 }
 
+/**
+ * The English text last written into each element. The page shows it in the
+ * chosen language (see i18n.ts), so comparing with what is on screen would
+ * write it again every second, and the translation after it.
+ */
+const written = new WeakMap<Element, string>();
+
 function setText(selector: string, text: string) {
   const el = $(selector);
-  if (el && el.textContent !== text) el.textContent = text;
+  if (!el || written.get(el) === text) return;
+  written.set(el, text);
+  el.textContent = text;
+}
+
+/** Sets an element's classes only when they change, so nothing is redrawn for nothing. */
+function setClass(el: Element, classes: string) {
+  if (el.getAttribute("class") !== classes) el.setAttribute("class", classes);
 }
 
 function flag(country: string): string {
@@ -221,49 +237,23 @@ function formatRate(bytesPerSecond: number): string {
   return mbps >= 10 ? `${mbps.toFixed(0)} Mbps` : `${mbps.toFixed(1)} Mbps`;
 }
 
-// "Speed now" glides from one reading to the next instead of jumping. The
-// browser only runs these frames while the window can be seen.
+// "Speed now" is written once per reading. (It used to glide between
+// readings, which kept the page drawing frames nearly all the time.)
 const shownSpeed = { up: 0, down: 0 };
-let speedFrom = { up: 0, down: 0 };
-let speedTo = { up: 0, down: 0 };
-let speedStart = 0;
-let speedMoving = false;
 
+/** Only while the window is in front: covered by another app or in the tray, nothing is drawn. */
 function drawSpeed() {
   const el = $("#speed");
   if (!el || !windowInFront()) return;
   const html = tunnelState() === "connected" ? `↓ ${formatRate(shownSpeed.down)}<br>↑ ${formatRate(shownSpeed.up)}` : "—";
-  if (el.innerHTML !== html) el.innerHTML = html;
+  if (written.get(el) === html) return;
+  written.set(el, html);
+  el.innerHTML = html;
 }
 
-function speedStep(now: number) {
-  const t = Math.min(1, (now - speedStart) / 800);
-  const eased = 1 - Math.pow(1 - t, 3);
-  shownSpeed.up = speedFrom.up + (speedTo.up - speedFrom.up) * eased;
-  shownSpeed.down = speedFrom.down + (speedTo.down - speedFrom.down) * eased;
-  drawSpeed();
-  if (t < 1) requestAnimationFrame(speedStep);
-  else speedMoving = false;
-}
-
-/**
- * Shows a new speed reading, gliding to it. Only while the window is in
- * front: covered by another app or in the tray, the numbers stay as they are
- * and nothing is drawn.
- */
 function showSpeed(target: { up: number; down: number }) {
-  if (!windowInFront() || state.screen !== "home") {
-    Object.assign(shownSpeed, target);
-    speedMoving = false;
-    return;
-  }
-  speedFrom = { ...shownSpeed };
-  speedTo = { ...target };
-  speedStart = performance.now();
-  if (!speedMoving) {
-    speedMoving = true;
-    requestAnimationFrame(speedStep);
-  }
+  Object.assign(shownSpeed, target);
+  if (state.screen === "home") drawSpeed();
 }
 
 function formatDuration(seconds: number): string {
@@ -789,16 +779,16 @@ function updateHome() {
   const power = $("#power") as HTMLButtonElement | null;
   if (!power) return;
   const shown = shownState();
-  power.className = `power ${shown}`;
-  power.disabled = state.busy;
+  setClass(power, `power ${shown}`);
+  // While connecting the button stays pressable: a second press cancels.
+  power.disabled = state.busy && state.pending !== "connect";
   setText(
     "#power-text",
     { disconnected: "Connect", connecting: "Connecting…", connected: "Connected", failed: "Try again", disconnecting: "Disconnecting…" }[shown],
   );
 
   const since = status?.connectedSince ? Date.now() / 1000 - status.connectedSince : 0;
-  const line = $("#status-line")!;
-  line.className = `status-line ${shown}`;
+  setClass($("#status-line")!, `status-line ${shown}`);
   setText(
     "#status-line",
     shown === "connected"
@@ -823,9 +813,8 @@ function updateHome() {
   // Once connected the server is reached through the VPN, so the note goes away.
   $("#offline-notice")!.classList.toggle("hidden", !state.offline || tstate === "connected" || tstate === "connecting");
 
-  const banner = $("#banner")!;
   const b = state.overview?.banner;
-  banner.className = `banner ${b ? `show ${b.kind}` : ""}`;
+  setClass($("#banner")!, `banner ${b ? `show ${b.kind}` : ""}`);
   if (b) {
     setText("#banner .banner-icon", { wifi: "📶", internet: "🌐", load: "🔥", vpn: "🛠️", dns: "🔎" }[b.kind] ?? "⚠️");
     setText("#banner .banner-text", b.message);
@@ -886,15 +875,27 @@ function ipsText(account: Account | null): string {
 function updateLocations() {
   syncTray();
   if (state.screen !== "home") return;
+  // Redrawn only when something in them changed: the map is large, and
+  // the account and pings come back every few seconds mostly the same.
   const list = $("#locations");
   const pins = $("#map-pins");
-  if (list) list.innerHTML = locationsHtml();
+  const listHtml = locationsHtml();
+  if (list && written.get(list) !== listHtml) {
+    written.set(list, listHtml);
+    list.innerHTML = listHtml;
+  }
   if (pins) {
-    pins.innerHTML = pinsHtml();
-    setPlaces((state.account?.locations ?? []).flatMap((l) => placeOf(l) ?? []));
+    const pinHtml = pinsHtml();
     const connected = tunnelState() === "connected" ? state.account?.locations.find((l) => l.id === state.overview?.locationId) : undefined;
-    markCountries(shownLocation()?.country, connected?.country);
-    drawMap();
+    const countries = [shownLocation()?.country, connected?.country];
+    const drawn = `${countries.join("|")}|${pinHtml}`;
+    if (written.get(pins) !== drawn) {
+      written.set(pins, drawn);
+      pins.innerHTML = pinHtml;
+      setPlaces((state.account?.locations ?? []).flatMap((l) => placeOf(l) ?? []));
+      markCountries(countries[0], countries[1]);
+      drawMap();
+    }
   }
   // The addresses belong to the main location; other locations use their own.
   const main = shownLocation()?.id === "main";
@@ -1876,8 +1877,9 @@ function syncTray(force = false) {
 
 /** The tray menu and the keyboard shortcut do what the window's own buttons do. */
 async function trayAction(action: string) {
-  if (!state.account || state.screen === "setup" || state.busy) return;
+  if (!state.account || state.screen === "setup") return;
   if (action === "toggle") return togglePower();
+  if (state.busy) return;
   const id = action.startsWith("loc:") ? action.slice(4) : "";
   if (!id) return;
   await chooseLocation(id);
@@ -1918,6 +1920,10 @@ function watchConnection(before: string, after: string) {
   if (before !== "connected" || Date.now() < state.expectedUntil) return;
   // Turned off from Android's Quick Settings (or by Android): meant.
   if (state.overview?.stoppedOutside) return;
+  // The service only says "disconnected" when it was asked to turn the VPN
+  // off. That is never a drop to bring back, whoever asked; only a tunnel
+  // that failed, or a service that went away, is.
+  if (after === "disconnected" && state.overview?.helper !== "missing") return;
   state.dropped = true;
   const coming = state.autoReconnect || state.options.killSwitch;
   notifyUser(
@@ -1968,11 +1974,11 @@ async function checkPublicWifi() {
     return;
   }
   state.network = net;
-  if (!net.onWifi) {
-    state.declinedNetwork = "";
-    return;
-  }
+  // Reading the Wi-Fi can miss it for a moment, so leaving it doesn't
+  // forget that the VPN was turned off there; another Wi-Fi does.
+  if (!net.onWifi) return;
   const key = net.name ?? "?";
+  if (state.declinedNetwork && state.declinedNetwork !== key) state.declinedNetwork = "";
   if ((net.name && state.trustedWifi.includes(net.name)) || state.declinedNetwork === key) return;
   if (tunnelState() !== "disconnected") return;
   const loc = chosenLocation();
@@ -2063,6 +2069,8 @@ function drawUpdateProgress() {
 }
 
 async function installUpdate() {
+  // The update turns the VPN off first; that isn't a dropped connection.
+  expectChange();
   state.updating = true;
   state.updateMessage = "";
   state.updateProgress = null;
@@ -2200,10 +2208,27 @@ async function submitCode(code: string) {
   render();
 }
 
-/** Connects with the protection settings as they are now. */
+/**
+ * Connects with the protection settings as they are now. When the button
+ * was pressed again meanwhile (see togglePower), the VPN is turned off as
+ * soon as the connect is through.
+ */
 async function connectTo(locationId: string) {
   const options = state.options;
-  await backend.connect(locationId, options);
+  state.cancelConnect = false;
+  let failure: unknown = null;
+  try {
+    await backend.connect(locationId, options);
+  } catch (e) {
+    failure = e;
+  }
+  if (state.cancelConnect) {
+    state.cancelConnect = false;
+    expectChange();
+    await backend.disconnect().catch(() => {});
+    return;
+  }
+  if (failure) throw failure;
   state.appliedOptions = JSON.stringify(options);
   state.speedTest = { phase: "", down: null, up: null, error: "" };
 }
@@ -2359,6 +2384,19 @@ async function runSpeedTest() {
 }
 
 async function togglePower() {
+  // Pressed while a connect is still being set up: cancel it. The button
+  // says so at once, and connectTo turns the VPN off when its part is done.
+  if (state.busy) {
+    if (state.pending === "connect") {
+      state.cancelConnect = true;
+      state.pending = "disconnect";
+      state.dropped = false;
+      if (state.network?.onWifi) state.declinedNetwork = state.network.name ?? "?";
+      expectChange();
+      updateHome();
+    }
+    return;
+  }
   const tstate = tunnelState();
   expectChange();
   state.dropped = false;
@@ -2663,7 +2701,9 @@ async function start() {
   setInterval(tick, 1000);
   // Coming back to the window catches up right away.
   window.addEventListener("focus", () => tick(true));
+  window.addEventListener("blur", markIdle);
   document.addEventListener("visibilitychange", () => {
+    markIdle();
     if (!document.hidden) {
       tick(true);
       void takeLaunchAction();
@@ -2723,13 +2763,14 @@ function windowInFront(): boolean {
 }
 
 /**
- * How often each thing is checked (ms): every second while the window is in
- * front (so "Speed now" moves smoothly); covered by another app or in the
+ * How often each thing is checked (ms): every 2 seconds while the window is
+ * in front, every second while the VPN is connecting or disconnecting (so
+ * the button changes as soon as it's done); covered by another app or in the
  * tray, only every 10 seconds, enough to notice the VPN going up or down.
  */
 const PACE = {
-  // A little under a second, so a timer that fires a moment early doesn't skip a turn.
-  overview: { inFront: 900, visible: 10_000, hidden: 10_000 },
+  // A little under the full seconds, so a timer that fires a moment early doesn't skip a turn.
+  overview: { changing: 900, inFront: 1_900, hidden: 10_000 },
   account: { visible: 10_000, hiddenConnected: 60_000, hidden: 5 * 60_000, unreachable: 30_000 },
   pings: 30_000,
   /** Public Wi-Fi: often enough to turn the VPN on soon after joining one. */
@@ -2739,6 +2780,26 @@ const PACE = {
 };
 
 let ticking = false;
+
+/** The slower jobs running now (each asks the server or the network). */
+const running = new Set<string>();
+
+/**
+ * Runs a slower job without waiting for it, at most one of each at a time,
+ * so a server that is slow to answer never holds up the VPN's status.
+ */
+function inBackground(name: string, job: () => Promise<unknown>) {
+  if (running.has(name)) return;
+  running.add(name);
+  job()
+    .catch(() => {})
+    .finally(() => running.delete(name));
+}
+
+/** Pauses what still moves on the page (the connecting spinner) while nobody looks at it. */
+function markIdle() {
+  document.documentElement.classList.toggle("idle", !windowInFront());
+}
 
 /**
  * Runs every second and does whatever is due. One ticker instead of several
@@ -2753,7 +2814,8 @@ async function tick(returned = false) {
     // "Looking" means the window is open and in front. Covered by another
     // app, minimized or in the tray all count as not looking.
     let looking = windowInFront() || returned;
-    const overviewEvery = looking ? PACE.overview.inFront : PACE.overview.hidden;
+    const changing = !!state.pending || tunnelState() === "connecting";
+    const overviewEvery = changing ? PACE.overview.changing : looking ? PACE.overview.inFront : PACE.overview.hidden;
     if (now - state.last.overview >= overviewEvery || returned) {
       state.last.overview = now;
       await refreshOverview();
@@ -2767,6 +2829,7 @@ async function tick(returned = false) {
         }
       }
     }
+    markIdle();
     // The connected timer counts every second, but only while someone is looking.
     if (looking && state.screen === "home") updateHome();
 
@@ -2774,18 +2837,18 @@ async function tick(returned = false) {
     let accountEvery = looking ? PACE.account.visible : connected ? PACE.account.hiddenConnected : PACE.account.hidden;
     // A server that can't be reached (and no VPN to reach it through) is asked less often.
     if (state.offline && !connected) accountEvery = Math.max(accountEvery, PACE.account.unreachable);
-    if (now - state.lastRefresh >= accountEvery) await refreshAccount();
+    if (now - state.lastRefresh >= accountEvery) inBackground("account", refreshAccount);
 
     if (looking && now - state.last.pings >= PACE.pings) {
       state.last.pings = now;
-      await refreshPings();
+      inBackground("pings", refreshPings);
     }
     if (state.autoWifi && now - state.last.network >= PACE.network) {
       state.last.network = now;
-      await checkPublicWifi();
+      inBackground("network", checkPublicWifi);
     }
     if (now - state.last.update >= PACE.update || (returned && now - state.last.update >= PACE.updateOnReturn)) {
-      await checkForUpdate();
+      inBackground("update", () => checkForUpdate());
     }
   } finally {
     ticking = false;
