@@ -382,10 +382,11 @@ h1 {
 }
 
 /* Nobody is looking (another app is in front, or CakeVPN is in the tray):
-   what still moves, like the connecting spinner, waits. */
-html.idle *,
-html.idle *::before,
-html.idle *::after {
+   what keeps moving, the connecting spinner and the blinking shortcut box,
+   waits. Short one-time animations (a screen or a message fading in) are
+   left alone: paused on their first frame they would stay invisible. */
+html.idle .power .ring,
+html.idle .shortcut kbd.recording {
   animation-play-state: paused !important;
 }
 

@@ -54,6 +54,13 @@ impl Tracker {
         *self = Tracker::default();
     }
 
+    /// Like `reset`, but the tunnel checks that failed in a row go on counting.
+    pub fn reset_keeping_failures(&mut self) {
+        let failures = self.tunnel_failures;
+        *self = Tracker::default();
+        self.tunnel_failures = failures;
+    }
+
     /// Forgets the router's pings, for when the computer joined another network.
     pub fn new_network(&mut self) {
         self.gateway.clear();

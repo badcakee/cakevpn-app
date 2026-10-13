@@ -5,7 +5,7 @@
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305, NONCE_LEN};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// The app's data folder, set once at start.
 static DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -23,8 +23,14 @@ mod secret {
         keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).ok()
     }
 
-    pub fn get() -> Option<String> {
-        entry()?.get_password().ok()
+    /// None when nothing is saved; an error when the keychain couldn't be read.
+    pub fn get() -> Result<Option<String>, String> {
+        let entry = entry().ok_or("the system keychain is not available")?;
+        match entry.get_password() {
+            Ok(token) => Ok(Some(token)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     pub fn set(token: &str) -> Result<(), String> {
@@ -49,8 +55,14 @@ mod secret {
         super::DIR.get().map(|d| d.join("sign-in"))
     }
 
-    pub fn get() -> Option<String> {
-        std::fs::read_to_string(path()?).ok().map(|t| t.trim().to_string())
+    /// None when nothing is saved; an error when the file couldn't be read.
+    pub fn get() -> Result<Option<String>, String> {
+        let path = path().ok_or("the app's folder is not known yet")?;
+        match std::fs::read_to_string(path) {
+            Ok(t) => Ok(Some(t.trim().to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     pub fn set(token: &str) -> Result<(), String> {
@@ -68,15 +80,33 @@ mod secret {
     }
 }
 
+/// The token as last read or saved. The keychain is asked once rather than
+/// on every request: each read can block, and a Mac may ask for permission
+/// again after an update.
+static TOKEN: Mutex<Option<String>> = Mutex::new(None);
+
+/// The sign-in token: None when this device isn't signed in; an error when
+/// it may be, but the keychain couldn't be read (that isn't a sign-out).
+pub fn token_checked() -> Result<Option<String>, String> {
+    let mut cached = TOKEN.lock().unwrap_or_else(|e| e.into_inner());
+    if cached.is_none() {
+        *cached = secret::get()?.filter(|t| !t.is_empty());
+    }
+    Ok(cached.clone())
+}
+
 pub fn token() -> Option<String> {
-    secret::get().filter(|t| !t.is_empty())
+    token_checked().ok().flatten()
 }
 
 pub fn save_token(token: &str) -> Result<(), String> {
-    secret::set(token)
+    secret::set(token)?;
+    *TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(token.to_string());
+    Ok(())
 }
 
 pub fn clear_token() {
+    *TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
     secret::clear()
 }
 

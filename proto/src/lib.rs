@@ -29,14 +29,20 @@ pub const PROTOCOL_VERSION: u32 = 1;
 ///     only in browsers (found by the name looked up and by address).
 /// 11: lighter while connected (traffic totals only read when the app asks),
 ///     and a Mac's DNS no longer points into a tunnel that was just turned off.
-pub const HELPER_REVISION: u32 = 11;
+/// 12: keeps the tunnel up on a bad link (longer checks, and starting over
+///     only while the internet itself works, waiting longer each time),
+///     Windows updates start for real, and one bad connection to the helper
+///     no longer ends it.
+pub const HELPER_REVISION: u32 = 12;
 
 /// The oldest helper the app still works with. Revision 9 only adds
 /// silent updates on Windows, where the installer updates the helper anyway,
 /// so a Mac doesn't have to run "Set up" again for it. Neither for 10: a Mac
 /// with skipped websites is offered "Set up" in those settings instead. Nor
-/// for 11, which works the same for the app.
-pub const MIN_HELPER_REVISION: u32 = 8;
+/// for 11, which works the same for the app. 12 is required: without it a
+/// bad link keeps cutting every connection (the old helper starts sing-box
+/// over every 30 seconds), so a Mac runs "Set up" once more for it.
+pub const MIN_HELPER_REVISION: u32 = 12;
 
 /// Most locations one ping request can name.
 pub const MAX_PING_TARGETS: usize = 32;

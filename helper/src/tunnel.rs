@@ -29,9 +29,18 @@ const WAKE_GAP_SECS: u64 = 12;
 /// sing-box starts over anyway.
 const WAIT_FOR_NETWORK_AFTER_WAKE: u64 = 15;
 /// Tunnel checks in a row that may fail before sing-box starts over, and
-/// how long it waits before doing that again.
+/// how long it waits before doing that again. Each start over cuts every
+/// open connection, so on a link that is bad but still works (lost packets,
+/// slow answers) it must not happen again and again: the wait doubles after
+/// each one that didn't help, up to `RESTART_AT_MOST_EVERY_MAX`.
 const RESTART_AFTER_FAILURES: u32 = 3;
 const RESTART_AT_MOST_EVERY: Duration = Duration::from_secs(30);
+const RESTART_AT_MOST_EVERY_MAX: Duration = Duration::from_secs(5 * 60);
+/// How long one check of a website may take. A new connection through the
+/// server takes about four round trips, and on a bad link each lost packet
+/// adds a second or more, so 5 seconds called a working tunnel broken.
+/// (sing-box reads this as a 16-bit number of milliseconds.)
+const CHECK_TIMEOUT_MS: u32 = 12_000;
 /// Traffic totals older than this are read again when the app asks.
 const FRESH_TOTALS: Duration = Duration::from_millis(900);
 
@@ -51,8 +60,9 @@ pub struct Paths {
 /// local port sing-box listens on, and takes it away again. Both may block
 /// while Android does its part, so they run on a blocking thread.
 pub trait Attach: Send + Sync + 'static {
-    /// Called once traffic gets through the server, before the tunnel counts as connected.
-    fn attach(&self, local_port: u16, params: &ConnectParams) -> Result<(), String>;
+    /// Called once traffic gets through the server, before the tunnel counts
+    /// as connected. The port takes user `singbox::DEVICE_USER` with `secret`.
+    fn attach(&self, local_port: u16, secret: &str, params: &ConnectParams) -> Result<(), String>;
     /// Called whenever the tunnel stops; must be fine to call when nothing is attached.
     fn detach(&self);
 }
@@ -65,13 +75,17 @@ struct Inner {
     params: Option<ConnectParams>,
     child: Option<Child>,
     api: Option<(u16, String)>,
-    /// The port sing-box takes the phone's traffic on (`Capture::Device`).
+    /// The port sing-box takes the phone's traffic on (`Capture::Device`), and its password.
     device_port: u16,
+    device_secret: String,
     config_path: Option<PathBuf>,
     /// When sing-box was started again after stopping (kill switch only).
     restarts: Vec<Instant>,
     /// When sing-box last started over to recover (after a sleep, or when stuck).
     started_over: Option<Instant>,
+    /// How long after that it may start over again when stuck; doubles after
+    /// each start over that didn't help (see `RESTART_AT_MOST_EVERY`).
+    restart_wait: Duration,
     /// Goes up on every connect and disconnect, so old background checks stop.
     generation: u64,
     tracker: Tracker,
@@ -197,24 +211,34 @@ impl Tunnel {
         // Look up the router before the tunnel changes the routes.
         inner.gateway = tokio::task::spawn_blocking(ping::gateway).await.ok().flatten();
 
-        let port = free_local_port().map_err(|e| format!("no free local port: {e}"))?;
+        // Anything that stops the connect from here on leaves it "failed"
+        // (with why), not "connecting" for ever.
+        let failed = |inner: &mut Inner, why: String| {
+            inner.state = TunnelState::Failed;
+            inner.error = Some(why.clone());
+            why
+        };
+        let port = free_local_port().map_err(|e| failed(&mut inner, format!("no free local port: {e}")))?;
         inner.device_port = match self.paths.capture {
-            singbox::Capture::Device => free_local_port().map_err(|e| format!("no free local port: {e}"))?,
+            singbox::Capture::Device => free_local_port().map_err(|e| failed(&mut inner, format!("no free local port: {e}")))?,
             _ => 0,
         };
         let secret = random_hex(16);
+        inner.device_secret = random_hex(16);
         let dir = &self.paths.data_dir;
-        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| failed(&mut inner, format!("cannot create {}: {e}", dir.display())))?;
         let ads_path = dir.join("ads.srs");
         if params.block_ads {
-            write_private(&ads_path, singbox::ADS_RULE_SET).map_err(|e| format!("cannot write the ad list: {e}"))?;
+            write_private(&ads_path, singbox::ADS_RULE_SET)
+                .map_err(|e| failed(&mut inner, format!("cannot write the ad list: {e}")))?;
         }
         // The addresses known so far; they are looked up again once sing-box runs.
         let skip_path = dir.join(skip::FILE);
         let skips = !params.bypass_domains.is_empty();
         if skips {
             inner.skip.use_list(&params.bypass_domains);
-            skip::write(dir, &inner.skip.list()).map_err(|e| format!("cannot write the skip list: {e}"))?;
+            let list = inner.skip.list();
+            skip::write(dir, &list).map_err(|e| failed(&mut inner, format!("cannot write the skip list: {e}")))?;
         }
         let config = singbox::config(&singbox::Settings {
             params: &params,
@@ -224,12 +248,13 @@ impl Tunnel {
             ads_rule_set: Some(&ads_path),
             skip_rule_set: Some(&skip_path),
             device_port: inner.device_port,
+            device_secret: &inner.device_secret,
         });
         let config_path = dir.join("config.json");
         write_private(&config_path, &serde_json::to_vec_pretty(&config).unwrap())
-            .map_err(|e| format!("cannot write the tunnel settings: {e}"))?;
+            .map_err(|e| failed(&mut inner, format!("cannot write the tunnel settings: {e}")))?;
 
-        let child = self.spawn(&config_path, true).inspect_err(|_| inner.state = TunnelState::Failed)?;
+        let child = self.spawn(&config_path, true).map_err(|why| failed(&mut inner, why))?;
         inner.child = Some(child);
         // On a Mac, names would otherwise still be asked of the local network.
         if self.paths.capture == singbox::Capture::Tun {
@@ -239,6 +264,8 @@ impl Tunnel {
         inner.api = Some((port, secret));
         inner.config_path = Some(config_path);
         inner.restarts.clear();
+        inner.started_over = None;
+        inner.restart_wait = RESTART_AT_MOST_EVERY;
         inner.params = Some(params);
         drop(inner);
 
@@ -419,16 +446,31 @@ impl Tunnel {
     /// marked failed and `false` comes back.
     async fn attach_device(&self, generation: u64) -> bool {
         let Some(attach) = self.paths.attach.clone() else { return true };
-        let (port, params) = {
+        let (port, secret, params) = {
             let inner = self.inner.lock().await;
             if inner.generation != generation {
                 return false;
             }
-            (inner.device_port, inner.params.clone())
+            (inner.device_port, inner.device_secret.clone(), inner.params.clone())
         };
         let Some(params) = params else { return false };
-        let why = match tokio::task::spawn_blocking(move || attach.attach(port, &params)).await {
-            Ok(Ok(())) => return true,
+        let attaching = Arc::clone(&attach);
+        let why = match tokio::task::spawn_blocking(move || attaching.attach(port, &secret, &params)).await {
+            Ok(Ok(())) => {
+                // Disconnected (or connected elsewhere) while Android set the
+                // VPN up: that stop found nothing to take down yet, so the VPN
+                // would stay on, pointing at a sing-box that is gone.
+                let inner = self.inner.lock().await;
+                if inner.generation != generation {
+                    let current = inner.state == TunnelState::Connected;
+                    drop(inner);
+                    if !current {
+                        let _ = tokio::task::spawn_blocking(move || attach.detach()).await;
+                    }
+                    return false;
+                }
+                return true;
+            }
             Ok(Err(why)) => why,
             Err(_) => "The VPN could not be started.".to_string(),
         };
@@ -442,7 +484,7 @@ impl Tunnel {
     /// connections to the server) can be stale, and some computers then pass
     /// nothing at all: every site says there is no internet until the VPN
     /// reconnects. Starting over is that reconnect, done by itself.
-    async fn start_over(&self, generation: u64) -> bool {
+    async fn start_over(&self, generation: u64, keep_failures: bool) -> bool {
         let mut inner = self.inner.lock().await;
         if inner.generation != generation {
             return false;
@@ -458,7 +500,13 @@ impl Tunnel {
             }
         }
         inner.started_over = Some(Instant::now());
-        inner.tracker.reset();
+        // Stuck: the failed checks go on counting until one passes, so the
+        // app can tell a location that stays down from a short hiccup.
+        if keep_failures {
+            inner.tracker.reset_keeping_failures();
+        } else {
+            inner.tracker.reset();
+        }
         let api = inner.api.clone();
         drop(inner);
         if let Some((port, secret)) = api {
@@ -504,7 +552,10 @@ impl Tunnel {
 
         // 2. Check that traffic really gets through the server.
         let mut reached = false;
-        for _ in 0..3 {
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
             let Ok((port, secret)) = self.still_current(generation).await else { return };
             if let Some(ms) = delay_test(port, &secret, "proxy").await {
                 if !self.attach_device(generation).await {
@@ -565,7 +616,8 @@ impl Tunnel {
             // What was measured before says nothing about now, and the Wi-Fi
             // needs a moment to come back, so start afresh after a pause.
             let now = now_secs();
-            let slept = now.saturating_sub(last) >= WAKE_GAP_SECS || now < last;
+            let slept = (now.saturating_sub(last) >= WAKE_GAP_SECS || now < last)
+                && self.paths.capture != singbox::Capture::Device;
             last = now;
             if slept {
                 // Once the network is back (or after a while anyway), sing-box
@@ -576,7 +628,7 @@ impl Tunnel {
                     }
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-                if !self.start_over(generation).await {
+                if !self.start_over(generation, false).await {
                     return;
                 }
                 last = now_secs();
@@ -632,17 +684,29 @@ impl Tunnel {
             if let Some((through_tunnel, outside)) = delay {
                 inner.tracker.tunnel_sample(through_tunnel);
                 inner.tracker.direct_sample(outside);
+                // Traffic gets through again: a later problem starts with the short wait.
+                if through_tunnel.is_some() {
+                    inner.restart_wait = RESTART_AT_MOST_EVERY;
+                }
             }
-            // Nothing gets through any more: start over, like reconnecting by
-            // hand would. If the server itself is down, that changes nothing,
-            // and the app moves to another location.
-            let stuck = inner.tracker.quality().tunnel_failures >= RESTART_AFTER_FAILURES
-                && inner.started_over.is_none_or(|at| at.elapsed() >= RESTART_AT_MOST_EVERY);
+            // Nothing gets through any more while the internet itself works:
+            // start over, like reconnecting by hand would. When the checks
+            // outside the VPN fail too, the internet is the problem and a
+            // start over can't help, so that takes much longer. If the server
+            // itself is down, starting over changes nothing, and the app
+            // moves to another location.
+            let q = inner.tracker.quality();
+            let needed = if q.direct_failures == 0 { RESTART_AFTER_FAILURES } else { RESTART_AFTER_FAILURES * 3 + 1 };
+            let wait = inner.restart_wait.max(RESTART_AT_MOST_EVERY);
+            let stuck = q.tunnel_failures >= needed && inner.started_over.is_none_or(|at| at.elapsed() >= wait);
             if stuck {
+                inner.restart_wait = (wait * 2).min(RESTART_AT_MOST_EVERY_MAX);
                 drop(inner);
-                if !self.start_over(generation).await {
+                if !self.start_over(generation, true).await {
                     return;
                 }
+                // The start over took a while; that isn't the computer sleeping.
+                last = now_secs();
                 continue;
             }
             if tick % 30 == 0 {
@@ -694,6 +758,10 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
 /// A tiny HTTP/1.0 GET against sing-box's local API. HTTP/1.0 keeps the
 /// answer unchunked, so no HTTP library is needed.
 async fn clash_get(port: u16, secret: &str, path: &str) -> Option<String> {
+    clash_get_within(port, secret, path, Duration::from_secs(8)).await
+}
+
+async fn clash_get_within(port: u16, secret: &str, path: &str, limit: Duration) -> Option<String> {
     let request = async {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.ok()?;
         let head = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {secret}\r\n\r\n");
@@ -707,7 +775,7 @@ async fn clash_get(port: u16, secret: &str, path: &str) -> Option<String> {
         }
         Some(rest.split_once("\r\n\r\n")?.1.to_string())
     };
-    tokio::time::timeout(Duration::from_secs(8), request).await.ok().flatten()
+    tokio::time::timeout(limit, request).await.ok().flatten()
 }
 
 /// Bytes sent and received through sing-box since it started.
@@ -720,7 +788,8 @@ async fn read_totals(port: u16, secret: &str) -> Option<(u64, u64)> {
 /// Round trip to a small web page in milliseconds: through the tunnel
 /// ("proxy") or outside it ("direct").
 async fn delay_test(port: u16, secret: &str, outbound: &str) -> Option<u32> {
-    let body = clash_get(port, secret, &format!("/proxies/{outbound}/delay?timeout=5000&url={TEST_URL}")).await?;
+    let path = format!("/proxies/{outbound}/delay?timeout={CHECK_TIMEOUT_MS}&url={TEST_URL}");
+    let body = clash_get_within(port, secret, &path, Duration::from_millis(CHECK_TIMEOUT_MS as u64 + 3_000)).await?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
     v["delay"].as_u64().map(|d| d as u32)
 }

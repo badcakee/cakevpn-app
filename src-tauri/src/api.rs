@@ -192,16 +192,40 @@ impl ApiError {
     }
 }
 
+/// One client for all requests, so its connections to the server are used
+/// again: on a bad link every new connection costs several round trips
+/// (and a lost packet costs a second or more each).
+static CLIENT: std::sync::Mutex<Option<reqwest::Client>> = std::sync::Mutex::new(None);
+
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .user_agent(concat!("CakeVPN/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .expect("http client")
+    let mut shared = CLIENT.lock().unwrap_or_else(|e| e.into_inner());
+    shared
+        .get_or_insert_with(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                // A server that doesn't answer at all is known sooner than the whole timeout.
+                .connect_timeout(Duration::from_secs(5))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .tcp_keepalive(Duration::from_secs(20))
+                .user_agent(concat!("CakeVPN/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .expect("http client")
+        })
+        .clone()
+}
+
+/// Forgets the connections kept open: after the VPN went up or down, or the
+/// computer woke up, they lead nowhere (the route they took is gone).
+pub fn fresh_connections() {
+    *CLIENT.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 async fn read<T: for<'de> Deserialize<'de>>(response: Result<reqwest::Response, reqwest::Error>) -> Result<T, ApiError> {
     let response = response.map_err(|e| {
+        // A connection that broke may be one kept from before: the next request makes new ones.
+        if !e.is_builder() {
+            fresh_connections();
+        }
         if e.is_builder() {
             // The request never left the computer: the server address built into the app is wrong.
             ApiError::new("bad_build", format!("This copy of CakeVPN has a wrong server address ({API_BASE:?}). Get a new download."))
@@ -230,7 +254,13 @@ pub async fn redeem(code: &str, device_id: &str, device_name: &str) -> Result<St
 }
 
 pub async fn account(token: &str) -> Result<Account, ApiError> {
-    read(client().get(format!("{API_BASE}/cakevpn/api/v1/account")).bearer_auth(token).send().await).await
+    let ask = || async { read(client().get(format!("{API_BASE}/cakevpn/api/v1/account")).bearer_auth(token).send().await).await };
+    match ask().await {
+        // Asked again once, on new connections: the old one may have been
+        // stale, or one packet got lost on a bad link.
+        Err(e) if e.error == "offline" => ask().await,
+        other => other,
+    }
 }
 
 /// Waits (up to about 50 seconds) until the panel sends something for the
@@ -243,6 +273,7 @@ pub async fn news(token: &str, after: u64) -> Result<u64, ApiError> {
     }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(75))
+        .connect_timeout(Duration::from_secs(10))
         .user_agent(concat!("CakeVPN/", env!("CARGO_PKG_VERSION")))
         .build()
         .expect("http client");
@@ -452,7 +483,8 @@ pub async fn speed_upload(ticket: &SpeedTicket) -> Result<f64, ApiError> {
 }
 
 pub async fn sign_out(token: &str) {
-    let _ = client().post(format!("{API_BASE}/cakevpn/api/v1/signout")).bearer_auth(token).send().await;
+    let request = client().post(format!("{API_BASE}/cakevpn/api/v1/signout")).bearer_auth(token).send();
+    let _ = tokio::time::timeout(Duration::from_secs(10), request).await;
 }
 
 #[cfg(test)]

@@ -68,10 +68,11 @@ pub fn install(data_dir: &std::path::Path, path: &str, signature: &str) -> Resul
     // installer stops the helper (and its children) before replacing it.
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
+    // Written out as one line: cmd's START takes the first quoted word as a
+    // window title, and Rust's own quoting would send `\"\"` (not a title),
+    // so START would try to run that instead of the installer.
     std::process::Command::new("cmd.exe")
-        .args(["/c", "start", "\"\"", "/b"])
-        .arg(&installer)
-        .args(["/S", "/UPDATE"])
+        .raw_arg(format!(r#"/c start "" /b "{}" /S /UPDATE"#, installer.display()))
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .spawn()
         .map_err(|e| format!("cannot start the update: {e}"))?;

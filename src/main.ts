@@ -79,7 +79,11 @@ const state = {
   lockedUntil: 0,
   actionError: "",
   settingsError: "",
+  /** "Reconnect now" (Protection, Skip the VPN) didn't work: why. */
+  reconnectError: "",
   inviteError: "",
+  /** An invite is being made or deleted (its own flag, so the VPN's buttons keep working meanwhile). */
+  inviteBusy: false,
   /** The invite code made last, highlighted in the list. */
   newInvite: "",
   /** A newer version found on GitHub, if any. */
@@ -104,6 +108,8 @@ const state = {
   moveNoticeUntil: 0,
   /** The server can't be reached (some networks block it); the saved account is in use. */
   offline: false,
+  /** Account checks in a row the server didn't answer; one miss on a bad link isn't "offline" yet. */
+  offlineMisses: 0,
   /** Protection settings; they take effect at the next connect. */
   options: {
     blockAds: saved.get("blockAds") === "1",
@@ -121,8 +127,8 @@ const state = {
   /** Announcements a notification was already shown for. */
   notifiedAnnouncements: new Set<number>(savedList("notifiedAnnouncements").map(Number)),
   shownAnnouncements: "",
-  /** Messages for this person that they closed here (the server is told too). */
-  closedMessages: new Set<number>(),
+  /** Messages for this person that they closed here (the server is told too, again until it knows). */
+  closedMessages: new Set<number>(savedList("closedMessages").map(Number)),
   /** Messages a notification was already shown for. */
   notifiedMessages: new Set<number>(savedList("notifiedMessages").map(Number)),
   /** Which messages are on screen, to redraw them only when they change. */
@@ -163,7 +169,7 @@ const state = {
   historyError: "",
   historyList: false,
   /** When things were last checked (ms), for the one ticker that paces everything. */
-  last: { overview: 0, pings: 0, update: 0, network: 0 },
+  last: { overview: 0, pings: 0, update: 0, network: 0, problem: 0 },
   /** When the account was last asked for, to ask less often while offline. */
   lastRefresh: 0,
   /** What is wrong with the connected location right now, and since when (ms). */
@@ -524,15 +530,16 @@ function windowsProblemText(): string {
   }
 }
 
-/** Asks Windows what is wrong with the service, and shows it. */
+/** Asks Windows what is wrong with the service, and shows it (again only when it changed). */
 async function readHelperProblem() {
   if (!isWindows) return;
+  const was = JSON.stringify(state.helperProblem);
   try {
     state.helperProblem = await backend.helperProblem();
   } catch {
     state.helperProblem = null;
   }
-  if (state.screen === "setup") render();
+  if (state.screen === "setup" && JSON.stringify(state.helperProblem) !== was) render();
 }
 
 let problemAsked = false;
@@ -767,6 +774,8 @@ function followConnection() {
 
 /** Updates the home screen in place. */
 function updateHome() {
+  // The tray follows the button ("Connecting…" as soon as it's pressed); it's only sent when it changed.
+  syncTray();
   if (state.screen !== "home" || !state.account) return;
   const places = `${tunnelState()}|${state.overview?.locationId}|${state.choice}`;
   if (places !== shownPlaces) {
@@ -1058,7 +1067,8 @@ function notificationsTab(): string {
 function reconnectNotice(): string {
   return optionsChanged()
     ? `<div class="notice reconnect">Reconnect to use your new settings.
-         <button id="reconnect" ${state.busy ? "disabled" : ""}>Reconnect now</button></div>`
+         <button id="reconnect" ${state.busy ? "disabled" : ""}>Reconnect now</button></div>
+       ${state.reconnectError ? `<div class="error">${esc(state.reconnectError)}</div>` : ""}`
     : "";
 }
 
@@ -1560,7 +1570,7 @@ function renderSettings() {
 
 /** Keeps a shortcut the person pressed while "Change" was on. */
 document.addEventListener("keydown", (e) => {
-  if (!state.recordingShortcut) return;
+  if (!state.recordingShortcut || state.screen !== "settings") return;
   e.preventDefault();
   if (e.key === "Escape") {
     state.recordingShortcut = false;
@@ -1667,13 +1677,18 @@ function skipListHtml(kind: "domain" | "app", list: string[]): string {
 async function reconnect() {
   const id = state.overview?.locationId ?? chosenLocation()?.id;
   if (!id) return;
+  if (state.busy) return;
   expectChange();
+  state.dropped = false;
   state.busy = true;
+  state.reconnectError = "";
   render();
   try {
     await connectTo(id);
   } catch (e) {
-    state.settingsError = asApiError(e).message;
+    const err = asApiError(e);
+    if (err.message.startsWith("update_required")) connectFailed(e);
+    else state.reconnectError = err.message;
   }
   state.busy = false;
   await refreshOverview();
@@ -1806,7 +1821,7 @@ function invitesHtml(account: Account): string {
             i.joined
               ? ""
               : `<button class="delete-code ${state.confirmDelete === i.code ? "confirm" : ""}" data-code="${esc(i.code)}" ${
-                  state.busy ? "disabled" : ""
+                  state.inviteBusy ? "disabled" : ""
                 }>${state.confirmDelete === i.code ? "Delete?" : "Delete"}</button>`
           }
         </div>`,
@@ -1824,8 +1839,8 @@ function invitesHtml(account: Account): string {
             : `<p class="muted small">You already have the fastest plan, so invites don't add speed, but your friends still get their own free CakeVPN.</p>`
         }
         ${state.inviteError ? `<div class="error">${esc(state.inviteError)}</div>` : ""}
-        <button class="primary" id="make-invite" ${full || state.busy ? "disabled" : ""}>${
-          full ? `You've made all ${r.maxFriends} invites` : state.busy ? "Making a code…" : "Create invite code"
+        <button class="primary" id="make-invite" ${full || state.inviteBusy ? "disabled" : ""}>${
+          full ? `You've made all ${r.maxFriends} invites` : state.inviteBusy ? "Making a code…" : "Create invite code"
         }</button>
         ${rows ? `<div class="invite-list">${rows}</div>` : ""}
       </div>`;
@@ -1845,7 +1860,8 @@ let trayShown = "";
 /** Keeps the tray menu in step: the status, Connect/Disconnect, and the locations to pick from. */
 function syncTray(force = false) {
   const account = state.account;
-  const tstate = tunnelState();
+  // What the big button shows, so a connect still being set up reads "Connecting…" and offers Disconnect.
+  const tstate = shownState();
   const connectedTo = account?.locations.find((l) => l.id === state.overview?.locationId);
   const on = tstate === "connected" || tstate === "connecting";
   const status =
@@ -1853,7 +1869,9 @@ function syncTray(force = false) {
       ? t("Connected · {place}", { place: connectedTo.name })
       : tstate === "connecting"
         ? t("Connecting…")
-        : t("Not connected");
+        : tstate === "disconnecting"
+          ? t("Disconnecting…")
+          : t("Not connected");
   const locations = account
     ? [
         { id: "best", name: t("Best location"), chosen: state.choice === "best", enabled: true },
@@ -1910,6 +1928,8 @@ function expectChange() {
 function watchConnection(before: string, after: string) {
   if (after === "connected") {
     if (state.overview?.locationId) state.lastConnectedId = state.overview.locationId;
+    // Connected after all: an error from an earlier try is over.
+    if (before !== "connected") state.actionError = "";
     if (state.dropped && before !== "connected") {
       state.dropped = false;
       const place = state.account?.locations.find((l) => l.id === state.overview?.locationId)?.name ?? "";
@@ -1934,24 +1954,50 @@ function watchConnection(before: string, after: string) {
   if ((after === "failed" || after === "disconnected") && state.autoReconnect) reconnectSoon();
 }
 
-function reconnectSoon() {
-  const now = Date.now();
-  state.reconnects = state.reconnects.filter((at) => now - at < 5 * 60_000);
-  if (state.reconnects.length >= 3) return;
-  state.reconnects.push(now);
-  setTimeout(async () => {
+let reconnectTimer: number | undefined;
+
+/**
+ * Brings a dropped connection back, and keeps trying until it is up (or the
+ * person turns the VPN off): at most 3 tries in 5 minutes, so a location
+ * that is down isn't asked again and again.
+ */
+function reconnectSoon(delay = 3000) {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = window.setTimeout(async () => {
     const tstate = tunnelState();
     const id = state.lastConnectedId || chosenLocation()?.id;
-    if (!state.dropped || !id || tstate === "connected" || tstate === "connecting" || state.busy) return;
+    if (!state.dropped || !state.autoReconnect || !state.account || !id || tstate === "connected") return;
+    // Something else is connecting right now: look again once it's done.
+    if (state.busy || tstate === "connecting") return reconnectSoon(5000);
+    const now = Date.now();
+    state.reconnects = state.reconnects.filter((at) => now - at < 5 * 60_000);
+    if (state.reconnects.length >= 3) return reconnectSoon(state.reconnects[0] + 5 * 60_000 - now);
+    state.reconnects.push(now);
     expectChange();
+    state.busy = true;
+    state.pending = "connect";
+    if (state.screen === "home") updateHome();
     try {
       await connectTo(id);
     } catch {
-      /* the next check notices it is still down */
+      /* tried again below */
     }
+    state.busy = false;
     await refreshOverview();
+    state.pending = "";
     if (state.screen === "home") updateHome();
-  }, 3000);
+    if (state.dropped && tunnelState() !== "connected") reconnectSoon(10_000);
+  }, Math.max(delay, 1000));
+}
+
+/** A connect that didn't work: an app too old for the panel goes to the update screen, anything else shows under the button. */
+function connectFailed(e: unknown) {
+  const err = asApiError(e);
+  if (err.message.startsWith("update_required")) {
+    void enterForcedUpdate(err.message.split(":")[1] ?? "");
+    return;
+  }
+  state.actionError = err.message;
 }
 
 /** Reads the network this computer is on (for Settings and for public Wi-Fi). */
@@ -1980,22 +2026,28 @@ async function checkPublicWifi() {
   const key = net.name ?? "?";
   if (state.declinedNetwork && state.declinedNetwork !== key) state.declinedNetwork = "";
   if ((net.name && state.trustedWifi.includes(net.name)) || state.declinedNetwork === key) return;
-  if (tunnelState() !== "disconnected") return;
+  if (tunnelState() !== "disconnected" || state.busy) return;
   const loc = chosenLocation();
   if (!loc) return;
   state.declinedNetwork = key;
   expectChange();
+  state.busy = true;
+  state.pending = "connect";
+  if (state.screen === "home") updateHome();
   try {
-    await connectTo(loc.id);
-    notifyUser(
-      "connection",
-      t("CakeVPN turned on"),
-      net.name ? t("{wifi} is a public Wi-Fi, so the VPN is on.", { wifi: net.name }) : t("This Wi-Fi isn't trusted, so the VPN is on."),
-    );
+    if (await connectTo(loc.id)) {
+      notifyUser(
+        "connection",
+        t("CakeVPN turned on"),
+        net.name ? t("{wifi} is a public Wi-Fi, so the VPN is on.", { wifi: net.name }) : t("This Wi-Fi isn't trusted, so the VPN is on."),
+      );
+    }
   } catch {
     /* tried once on this network */
   }
+  state.busy = false;
   await refreshOverview();
+  state.pending = "";
   if (state.screen === "home") updateHome();
 }
 
@@ -2003,6 +2055,7 @@ async function checkPublicWifi() {
 
 function setScreen(screen: Screen) {
   if (state.screen === screen) return;
+  state.recordingShortcut = false;
   state.screen = screen;
   render();
 }
@@ -2106,7 +2159,8 @@ async function installUpdate() {
 }
 
 async function makeInvite() {
-  state.busy = true;
+  if (state.inviteBusy) return;
+  state.inviteBusy = true;
   state.inviteError = "";
   render();
   try {
@@ -2116,7 +2170,7 @@ async function makeInvite() {
   } catch (e) {
     state.inviteError = asApiError(e).message;
   }
-  state.busy = false;
+  state.inviteBusy = false;
   render();
 }
 
@@ -2135,7 +2189,8 @@ async function deleteInvite(code: string) {
     return;
   }
   state.confirmDelete = "";
-  state.busy = true;
+  if (state.inviteBusy) return;
+  state.inviteBusy = true;
   state.inviteError = "";
   render();
   try {
@@ -2143,7 +2198,7 @@ async function deleteInvite(code: string) {
   } catch (e) {
     state.inviteError = asApiError(e).message;
   }
-  state.busy = false;
+  state.inviteBusy = false;
   render();
 }
 
@@ -2189,11 +2244,18 @@ async function submitCode(code: string) {
   try {
     state.account = await backend.redeem(code);
     state.codeNotice = "";
+    state.offline = false;
+    state.offlineMisses = 0;
     state.screen = "home";
     refreshPings();
     void newsLoop();
   } catch (e) {
     const err = asApiError(e);
+    if (err.error === "update_required") {
+      state.busy = false;
+      void enterForcedUpdate(err.version ?? "");
+      return;
+    }
     if (err.error === "locked" && err.retryAfter) {
       state.lockedUntil = Date.now() + err.retryAfter * 1000;
     } else if (err.error === "wrong_code" && err.triesLeft != null) {
@@ -2213,12 +2275,14 @@ async function submitCode(code: string) {
  * was pressed again meanwhile (see togglePower), the VPN is turned off as
  * soon as the connect is through.
  */
-async function connectTo(locationId: string) {
-  const options = state.options;
+async function connectTo(locationId: string): Promise<boolean> {
+  // The settings as they are now: switches flipped while this connects
+  // are new settings, for which "Reconnect now" is offered.
+  const sent = JSON.stringify(state.options);
   state.cancelConnect = false;
   let failure: unknown = null;
   try {
-    await backend.connect(locationId, options);
+    await backend.connect(locationId, JSON.parse(sent) as ConnectOptions);
   } catch (e) {
     failure = e;
   }
@@ -2226,11 +2290,12 @@ async function connectTo(locationId: string) {
     state.cancelConnect = false;
     expectChange();
     await backend.disconnect().catch(() => {});
-    return;
+    return false;
   }
   if (failure) throw failure;
-  state.appliedOptions = JSON.stringify(options);
+  state.appliedOptions = sent;
   state.speedTest = { phase: "", down: null, up: null, error: "" };
+  return true;
 }
 
 /** "Ads blocked · Kill switch on · 2 skip the VPN", for the connection as it was made. */
@@ -2282,12 +2347,20 @@ function drawMessages() {
 
 async function closeMessage(id: number) {
   state.closedMessages.add(id);
+  saved.set("closedMessages", JSON.stringify([...state.closedMessages].slice(-100).map(String)));
   updateHome();
   if (state.screen === "settings" && state.settingsTab === "messages") render();
   try {
     await backend.closeMessage(id);
   } catch {
-    /* it stays closed here; the server hears of it next time */
+    /* it stays closed here; the server hears of it at the next account check */
+  }
+}
+
+/** Messages closed here that the server still has as open (the close got lost on the way): tells it again. */
+function resendClosedMessages() {
+  for (const m of state.account?.messages ?? []) {
+    if (state.closedMessages.has(m.id)) backend.closeMessage(m.id).catch(() => {});
   }
 }
 
@@ -2441,18 +2514,23 @@ async function chooseLocation(id: string) {
   saved.set("location", id);
   state.moveNotice = "";
   updateLocations();
-  // Switching while connected moves the tunnel right away.
-  if (tunnelState() === "connected") {
+  // Switching while connected (or while stuck connecting) moves the tunnel
+  // right away. While the VPN is being turned on or off, the choice is
+  // kept for the next connect: two changes at once would undo each other.
+  const tstate = tunnelState();
+  if (!state.busy && (tstate === "connected" || tstate === "connecting")) {
     const loc = chosenLocation();
     if (loc && loc.id !== state.overview?.locationId) {
       expectChange();
+      state.dropped = false;
       state.busy = true;
       state.pending = "connect";
+      state.actionError = "";
       updateHome();
       try {
         await connectTo(loc.id);
       } catch (e) {
-        state.actionError = asApiError(e).message;
+        connectFailed(e);
       }
       state.busy = false;
       await refreshOverview();
@@ -2464,10 +2542,14 @@ async function chooseLocation(id: string) {
 
 async function signOut() {
   expectChange();
-  await backend.signOut();
+  signIns++;
+  state.dropped = false;
   state.account = null;
   state.codeNotice = "";
+  state.offline = false;
   setScreen("code");
+  syncTray();
+  await backend.signOut().catch(() => {});
 }
 
 async function installHelper() {
@@ -2512,6 +2594,7 @@ async function refreshOverview() {
     const before = tunnelState();
     state.overview = ov;
     watchConnection(before, tunnelState());
+    if (before !== tunnelState() && state.screen === "home") updateHome();
     noteBaseline();
     void leaveTroubledLocation();
     syncTray();
@@ -2544,25 +2627,60 @@ async function refreshOverview() {
   }
 }
 
+/** Counts sign-ins and sign-outs, so an account answer asked for before one of them is dropped. */
+let signIns = 0;
+
 async function refreshAccount() {
-  if (!state.account) return;
   state.lastRefresh = Date.now();
+  if (!state.account) {
+    if (state.screen === "forced") await recheckForced();
+    return;
+  }
+  const asked = signIns;
   try {
-    state.account = await backend.refreshAccount();
+    const account = await backend.refreshAccount();
+    if (asked !== signIns || !state.account) return;
+    state.account = account;
     notifyNewMessages();
+    resendClosedMessages();
     state.offline = false;
+    state.offlineMisses = 0;
+    leaveForced();
     syncTray();
     updateLocations();
     updateHome();
   } catch (e) {
+    if (asked !== signIns) return;
     const err = asApiError(e);
-    if (err.error === "offline" && !state.offline) {
+    if (err.error === "offline" && ++state.offlineMisses >= 2 && !state.offline) {
       state.offline = true;
       updateHome();
     }
     if (err.error === "signed_out") handleSignedOut("You were signed out because this code was used on another device.");
     if (err.error === "code_disabled") handleSignedOut("This code has been turned off. Ask for a new one.");
     if (err.error === "update_required") enterForcedUpdate(err.version ?? "");
+  }
+}
+
+/** The panel doesn't require a newer CakeVPN anymore (lowered, or this one is new enough): back to the app. */
+function leaveForced() {
+  if (state.screen !== "forced" || state.updating) return;
+  state.forcedTried = false;
+  state.updateMessage = "";
+  setScreen(state.account ? "home" : "code");
+}
+
+/** On the update screen without an account (it was required at start): asks again now and then. */
+async function recheckForced() {
+  if (state.updating) return;
+  try {
+    const session = await backend.loadSession();
+    if (!session.signedIn || !session.account || session.offline) return;
+    state.account = session.account;
+    leaveForced();
+    void newsLoop();
+  } catch {
+    /* still required, or the server can't be reached */
   }
 }
 
@@ -2628,11 +2746,12 @@ async function leaveTroubledLocation() {
   updateLocations();
   updateHome();
   try {
-    await connectTo(target.id);
-    showMoveNotice(moveMessage(current, target, kind));
-    notifyUser("connection", t("CakeVPN moved you"), state.moveNotice);
+    if (await connectTo(target.id)) {
+      showMoveNotice(moveMessage(current, target, kind));
+      notifyUser("connection", t("CakeVPN moved you"), state.moveNotice);
+    }
   } catch (e) {
-    state.actionError = asApiError(e).message;
+    connectFailed(e);
   }
   state.busy = false;
   await refreshOverview();
@@ -2662,6 +2781,13 @@ async function start() {
   listen<string>("tray-action", (e) => trayAction(e.payload)).catch(() => {});
   // CakeVPN connects again by itself after the computer woke up with a broken tunnel: not a drop.
   listen<number>("wake-reconnect", () => expectChange()).catch(() => {});
+  // That reconnect didn't work: a dropped connection, brought back like any other.
+  listen("wake-failed", () => {
+    if (!state.autoReconnect || !state.account) return;
+    state.dropped = true;
+    notifyUser("connection", t("The VPN connection dropped"), t("CakeVPN is connecting again."));
+    reconnectSoon();
+  }).catch(() => {});
   backend.setCloseToTray(state.closeToTray).catch(() => {});
   if (state.shortcut) {
     backend.setShortcut(state.shortcut).catch((e) => (state.shortcutError = asApiError(e).message));
@@ -2689,16 +2815,18 @@ async function start() {
   render();
   // Too old for the panel: on a computer the update starts right away.
   if (state.screen === "forced") enterForcedUpdate(state.forcedVersion);
-  void takeLaunchAction();
   void newsLoop();
-  await refreshPings();
-
   syncTray(true);
-  if (state.autoConnect && state.screen === "home" && tunnelState() === "disconnected") togglePower();
-  else checkPublicWifi();
-  checkForUpdate();
+  // The ticker runs from the start, so the window never waits on a slow ping or server.
   state.last.overview = state.last.pings = Date.now();
   setInterval(tick, 1000);
+  inBackground("pings", refreshPings);
+  checkForUpdate();
+  // Android's Quick Settings tile asked to connect: that goes first, and
+  // "Connect when CakeVPN opens" must not take it for a second press (a cancel).
+  await takeLaunchAction();
+  if (state.autoConnect && state.screen === "home" && !state.busy && tunnelState() === "disconnected") void togglePower();
+  else void checkPublicWifi();
   // Coming back to the window catches up right away.
   window.addEventListener("focus", () => tick(true));
   window.addEventListener("blur", markIdle);
@@ -2726,14 +2854,15 @@ async function newsLoop() {
   while (state.account) {
     try {
       const v = await backend.waitForNews(version);
-      if (version !== 0 && v !== version) await refreshAccount();
+      // Through the same queue as the regular check, so an older answer can't land last.
+      if (version !== 0 && v !== version) inBackground("account", refreshAccount, true);
       version = v;
       pause = 5_000;
     } catch (e) {
       const err = asApiError(e);
       // Signed out, turned off or too old: the account check says so and handles it.
       if (err.error === "signed_out" || err.error === "code_disabled" || err.error === "update_required") {
-        await refreshAccount();
+        inBackground("account", refreshAccount, true);
         break;
       }
       await new Promise((done) => setTimeout(done, pause));
@@ -2783,17 +2912,26 @@ let ticking = false;
 
 /** The slower jobs running now (each asks the server or the network). */
 const running = new Set<string>();
+/** Jobs to run once more when the running one is done: news came in after it asked. */
+const again = new Set<string>();
 
 /**
  * Runs a slower job without waiting for it, at most one of each at a time,
  * so a server that is slow to answer never holds up the VPN's status.
+ * With `rerun`, a job that is already running goes once more afterwards.
  */
-function inBackground(name: string, job: () => Promise<unknown>) {
-  if (running.has(name)) return;
+function inBackground(name: string, job: () => Promise<unknown>, rerun = false) {
+  if (running.has(name)) {
+    if (rerun) again.add(name);
+    return;
+  }
   running.add(name);
   job()
     .catch(() => {})
-    .finally(() => running.delete(name));
+    .finally(() => {
+      running.delete(name);
+      if (again.delete(name)) inBackground(name, job);
+    });
 }
 
 /** Pauses what still moves on the page (the connecting spinner) while nobody looks at it. */
@@ -2842,6 +2980,11 @@ async function tick(returned = false) {
     if (looking && now - state.last.pings >= PACE.pings) {
       state.last.pings = now;
       inBackground("pings", refreshPings);
+    }
+    // The fix screen follows the service ("starting…" then running, or stopped again).
+    if (state.screen === "setup" && isWindows && !state.busy && now - state.last.problem >= 5_000) {
+      state.last.problem = now;
+      inBackground("problem", readHelperProblem);
     }
     if (state.autoWifi && now - state.last.network >= PACE.network) {
       state.last.network = now;

@@ -295,6 +295,12 @@ fn not_signed_in() -> ApiError {
     ApiError::new("signed_out", "Enter your code to sign in.")
 }
 
+/// The keychain couldn't be read: this device may well be signed in, so it
+/// is never taken for a sign-out.
+fn keychain_error(why: String) -> ApiError {
+    ApiError::new("keychain", format!("CakeVPN couldn't read its sign-in from this computer's keychain ({why}). Try again."))
+}
+
 /// The account as it is kept on disk: unlike what the window gets, it
 /// includes each location's connection details.
 fn account_for_disk(account: &Account) -> serde_json::Value {
@@ -322,7 +328,7 @@ async fn remember_account(state: &AppState, token: &str, account: &Account) {
 }
 
 async fn fetch_account(state: &AppState) -> Result<Account, ApiError> {
-    let token = store::token().ok_or_else(not_signed_in)?;
+    let token = store::token_checked().map_err(keychain_error)?.ok_or_else(not_signed_in)?;
     match api::account(&token).await {
         Ok(account) => {
             *state.account.lock().await = Some(account.clone());
@@ -331,13 +337,24 @@ async fn fetch_account(state: &AppState) -> Result<Account, ApiError> {
             Ok(account)
         }
         Err(e) => {
-            if e.error == "signed_out" {
+            // Only when the token this answer is about is still the one in
+            // use: an answer that took long could be about a sign-in that
+            // was already replaced by a new one.
+            let still_current = store::token().as_deref() == Some(token.as_str());
+            if e.error == "signed_out" && still_current {
                 // Signed in somewhere else, or the code was deleted: forget the token and stop the tunnel.
                 store::clear_token();
                 store::forget_account(&state.data_dir);
                 *state.saved.lock().await = None;
                 *state.account.lock().await = None;
                 *state.account_at.lock().unwrap() = None;
+                *state.last_connect.lock().await = None;
+                let _ = helper::ask(Request::Disconnect).await;
+            }
+            if e.error == "code_disabled" && still_current {
+                // The panel turned this code off, so the server passes nothing
+                // any more: a tunnel left up would only block the internet.
+                *state.last_connect.lock().await = None;
                 let _ = helper::ask(Request::Disconnect).await;
             }
             Err(e)
@@ -355,7 +372,7 @@ const FRESH_ACCOUNT: Duration = Duration::from_secs(30);
 
 #[tauri::command]
 async fn load_session(state: State<'_, AppState>) -> Result<Session, ApiError> {
-    let Some(token) = store::token() else {
+    let Some(token) = store::token_checked().map_err(keychain_error)? else {
         return Ok(Session { signed_in: false, account: None, offline: false });
     };
     let error = match tokio::time::timeout(SERVER_WAIT, fetch_account(&state)).await {
@@ -382,7 +399,18 @@ async fn load_session(state: State<'_, AppState>) -> Result<Session, ApiError> {
 async fn redeem(code: String, state: State<'_, AppState>) -> Result<Account, ApiError> {
     let token = api::redeem(&code, &store::device_id(&state.data_dir), &store::device_name()).await?;
     store::save_token(&token).map_err(|m| ApiError::new("keychain", m))?;
-    fetch_account(&state).await
+    // Signed in now: on a bad link the account may take a few tries, and
+    // giving up here would leave a sign-in the window doesn't know about.
+    let mut tries = 0;
+    loop {
+        match fetch_account(&state).await {
+            Err(e) if e.error == "offline" && tries < 3 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            other => return other,
+        }
+    }
 }
 
 #[tauri::command]
@@ -532,15 +560,20 @@ async fn close_message(id: i64) -> Result<(), ApiError> {
 
 #[tauri::command]
 async fn sign_out(state: State<'_, AppState>) -> Result<(), String> {
-    let _ = helper::ask(Request::Disconnect).await;
-    if let Some(token) = store::token() {
-        api::sign_out(&token).await;
-    }
+    // Signed out here first, so closing CakeVPN right after (or a server
+    // that doesn't answer) can't leave this device signed in.
+    let token = store::token();
+    *state.last_connect.lock().await = None;
     store::clear_token();
     store::forget_account(&state.data_dir);
     *state.saved.lock().await = None;
     *state.account.lock().await = None;
     *state.account_at.lock().unwrap() = None;
+    let _ = helper::ask(Request::Disconnect).await;
+    // The server frees this device's place; it's told in the background.
+    if let Some(token) = token {
+        tauri::async_runtime::spawn(async move { api::sign_out(&token).await });
+    }
     Ok(())
 }
 
@@ -567,7 +600,10 @@ async fn connect(
             Ok(Err(e)) if e.error == "update_required" => {
                 return Err(format!("update_required:{}", e.version.unwrap_or_default()))
             }
-            Ok(Err(e)) if e.error != "offline" => return Err(e.message),
+            // Signed out or turned off: the details known here must not be used.
+            Ok(Err(e)) if e.error == "signed_out" || e.error == "code_disabled" => return Err(e.message),
+            // Anything else (no answer, a server hiccup, too many requests):
+            // the details CakeVPN already has still connect.
             _ => state
                 .account
                 .lock()
@@ -590,6 +626,8 @@ async fn connect(
     params.bypass_apps = options.bypass_apps;
     *state.location.lock().await = Some(location.id.clone());
     *state.last_connect.lock().await = Some(params.clone());
+    // Connections to the server kept from before now take another route.
+    api::fresh_connections();
     let response = helper::ask(Request::Connect { params }).await?;
     if response.ok {
         Ok(response.status)
@@ -626,21 +664,25 @@ async fn speed_test_upload(state: State<'_, AppState>) -> Result<f64, ApiError> 
 #[tauri::command]
 async fn disconnect(state: State<'_, AppState>) -> Result<Status, String> {
     *state.last_connect.lock().await = None;
-    Ok(helper::ask(Request::Disconnect).await?.status)
+    let status = helper::ask(Request::Disconnect).await?.status;
+    api::fresh_connections();
+    Ok(status)
 }
 
 /// Whether a website loads through the VPN, the way a browser would reach it.
+/// A bad link (lost packets, slow answers) needs a while for a new connection.
 #[cfg(desktop)]
 async fn internet_works() -> bool {
-    let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(4)).build() else { return false };
+    let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(10)).build() else { return false };
     matches!(client.get("https://www.gstatic.com/generate_204").send().await, Ok(r) if r.status().as_u16() == 204)
 }
 
 /// After the computer slept (a closed laptop lid), the tunnel can come back
 /// broken: every site says there is no internet until the VPN is
 /// disconnected and connected again. So once awake, CakeVPN checks a
-/// website through the VPN every few seconds, and when it fails twice it
-/// connects again by itself, the same as doing it by hand.
+/// website through the VPN every few seconds, and when it keeps failing
+/// while the internet itself works, it connects again by itself, the same
+/// as doing it by hand.
 #[cfg(desktop)]
 async fn watch_for_wake(app: AppHandle) {
     let mut last = SystemTime::now();
@@ -657,36 +699,68 @@ async fn watch_for_wake(app: AppHandle) {
     }
 }
 
+/// Checks this many times after waking, about every 3 to 13 seconds.
+#[cfg(desktop)]
+const WAKE_CHECKS: u32 = 20;
+/// Failed checks in a row (while the internet outside the VPN works) before connecting again.
+#[cfg(desktop)]
+const WAKE_FAILURES: u32 = 3;
+
 #[cfg(desktop)]
 async fn recover_after_wake(app: &AppHandle) {
     let shared = Arc::clone(&app.state::<AppState>().last_connect);
-    let meant = |s: TunnelState| matches!(s, TunnelState::Connected | TunnelState::Connecting | TunnelState::Failed);
     match helper::ask(Request::Status).await {
-        Ok(r) if meant(r.status.state) => {}
+        Ok(r) if matches!(r.status.state, TunnelState::Connected | TunnelState::Connecting) => {}
+        // Off, or failed: a failed tunnel is the window's to bring back, as a dropped connection.
         _ => return,
     }
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Connections to the server from before the sleep lead nowhere now.
+    api::fresh_connections();
+    // The helper starts sing-box over by itself once the network is back
+    // (it waits up to 15 seconds for it): judging before that would only
+    // connect a second time on top of its own.
+    tokio::time::sleep(Duration::from_secs(20)).await;
     let mut failed = 0;
     let mut reconnects = 0;
-    for _ in 0..25 {
+    for _ in 0..WAKE_CHECKS {
         // Disconnected meanwhile (by the person): nothing to do.
         let Some(params) = shared.lock().await.clone() else { return };
-        match helper::ask(Request::Status).await {
-            Ok(r) if meant(r.status.state) => {}
+        let state = match helper::ask(Request::Status).await {
+            Ok(r) => r.status.state,
+            Err(_) => return,
+        };
+        match state {
+            TunnelState::Connected => {}
+            // Still coming up: look again in a moment.
+            TunnelState::Connecting => {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                continue;
+            }
+            // It failed after all: the window counts that as a drop and
+            // reconnects ("Reconnect by itself").
+            TunnelState::Failed if reconnects > 0 => {
+                let _ = app.emit("wake-failed", ());
+                return;
+            }
             _ => return,
         }
         if internet_works().await {
             return;
         }
-        failed += 1;
-        if failed >= 2 && reconnects < 3 {
+        // Only the tunnel's fault when the helper's check outside the VPN
+        // passes: otherwise the Wi-Fi simply isn't back yet.
+        let outside_works =
+            matches!(helper::ask(Request::Status).await, Ok(r) if r.status.quality.direct_failures == 0);
+        failed = if outside_works { failed + 1 } else { 0 };
+        if failed >= WAKE_FAILURES && reconnects < 2 {
             reconnects += 1;
             failed = 0;
             // The window is told, so this isn't shown as a dropped connection.
             let _ = app.emit("wake-reconnect", reconnects);
+            api::fresh_connections();
             let _ = helper::ask(Request::Connect { params }).await;
             // Give the new tunnel time to come up before judging it.
-            for _ in 0..10 {
+            for _ in 0..20 {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 if matches!(helper::ask(Request::Status).await, Ok(r) if r.status.state != TunnelState::Connecting) {
                     break;
@@ -806,7 +880,13 @@ async fn dns_outside(state: &AppState, status: &Status) -> bool {
                 *dns = Some((since, None));
                 let shared = Arc::clone(&state.dns);
                 tokio::spawn(async move {
-                    let found = netinfo::dns_path().await;
+                    let mut found = netinfo::dns_path().await;
+                    // A warning stays for the whole connection, so one look
+                    // isn't enough for it: a second one a little later must agree.
+                    if found == netinfo::DnsPath::Outside {
+                        tokio::time::sleep(Duration::from_secs(20)).await;
+                        found = netinfo::dns_path().await;
+                    }
                     let mut dns = shared.lock().await;
                     if matches!(*dns, Some((checked, None)) if checked == since) {
                         *dns = Some((since, Some(found)));
@@ -1029,9 +1109,26 @@ async fn ping_locations(state: State<'_, AppState>) -> Result<HashMap<String, Op
             _ => {}
         }
     }
-    let mut pings = HashMap::new();
+    // All locations at once, each twice, keeping the faster: a lost packet
+    // (a resent connection request) would otherwise show a near location
+    // as a second away.
+    let mut measuring = tokio::task::JoinSet::new();
     for (id, host, port) in targets {
-        pings.insert(id, netinfo::tcp_ping(&host, port).await);
+        measuring.spawn(async move {
+            let first = netinfo::tcp_ping(&host, port).await;
+            let second = netinfo::tcp_ping(&host, port).await;
+            let best = match (first, second) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            (id, best)
+        });
+    }
+    let mut pings = HashMap::new();
+    while let Some(done) = measuring.join_next().await {
+        if let Ok((id, ms)) = done {
+            pings.insert(id, ms);
+        }
     }
     remember_pings(&state, &pings).await;
     Ok(pings)
@@ -1150,8 +1247,8 @@ pub fn run() {
     let builder = platform::plugins(tauri::Builder::default()).plugin(tauri_plugin_notification::init());
     let app = builder
         .setup(|app| {
-            let shown = platform::starts_shown();
             let data_dir = app.path().app_data_dir()?;
+            let shown = platform::starts_shown(&data_dir);
             store::use_dir(&data_dir);
             app.manage(AppState {
                 data_dir,

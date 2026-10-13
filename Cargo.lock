@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "cakevpn"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "bytes",
  "cakevpn-helper",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "cakevpn-helper"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "base64 0.22.1",
  "cakevpn-proto",
@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "cakevpn-proto"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "serde",
  "serde_json",

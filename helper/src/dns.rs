@@ -44,8 +44,13 @@ fn read(dir: &Path) -> Option<Before> {
     serde_json::from_slice(&std::fs::read(dir.join(SAVED)).ok()?).ok()
 }
 
+/// Written to a side file and renamed into place, so a crash halfway never
+/// leaves a torn note (which would mean the Mac's own DNS can't be put back).
 fn write(dir: &Path, before: &Before) -> bool {
-    std::fs::create_dir_all(dir).is_ok() && std::fs::write(dir.join(SAVED), serde_json::to_vec(before).unwrap_or_default()).is_ok()
+    let partial = dir.join(format!("{SAVED}.partial"));
+    std::fs::create_dir_all(dir).is_ok()
+        && std::fs::write(&partial, serde_json::to_vec(before).unwrap_or_default()).is_ok()
+        && std::fs::rename(&partial, dir.join(SAVED)).is_ok()
 }
 
 /// Points every network service at the tunnel's DNS. `run` runs

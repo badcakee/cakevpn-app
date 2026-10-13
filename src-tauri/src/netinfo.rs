@@ -197,11 +197,14 @@ fn dns_path_from(premise: Option<bool>, only_over_https: bool, never_over_https:
     }
 }
 
-async fn resolves(name: &str) -> bool {
+/// Whether a name exists. A lookup that took too long tells nothing (on a
+/// bad link the VPN's own lookups can be that slow), so it's None.
+async fn resolves(name: &str) -> Option<bool> {
     let lookup = tokio::net::lookup_host(format!("{name}:443"));
     match tokio::time::timeout(Duration::from_secs(5), lookup).await {
-        Ok(Ok(mut found)) => found.next().is_some(),
-        _ => false,
+        Ok(Ok(mut found)) => Some(found.next().is_some()),
+        Ok(Err(_)) => Some(false),
+        Err(_) => None,
     }
 }
 
@@ -233,7 +236,10 @@ pub async fn dns_path() -> DnsPath {
     let only = format!("c{label}.{ONLY_OVER_HTTPS}");
     let never = format!("c{label}.{NEVER_OVER_HTTPS}");
     let (premise, only_found, never_found) = tokio::join!(exists_over_https(&only), resolves(&only), resolves(&never));
-    dns_path_from(premise, only_found, never_found)
+    match (only_found, never_found) {
+        (Some(only_found), Some(never_found)) => dns_path_from(premise, only_found, never_found),
+        _ => DnsPath::Unknown,
+    }
 }
 
 /// Time to open a TCP connection to a location, in milliseconds.

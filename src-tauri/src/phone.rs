@@ -122,7 +122,7 @@ pub fn plugins(builder: tauri::Builder<Wry>) -> tauri::Builder<Wry> {
     )
 }
 
-pub fn starts_shown() -> bool {
+pub fn starts_shown(_data_dir: &std::path::Path) -> bool {
     true
 }
 
@@ -163,7 +163,14 @@ fn watch_messages(app: AppHandle, dir: PathBuf) {
         let mut version = 0u64;
         loop {
             if let Some(token) = crate::store::token() {
-                if let Ok(account) = crate::api::account(&token).await {
+                let answer = crate::api::account(&token).await;
+                // Signed out elsewhere, or the code was turned off: nothing will
+                // arrive for this token, so it's asked only now and then.
+                if matches!(&answer, Err(e) if e.error == "signed_out" || e.error == "code_disabled") {
+                    tokio::time::sleep(Duration::from_secs(10 * 60)).await;
+                    continue;
+                }
+                if let Ok(account) = answer {
                     let mut told: Vec<i64> = std::fs::read_to_string(&file)
                         .unwrap_or_default()
                         .split(',')
@@ -190,9 +197,19 @@ fn watch_messages(app: AppHandle, dir: PathBuf) {
                             changed = true;
                         }
                     }
-                    if changed {
-                        let keep = told.len().saturating_sub(50);
-                        let list: Vec<String> = told[keep..].iter().map(|n| n.to_string()).collect();
+                    // Only what the account still has is remembered: a fixed
+                    // number would forget an old announcement that is still
+                    // shown, and it would pop up again.
+                    let current: Vec<i64> = account
+                        .messages
+                        .iter()
+                        .map(|m| m.id)
+                        .chain(account.announcements.iter().map(|a| -a.id))
+                        .collect();
+                    let before = told.len();
+                    told.retain(|id| current.contains(id));
+                    if changed || told.len() != before {
+                        let list: Vec<String> = told.iter().map(|n| n.to_string()).collect();
                         let _ = std::fs::create_dir_all(&dir);
                         let _ = std::fs::write(&file, list.join(","));
                     }
@@ -268,7 +285,7 @@ impl PhoneAttach {
 }
 
 impl Attach for PhoneAttach {
-    fn attach(&self, local_port: u16, params: &ConnectParams) -> Result<(), String> {
+    fn attach(&self, local_port: u16, secret: &str, params: &ConnectParams) -> Result<(), String> {
         self.stop_forwarding();
         let started: Started = self
             .vpn()?
@@ -276,7 +293,9 @@ impl Attach for PhoneAttach {
             .run_mobile_plugin("start", StartArgs { skip_apps: params.bypass_apps.clone() })
             .map_err(|e| format!("Android didn't start the VPN: {e}"))?;
 
-        let proxy = tun2proxy::ProxyParameters::try_from(format!("socks5://127.0.0.1:{local_port}").as_str())
+        // The secret is hex, so it needs no escaping in the address.
+        let user = cakevpn_helper::singbox::DEVICE_USER;
+        let proxy = tun2proxy::ProxyParameters::try_from(format!("socks5://{user}:{secret}@127.0.0.1:{local_port}").as_str())
             .map_err(|e| e.to_string())?;
         let mut args = tun2proxy::Args::default();
         args.proxy(proxy)

@@ -6,6 +6,7 @@ use crate::{helper, AppState, TrayModel, UpdateInfo};
 use cakevpn_proto::Request;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, WindowEvent, Wry};
@@ -63,8 +64,16 @@ pub fn plugins(builder: tauri::Builder<Wry>) -> tauri::Builder<Wry> {
         })
 }
 
-/// Opened at login: stay in the tray. Opened by the person: show the window.
-pub fn starts_shown() -> bool {
+/// Left by an update just before CakeVPN starts again: the new version shows
+/// its window even when the old one had been started at login (hidden).
+const SHOW_AFTER_UPDATE: &str = "show-after-update";
+
+/// Opened at login: stay in the tray. Opened by the person, or again after
+/// an update: show the window.
+pub fn starts_shown(data_dir: &std::path::Path) -> bool {
+    if std::fs::remove_file(data_dir.join(SHOW_AFTER_UPDATE)).is_ok() {
+        return true;
+    }
     !std::env::args().any(|a| a == HIDDEN_ARG)
 }
 
@@ -112,7 +121,7 @@ pub fn set_autostart(app: &AppHandle, enabled: bool) -> Result<bool, String> {
 
 /// Looks for a newer CakeVPN release on GitHub.
 pub async fn check_update(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
-    let updater = app.updater().map_err(|e| e.to_string())?;
+    let updater = app.updater_builder().timeout(Duration::from_secs(30)).build().map_err(|e| e.to_string())?;
     let update = match updater.check().await {
         Ok(update) => update,
         // The newest release has no build for this kind of computer (yet): nothing to update to.
@@ -127,14 +136,15 @@ pub async fn check_update(app: &AppHandle) -> Result<Option<UpdateInfo>, String>
 /// Windows doesn't ask for permission; older helpers fall back to the
 /// installer that asks.
 pub async fn install_update(app: &AppHandle, state: &AppState) -> Result<(), String> {
-    let updater = app.updater().map_err(|e| e.to_string())?;
+    // A slow link still gets the download done; a server that stops
+    // answering doesn't leave it hanging for ever.
+    let updater =
+        app.updater_builder().timeout(Duration::from_secs(15 * 60)).build().map_err(|e| e.to_string())?;
     let update = updater
         .check()
         .await
         .map_err(|e| format!("Could not check for updates: {e}"))?
         .ok_or("CakeVPN is already up to date.")?;
-    // The installer replaces the helper on Windows, which would cut the tunnel anyway.
-    let _ = helper::ask(Request::Disconnect).await;
     let (done, total) = (Arc::clone(&state.update_done), Arc::clone(&state.update_total));
     done.store(0, Ordering::Relaxed);
     total.store(0, Ordering::Relaxed);
@@ -145,30 +155,46 @@ pub async fn install_update(app: &AppHandle, state: &AppState) -> Result<(), Str
         }
     };
     // The updater checks the download's signature before handing it over.
+    // The VPN stays on while it downloads: a download that fails changes nothing.
     let bytes = update.download(progress, || {}).await.map_err(|e| format!("The update could not be downloaded: {e}"))?;
+    // The new version opens with its window showing, even if this one started hidden at login.
+    let _ = std::fs::write(state.data_dir.join(SHOW_AFTER_UPDATE), b"");
     #[cfg(windows)]
-    if helper_installs_updates().await {
-        let path = std::env::temp_dir().join(format!("CakeVPN_{}_update.exe", update.version));
-        std::fs::write(&path, &bytes).map_err(|e| format!("The update could not be saved: {e}"))?;
-        let request = Request::InstallUpdate { path: path.to_string_lossy().into_owned(), signature: update.signature.clone() };
-        match helper::ask(request).await {
-            Ok(response) if response.ok => {
-                start_again_after_install();
-                app.exit(0);
-                return Ok(());
+    {
+        // The installer replaces the helper, which would cut the tunnel anyway.
+        let _ = helper::ask(Request::Disconnect).await;
+        if helper_installs_updates().await {
+            let path = std::env::temp_dir().join(format!("CakeVPN_{}_update.exe", update.version));
+            let saved = std::fs::write(&path, &bytes);
+            if saved.is_ok() {
+                let request =
+                    Request::InstallUpdate { path: path.to_string_lossy().into_owned(), signature: update.signature.clone() };
+                if matches!(helper::ask(request).await, Ok(response) if response.ok) {
+                    start_again_after_install();
+                    app.exit(0);
+                    return Ok(());
+                }
             }
             // Not installed by the helper: the installer that asks for permission does it.
-            _ => {}
         }
     }
-    update.install(&bytes).map_err(|e| format!("The update could not be installed: {e}"))?;
+    // A Mac's helper isn't part of the app, so the VPN stays on through the update.
+    if let Err(e) = update.install(&bytes) {
+        let _ = std::fs::remove_file(state.data_dir.join(SHOW_AFTER_UPDATE));
+        // Not installed (permission refused, …): the VPN comes back as it was.
+        #[cfg(windows)]
+        if let Some(params) = state.last_connect.lock().await.clone() {
+            let _ = helper::ask(Request::Connect { params }).await;
+        }
+        return Err(format!("The update could not be installed: {e}"));
+    }
     app.restart()
 }
 
 /// Whether the helper can install updates by itself (revision 9 and newer).
 #[cfg(windows)]
 async fn helper_installs_updates() -> bool {
-    helper::ask(Request::Status).await.is_ok_and(|r| r.status.revision >= 9)
+    helper::ask(Request::Status).await.is_ok_and(|r| r.status.revision >= 12)
 }
 
 /// Opens CakeVPN again once the helper's installer has finished: a hidden

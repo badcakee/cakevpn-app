@@ -74,6 +74,10 @@ pub async fn serve(shutdown: impl std::future::Future<Output = ()>) -> std::io::
     };
     // Stopping must not hang on a tunnel that is busy; sing-box ends with the helper anyway.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tunnel.disconnect()).await;
+    // A disconnect cut short above may not have got to the Mac's DNS: put it back here.
+    if capture() == singbox::Capture::Tun {
+        dns::back_to_normal(&data_dir());
+    }
     result
 }
 

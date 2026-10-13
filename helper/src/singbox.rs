@@ -20,6 +20,9 @@ pub enum Capture {
     Device,
 }
 
+/// The user name on the phone's local port (see `Settings::device_secret`).
+pub const DEVICE_USER: &str = "cakevpn";
+
 pub struct Settings<'a> {
     pub params: &'a ConnectParams,
     pub capture: Capture,
@@ -31,6 +34,10 @@ pub struct Settings<'a> {
     pub skip_rule_set: Option<&'a Path>,
     /// The local port for `Capture::Device`.
     pub device_port: u16,
+    /// The password for that port: every app on a phone can reach 127.0.0.1,
+    /// and without one any of them could use the VPN through it (and see
+    /// that one is running), even apps the person chose to leave out.
+    pub device_secret: &'a str,
 }
 
 /// The tunnel sends all TCP and UDP through the VPN, like a normal network.
@@ -116,12 +123,18 @@ pub fn config(s: &Settings) -> Value {
             "listen": "127.0.0.1",
             "listen_port": port
         }),
-        Capture::Device => json!({
-            "type": "mixed",
-            "tag": "device-in",
-            "listen": "127.0.0.1",
-            "listen_port": s.device_port
-        }),
+        Capture::Device => {
+            let mut inbound = json!({
+                "type": "mixed",
+                "tag": "device-in",
+                "listen": "127.0.0.1",
+                "listen_port": s.device_port
+            });
+            if !s.device_secret.is_empty() {
+                inbound["users"] = json!([{ "username": DEVICE_USER, "password": s.device_secret }]);
+            }
+            inbound
+        }
     };
     // sing-box on Android has no system resolver to ask (it runs as a plain
     // program there), so names outside the VPN go to Cloudflare directly.
@@ -212,6 +225,7 @@ mod tests {
             ads_rule_set: Some(Path::new("/x/ads.srs")),
             skip_rule_set: Some(Path::new("/x/skip-addresses.json")),
             device_port: 0,
+            device_secret: "",
         }
     }
 
@@ -291,8 +305,11 @@ mod tests {
         let mut s = settings(&p);
         s.capture = Capture::Device;
         s.device_port = 40000;
+        s.device_secret = "pw";
         let c = config(&s);
         assert_eq!(c["inbounds"][0]["type"], "mixed");
+        assert_eq!(c["inbounds"][0]["users"][0]["username"], DEVICE_USER);
+        assert_eq!(c["inbounds"][0]["users"][0]["password"], "pw");
         assert_eq!(c["inbounds"][0]["listen"], "127.0.0.1");
         assert_eq!(c["inbounds"][0]["listen_port"], 40000);
         assert_eq!(c["route"]["auto_detect_interface"], false);
@@ -345,6 +362,7 @@ mod tests {
                 ads_rule_set: Some(Path::new(&ads)),
                 skip_rule_set: Some(Path::new(&skip)),
                 device_port: 11096,
+                device_secret: "pw",
             });
             std::fs::write(format!("{dir}/{name}.json"), serde_json::to_string_pretty(&c).unwrap()).unwrap();
         }

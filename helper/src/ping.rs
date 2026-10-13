@@ -26,7 +26,8 @@ pub fn gateway() -> Option<Ipv4Addr> {
     }
     netdev::get_interfaces()
         .into_iter()
-        .filter(|i| i.is_up() && !tunnel_like(&i.name))
+        // On Windows the name is a GUID; the friendly name says "CakeVPN".
+        .filter(|i| i.is_up() && !tunnel_like(&i.name) && !tunnel_like(i.friendly_name.as_deref().unwrap_or("")))
         .find_map(|i| i.gateway.and_then(|g| g.ipv4.first().copied()))
 }
 

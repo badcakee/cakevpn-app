@@ -69,8 +69,16 @@ pub async fn listen(tunnel: Arc<Tunnel>, path: &str) -> std::io::Result<()> {
     // disconnect and status, and connect takes checked connection data only.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
     loop {
-        let (stream, _) = listener.accept().await?;
-        tokio::spawn(serve_client(Arc::clone(&tunnel), stream));
+        // One connection that goes wrong must not end the helper (and with it the tunnel).
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                tokio::spawn(serve_client(Arc::clone(&tunnel), stream));
+            }
+            Err(e) => {
+                eprintln!("cakevpn-helper: accepting a connection failed: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
     }
 }
 
@@ -98,7 +106,13 @@ pub async fn listen(tunnel: Arc<Tunnel>, path: &str) -> std::io::Result<()> {
             Err(e) => return Err(e),
         };
         first = false;
-        server.connect().await?;
+        // The app can hang up before the pipe is connected (ERROR_NO_DATA):
+        // that one pipe is dropped, the helper and the tunnel go on.
+        if let Err(e) = server.connect().await {
+            eprintln!("cakevpn-helper: a pipe connection failed: {e}");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
         tokio::spawn(serve_client(Arc::clone(&tunnel), server));
     }
 }
