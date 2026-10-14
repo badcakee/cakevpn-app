@@ -4,3 +4,4 @@ target/
 src-tauri/gen/schemas/
 src-tauri/binaries/*
 !src-tauri/binaries/.gitkeep
+__pycache__/

@@ -724,7 +724,9 @@ async fn recover_after_wake(app: &AppHandle) {
     let mut reconnects = 0;
     for _ in 0..WAKE_CHECKS {
         // Disconnected meanwhile (by the person): nothing to do.
-        let Some(params) = shared.lock().await.clone() else { return };
+        if shared.lock().await.is_none() {
+            return;
+        }
         let state = match helper::ask(Request::Status).await {
             Ok(r) => r.status.state,
             Err(_) => return,
@@ -753,12 +755,18 @@ async fn recover_after_wake(app: &AppHandle) {
             matches!(helper::ask(Request::Status).await, Ok(r) if r.status.quality.direct_failures == 0);
         failed = if outside_works { failed + 1 } else { 0 };
         if failed >= WAKE_FAILURES && reconnects < 2 {
+            // Held while connecting: a Disconnect pressed during the checks
+            // above has cleared it (no connect then), and one pressed now
+            // waits for this connect and turns it off right after.
+            let latest = shared.lock().await;
+            let Some(params) = latest.clone() else { return };
             reconnects += 1;
             failed = 0;
             // The window is told, so this isn't shown as a dropped connection.
             let _ = app.emit("wake-reconnect", reconnects);
             api::fresh_connections();
             let _ = helper::ask(Request::Connect { params }).await;
+            drop(latest);
             // Give the new tunnel time to come up before judging it.
             for _ in 0..20 {
                 tokio::time::sleep(Duration::from_secs(2)).await;

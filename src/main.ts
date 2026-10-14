@@ -243,9 +243,17 @@ function formatRate(bytesPerSecond: number): string {
   return mbps >= 10 ? `${mbps.toFixed(0)} Mbps` : `${mbps.toFixed(1)} Mbps`;
 }
 
-// "Speed now" is written once per reading. (It used to glide between
-// readings, which kept the page drawing frames nearly all the time.)
+// "Speed now" glides from one reading to the next (in 0.8 s) instead of
+// jumping. It's drawn at most 20 times a second, only while the window is
+// in front, and only when the text changes, so it costs next to nothing.
 const shownSpeed = { up: 0, down: 0 };
+let speedFrom = { up: 0, down: 0 };
+let speedTo = { up: 0, down: 0 };
+let speedStart = 0;
+let speedMoving = false;
+let speedDrawnAt = 0;
+const SPEED_GLIDE_MS = 800;
+const SPEED_FRAME_MS = 50;
 
 /** Only while the window is in front: covered by another app or in the tray, nothing is drawn. */
 function drawSpeed() {
@@ -257,9 +265,41 @@ function drawSpeed() {
   el.innerHTML = html;
 }
 
+function speedStep(now: number) {
+  const t = Math.min(1, (now - speedStart) / SPEED_GLIDE_MS);
+  const eased = 1 - Math.pow(1 - t, 3);
+  shownSpeed.up = speedFrom.up + (speedTo.up - speedFrom.up) * eased;
+  shownSpeed.down = speedFrom.down + (speedTo.down - speedFrom.down) * eased;
+  const looking = windowInFront() && state.screen === "home";
+  if (t >= 1 || !looking) {
+    // Done, or nobody looks any more: straight to the reading.
+    Object.assign(shownSpeed, speedTo);
+    speedMoving = false;
+    drawSpeed();
+    return;
+  }
+  if (now - speedDrawnAt >= SPEED_FRAME_MS) {
+    speedDrawnAt = now;
+    drawSpeed();
+  }
+  requestAnimationFrame(speedStep);
+}
+
+/** Shows a new speed reading, gliding to it while someone is looking. */
 function showSpeed(target: { up: number; down: number }) {
-  Object.assign(shownSpeed, target);
-  if (state.screen === "home") drawSpeed();
+  if (!windowInFront() || state.screen !== "home") {
+    Object.assign(shownSpeed, target);
+    speedTo = { ...target };
+    speedMoving = false;
+    return;
+  }
+  speedFrom = { ...shownSpeed };
+  speedTo = { ...target };
+  speedStart = performance.now();
+  if (!speedMoving) {
+    speedMoving = true;
+    requestAnimationFrame(speedStep);
+  }
 }
 
 function formatDuration(seconds: number): string {
@@ -2024,8 +2064,13 @@ async function checkPublicWifi() {
   // forget that the VPN was turned off there; another Wi-Fi does.
   if (!net.onWifi) return;
   const key = net.name ?? "?";
-  if (state.declinedNetwork && state.declinedNetwork !== key) state.declinedNetwork = "";
-  if ((net.name && state.trustedWifi.includes(net.name)) || state.declinedNetwork === key) return;
+  // Turned off by the person on this Wi-Fi: it stays off here. Windows
+  // doesn't always tell the Wi-Fi's name, so a name that comes and goes
+  // isn't another network: only a different name is (and a name first
+  // seen after an unknown one is taken as this same network).
+  if (state.declinedNetwork === "?" && net.name) state.declinedNetwork = net.name;
+  else if (state.declinedNetwork && net.name && state.declinedNetwork !== net.name) state.declinedNetwork = "";
+  if ((net.name && state.trustedWifi.includes(net.name)) || state.declinedNetwork) return;
   if (tunnelState() !== "disconnected" || state.busy) return;
   const loc = chosenLocation();
   if (!loc) return;
@@ -2121,9 +2166,59 @@ function drawUpdateProgress() {
   if (button) button.textContent = updatingText();
 }
 
+/** The VPN was on when an update started: CakeVPN connects again once the new version opens. */
+const RESUME_KEY = "resumeAfterUpdate";
+const RESUME_WITHIN = 10 * 60_000;
+
+/** Where to connect again after an update, if one was just installed while connected (read once). */
+function takeResume(): string {
+  let resume: { id?: string; at?: number } = {};
+  try {
+    resume = JSON.parse(saved.get(RESUME_KEY) || "{}");
+  } catch {
+    resume = {};
+  }
+  saved.set(RESUME_KEY, "");
+  return resume.id && Date.now() - (resume.at ?? 0) < RESUME_WITHIN ? resume.id : "";
+}
+
+/**
+ * The panel asked this app to update itself (unlike a forced update, it
+ * keeps working meanwhile): a computer installs it in the background and
+ * connects again afterwards; a phone, where nothing installs by itself,
+ * shows its update button.
+ */
+function updateIfAsked() {
+  const want = state.account?.updateTo;
+  if (!want || state.updating || state.screen === "forced" || state.screen === "setup") return;
+  if (isAndroid) {
+    if (!state.update) {
+      state.update = { version: want };
+      if (state.screen === "home") updateHome();
+    }
+    return;
+  }
+  // The same version tried lately and this one still runs: not again and again.
+  let tried: { version?: string; at?: number } = {};
+  try {
+    tried = JSON.parse(saved.get("askedUpdateTried") || "{}");
+  } catch {
+    tried = {};
+  }
+  if (tried.version === want && Date.now() - (tried.at ?? 0) < 30 * 60_000) return;
+  saved.set("askedUpdateTried", JSON.stringify({ version: want, at: Date.now() }));
+  state.update = { version: want };
+  void installUpdate();
+}
+
 async function installUpdate() {
   // The update turns the VPN off first; that isn't a dropped connection.
   expectChange();
+  // On a computer CakeVPN restarts with the new version: the VPN comes back on then.
+  const tstate = tunnelState();
+  if (!isAndroid && (tstate === "connected" || tstate === "connecting")) {
+    saved.set(RESUME_KEY, JSON.stringify({ id: state.overview?.locationId ?? chosenLocation()?.id, at: Date.now() }));
+  }
   state.updating = true;
   state.updateMessage = "";
   state.updateProgress = null;
@@ -2150,6 +2245,7 @@ async function installUpdate() {
     }
   } catch (e) {
     clearInterval(watch);
+    saved.set(RESUME_KEY, "");
     state.updating = false;
     state.updateMessage = asApiError(e).message;
     state.actionError = state.screen === "home" ? state.updateMessage : state.actionError;
@@ -2464,7 +2560,7 @@ async function togglePower() {
       state.cancelConnect = true;
       state.pending = "disconnect";
       state.dropped = false;
-      if (state.network?.onWifi) state.declinedNetwork = state.network.name ?? "?";
+      if (!state.network || state.network.onWifi) state.declinedNetwork = state.network?.name ?? "?";
       expectChange();
       updateHome();
     }
@@ -2474,7 +2570,9 @@ async function togglePower() {
   expectChange();
   state.dropped = false;
   // Turned off on a public Wi-Fi: it stays off there.
-  if ((tstate === "connected" || tstate === "connecting") && state.network?.onWifi) state.declinedNetwork = state.network.name ?? "?";
+  // (Not read yet counts as this Wi-Fi too, so it can't come back on by itself.)
+  if ((tstate === "connected" || tstate === "connecting") && (!state.network || state.network.onWifi))
+    state.declinedNetwork = state.network?.name ?? "?";
   state.busy = true;
   state.pending = tstate === "connected" || tstate === "connecting" ? "disconnect" : "connect";
   state.actionError = "";
@@ -2646,6 +2744,7 @@ async function refreshAccount() {
     state.offline = false;
     state.offlineMisses = 0;
     leaveForced();
+    updateIfAsked();
     syncTray();
     updateLocations();
     updateHome();
@@ -2825,8 +2924,11 @@ async function start() {
   // Android's Quick Settings tile asked to connect: that goes first, and
   // "Connect when CakeVPN opens" must not take it for a second press (a cancel).
   await takeLaunchAction();
-  if (state.autoConnect && state.screen === "home" && !state.busy && tunnelState() === "disconnected") void togglePower();
+  const resume = takeResume();
+  if (resume && state.screen === "home" && !state.busy && tunnelState() === "disconnected") void resumeConnection(resume);
+  else if (state.autoConnect && state.screen === "home" && !state.busy && tunnelState() === "disconnected") void togglePower();
   else void checkPublicWifi();
+  if (!state.offline) updateIfAsked();
   // Coming back to the window catches up right away.
   window.addEventListener("focus", () => tick(true));
   window.addEventListener("blur", markIdle);
@@ -2870,6 +2972,25 @@ async function newsLoop() {
     }
   }
   newsRunning = false;
+}
+
+/** Connects to where the VPN was before an update restarted CakeVPN. */
+async function resumeConnection(id: string) {
+  const loc = (state.account?.locations ?? []).find((l) => l.id === id && l.online) ?? chosenLocation();
+  if (!loc) return;
+  expectChange();
+  state.busy = true;
+  state.pending = "connect";
+  updateHome();
+  try {
+    await connectTo(loc.id);
+  } catch (e) {
+    connectFailed(e);
+  }
+  state.busy = false;
+  await refreshOverview();
+  state.pending = "";
+  updateHome();
 }
 
 /** Android: the Quick Settings tile opened CakeVPN to connect. */

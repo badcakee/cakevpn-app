@@ -183,8 +183,12 @@ pub async fn install_update(app: &AppHandle, state: &AppState) -> Result<(), Str
         let _ = std::fs::remove_file(state.data_dir.join(SHOW_AFTER_UPDATE));
         // Not installed (permission refused, …): the VPN comes back as it was.
         #[cfg(windows)]
-        if let Some(params) = state.last_connect.lock().await.clone() {
-            let _ = helper::ask(Request::Connect { params }).await;
+        {
+            // Held while connecting, so a Disconnect pressed meanwhile wins.
+            let latest = state.last_connect.lock().await;
+            if let Some(params) = latest.clone() {
+                let _ = helper::ask(Request::Connect { params }).await;
+            }
         }
         return Err(format!("The update could not be installed: {e}"));
     }

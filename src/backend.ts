@@ -79,6 +79,8 @@ export interface Account {
   messages?: PersonalMessage[];
   /** Every recent message, closed ones too, newest first. */
   inbox?: PersonalMessage[];
+  /** The panel asks this app to update to this version by itself (it isn't forced: the app keeps working). */
+  updateTo?: string;
 }
 
 export interface PersonalMessage {
