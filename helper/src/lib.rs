@@ -8,6 +8,8 @@
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub mod dns;
+#[cfg(windows)]
+pub mod folder;
 #[cfg(not(target_os = "android"))]
 pub mod ipc;
 pub mod ping;

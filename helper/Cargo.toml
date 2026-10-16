@@ -18,7 +18,9 @@ cakevpn-proto = { path = "../proto" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "process", "sync", "time", "macros", "signal"] }
-netdev = "0.36"
+# 0.36 panicked on some Windows PCs while finding the router (an assert on
+# the size of its ARP answer), so the helper never knew the router there.
+netdev = { version = "0.46", default-features = false, features = ["gateway"] }
 getrandom = "0.3"
 # Checks update installers (see src/update.rs).
 minisign-verify = "0.2"

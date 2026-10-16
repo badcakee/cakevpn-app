@@ -239,6 +239,9 @@ impl Tunnel {
             inner.skip.use_list(&params.bypass_domains);
             let list = inner.skip.list();
             skip::write(dir, &list).map_err(|e| failed(&mut inner, format!("cannot write the skip list: {e}")))?;
+        } else {
+            // Left from a connection that skipped sites; this one doesn't read it.
+            let _ = std::fs::remove_file(&skip_path);
         }
         let config = singbox::config(&singbox::Settings {
             params: &params,

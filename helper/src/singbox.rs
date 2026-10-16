@@ -294,7 +294,13 @@ mod tests {
         assert_eq!(c["outbounds"][0]["flow"], "xtls-rprx-vision");
         assert_eq!(c["outbounds"][0]["tls"]["reality"]["public_key"], p.public_key);
         assert_eq!(c["dns"]["strategy"], "ipv4_only");
+        // A network that blocks sites by their names (airport Wi-Fi) never sees the lookups.
+        assert_eq!(c["dns"]["final"], "remote");
+        assert_eq!(c["dns"]["servers"][0]["tag"], "remote");
+        assert_eq!(c["dns"]["servers"][0]["detour"], "proxy");
+        assert_eq!(c["dns"]["rules"], json!([]));
         let rules = c["route"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| r["protocol"] == "dns" && r["action"] == "hijack-dns"), "DNS sent to the network's own server must be answered by the VPN");
         assert!(rules.iter().any(|r| r["network"] == "udp" && r["port"] == 443 && r["action"] == "reject"), "QUIC is not refused");
     }
 

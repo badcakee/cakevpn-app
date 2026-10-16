@@ -33,7 +33,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 ///     only while the internet itself works, waiting longer each time),
 ///     Windows updates start for real, and one bad connection to the helper
 ///     no longer ends it.
-pub const HELPER_REVISION: u32 = 12;
+/// 13: finds the router on Windows PCs where finding it panicked (Wi-Fi
+///     checks, pings while connected, and the quick start over after
+///     waking up work there again), and its ProgramData folder is for
+///     SYSTEM and administrators only.
+pub const HELPER_REVISION: u32 = 13;
 
 /// The oldest helper the app still works with. Revision 9 only adds
 /// silent updates on Windows, where the installer updates the helper anyway,
@@ -41,7 +45,8 @@ pub const HELPER_REVISION: u32 = 12;
 /// with skipped websites is offered "Set up" in those settings instead. Nor
 /// for 11, which works the same for the app. 12 is required: without it a
 /// bad link keeps cutting every connection (the old helper starts sing-box
-/// over every 30 seconds), so a Mac runs "Set up" once more for it.
+/// over every 30 seconds), so a Mac runs "Set up" once more for it. 13 is
+/// not: its fixes are for Windows, where the installer updates the helper.
 pub const MIN_HELPER_REVISION: u32 = 12;
 
 /// Most locations one ping request can name.

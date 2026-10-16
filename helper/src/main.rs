@@ -57,6 +57,11 @@ fn capture() -> singbox::Capture {
 
 /// Serves the app until `shutdown` finishes, then takes the tunnel down.
 pub async fn serve(shutdown: impl std::future::Future<Output = ()>) -> std::io::Result<()> {
+    // Before anything is written there: the folder holds the sign-in to the VPN server.
+    #[cfg(windows)]
+    if let Err(e) = cakevpn_helper::folder::lock(&data_dir()) {
+        eprintln!("cakevpn-helper: cannot protect {}: {e}", data_dir().display());
+    }
     // A helper that was ended while the tunnel was up left the Mac's DNS pointing into it.
     if capture() == singbox::Capture::Tun {
         dns::back_to_normal(&data_dir());
@@ -112,8 +117,27 @@ pub fn on_big_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static
     std::thread::Builder::new().stack_size(STACK).spawn(work).ok()?.join().ok()
 }
 
-/// Writes every panic to helper-crash.log in the data folder (only its last
-/// few KB are kept), so the app can show what went wrong.
+/// How much of helper-crash.log is kept: the newest lines, about a day of
+/// crashes even when the helper crashed every minute.
+const CRASH_LOG_BYTES: usize = 64 * 1024;
+
+/// The last `keep` bytes of a log, starting at a whole line.
+fn last_lines(log: &[u8], keep: usize) -> &[u8] {
+    if log.len() <= keep {
+        return log;
+    }
+    let cut = log.len() - keep;
+    if log[cut - 1] == b'\n' {
+        return &log[cut..];
+    }
+    match log[cut..].iter().position(|b| *b == b'\n') {
+        Some(end) => &log[cut + end + 1..],
+        None => &[],
+    }
+}
+
+/// Writes every panic to helper-crash.log in the data folder (only its
+/// newest lines are kept), so the app can show what went wrong.
 fn note_crashes() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -123,9 +147,12 @@ fn note_crashes() {
         let path = dir.join("helper-crash.log");
         let _ = std::fs::create_dir_all(&dir);
         let old = std::fs::read(&path).unwrap_or_default();
-        let mut log = old[old.len().saturating_sub(8 * 1024)..].to_vec();
+        let mut log = last_lines(&old, CRASH_LOG_BYTES).to_vec();
         log.extend_from_slice(format!("{when} {} {text}\n", env!("CARGO_PKG_VERSION")).as_bytes());
         let _ = std::fs::write(&path, log);
+        // The rest of the folder is for SYSTEM and administrators only, but the app reads this.
+        #[cfg(windows)]
+        let _ = cakevpn_helper::folder::readable_by_users(&path);
         previous(info);
     }));
 }
@@ -139,6 +166,18 @@ fn run_foreground() {
             std::process::exit(1);
         }
         None => std::process::exit(1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn crash_log_keeps_whole_lines() {
+        let log = b"1 first line\n2 second line\n3 third\n";
+        assert_eq!(super::last_lines(log, 100), &log[..]);
+        assert_eq!(super::last_lines(log, 20), b"3 third\n", "the cut-off second line is left out");
+        assert_eq!(super::last_lines(log, 8), b"3 third\n");
+        assert_eq!(super::last_lines(b"no end of line", 4), b"");
     }
 }
 
