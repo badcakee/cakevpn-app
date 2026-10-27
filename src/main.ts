@@ -1147,16 +1147,27 @@ function skipTab(): string {
 
 /** The background service that skips websites in games too (helper revision 10). */
 const SKIPS_EVERYWHERE = 10;
+/** The one whose skipped websites open on a network without IPv6 when the plan has IPv6 (revision 14). */
+const SKIPS_WITHOUT_IPV6 = 14;
 
 /**
  * A Mac's background service only changes when "Set up" runs again (it asks
  * for the Mac's password), so older ones keep working but skip websites in
- * browsers only. Windows updates it with the app, and Android has none.
+ * browsers only, or (with an IPv6 of one's own) fail to open some of them on
+ * a network without IPv6. Windows updates it with the app, and Android has none.
  */
 function skipSetupNotice(): string {
-  const revision = state.overview?.status?.revision ?? SKIPS_EVERYWHERE;
-  if (!isMac || isAndroid || !state.options.bypassDomains.length || revision >= SKIPS_EVERYWHERE) return "";
-  return `<div class="notice reconnect">Websites here skip the VPN in browsers. To make them skip it in games and other apps too, set up CakeVPN's background service again. Your Mac asks for your password once.
+  const revision = state.overview?.status?.revision ?? SKIPS_WITHOUT_IPV6;
+  if (!isMac || isAndroid || !state.options.bypassDomains.length) return "";
+  let text: string;
+  if (revision < SKIPS_EVERYWHERE) {
+    text = "Websites here skip the VPN in browsers. To make them skip it in games and other apps too, set up CakeVPN's background service again. Your Mac asks for your password once.";
+  } else if (revision < SKIPS_WITHOUT_IPV6 && state.account?.ips?.ipv6) {
+    text = "Some websites here may not open on a network without IPv6. To fix it, set up CakeVPN's background service again. Your Mac asks for your password once.";
+  } else {
+    return "";
+  }
+  return `<div class="notice reconnect">${text}
       <button id="setup-again" ${state.busy ? "disabled" : ""}>Set up again</button></div>`;
 }
 

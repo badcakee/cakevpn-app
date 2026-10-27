@@ -64,21 +64,27 @@ pub fn config(s: &Settings) -> Value {
     // names had. Web traffic always names its site, and many sites share one
     // address, so the addresses only decide for everything else.
     if !p.bypass_domains.is_empty() {
-        rules.push(json!({ "domain_suffix": p.bypass_domains, "outbound": "direct" }));
+        let sites = json!({ "domain_suffix": p.bypass_domains });
+        rules.push(straight_out(vec![sites.clone()], device));
+        if p.ipv6 && !device {
+            dns_rules.push(no_ipv6_answers(sites));
+        }
         dns_rules.push(json!({ "domain_suffix": p.bypass_domains, "server": "local" }));
         if let Some(path) = s.skip_rule_set {
             rule_sets.push(json!({ "type": "local", "tag": "skip-addresses", "format": "source", "path": path }));
-            rules.push(json!({
-                "type": "logical",
-                "mode": "and",
-                "rules": [{ "rule_set": "skip-addresses" }, { "protocol": ["tls", "http", "quic"], "invert": true }],
-                "outbound": "direct"
-            }));
+            rules.push(straight_out(
+                vec![json!({ "rule_set": "skip-addresses" }), json!({ "protocol": ["tls", "http", "quic"], "invert": true })],
+                device,
+            ));
         }
     }
     // On Android, apps skip the VPN by being left out of the VPN itself.
     if !p.bypass_apps.is_empty() && !device {
-        rules.push(json!({ "process_name": p.bypass_apps, "outbound": "direct" }));
+        let apps = json!({ "process_name": p.bypass_apps });
+        rules.push(straight_out(vec![apps.clone()], device));
+        if p.ipv6 {
+            dns_rules.push(no_ipv6_answers(apps));
+        }
         dns_rules.push(json!({ "process_name": p.bypass_apps, "server": "local" }));
     }
 
@@ -194,6 +200,48 @@ pub fn config(s: &Settings) -> Value {
     })
 }
 
+/// Matches while the computer's own network (outside the VPN) has no public
+/// IPv6 address. sing-box follows that network as it changes; it can on
+/// Windows, macOS and Linux, but not as the plain program it is on Android.
+///
+/// Skipped traffic needs it: the VPN gives the computer IPv6 when the plan
+/// has it, so Chrome (and others) see IPv6 working and pick a skipped site's
+/// IPv6 address, which can't go straight out when the network itself has
+/// none. Firefox gets over it by retrying IPv4; Chrome showed an error.
+fn no_ipv6_outside() -> Value {
+    json!({ "default_interface_address": ["2000::/3"], "invert": true })
+}
+
+/// Sends what all of `parts` match straight out, except (on a computer) a
+/// connection to an IPv6 address while there is no IPv6 outside the VPN:
+/// that one goes through the VPN instead, which has IPv6 when the plan does,
+/// so the site still opens.
+fn straight_out(mut parts: Vec<Value>, device: bool) -> Value {
+    if !device {
+        parts.push(json!({
+            "type": "logical",
+            "mode": "and",
+            "rules": [{ "ip_version": 6 }, no_ipv6_outside()],
+            "invert": true
+        }));
+    }
+    json!({ "type": "logical", "mode": "and", "rules": parts, "outbound": "direct" })
+}
+
+/// Answers IPv6 lookups (AAAA) for what `skipped` matches with no addresses
+/// while there is no IPv6 outside the VPN, so apps use the site's IPv4
+/// addresses, which go straight out. Must come before the skipped names'
+/// own DNS rule.
+fn no_ipv6_answers(skipped: Value) -> Value {
+    json!({
+        "type": "logical",
+        "mode": "and",
+        "rules": [skipped, { "query_type": ["AAAA"] }, no_ipv6_outside()],
+        "action": "predefined",
+        "rcode": "NOERROR"
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,8 +306,9 @@ mod tests {
         p.bypass_apps = vec!["steam.exe".into()];
         let c = config(&settings(&p));
         let rules = c["route"]["rules"].as_array().unwrap();
-        assert!(rules.iter().any(|r| r["domain_suffix"] == json!(["mybank.com"]) && r["outbound"] == "direct"));
-        assert!(rules.iter().any(|r| r["process_name"] == json!(["steam.exe"]) && r["outbound"] == "direct"));
+        let direct = |key: &str, value: Value| rules.iter().any(|r| r["outbound"] == "direct" && r["rules"][0][key] == value);
+        assert!(direct("domain_suffix", json!(["mybank.com"])));
+        assert!(direct("process_name", json!(["steam.exe"])));
         assert_eq!(c["route"]["find_process"], true);
         assert!(c["dns"]["rules"].as_array().unwrap().iter().any(|r| r["domain_suffix"] == json!(["mybank.com"]) && r["server"] == "local"));
     }
@@ -273,7 +322,7 @@ mod tests {
         assert_eq!(c["dns"]["reverse_mapping"], true);
         assert!(c["route"]["rule_set"].as_array().unwrap().iter().any(|r| r["tag"] == "skip-addresses" && r["path"] == "/x/skip-addresses.json"));
         let rules = c["route"]["rules"].as_array().unwrap();
-        let by_address = rules.iter().position(|r| r["type"] == "logical" && r["outbound"] == "direct").expect("no address rule");
+        let by_address = rules.iter().position(|r| r["outbound"] == "direct" && r["rules"][0]["rule_set"] == "skip-addresses").expect("no address rule");
         let parts = &rules[by_address]["rules"];
         assert_eq!(parts[0]["rule_set"], "skip-addresses");
         assert_eq!(parts[1]["protocol"], json!(["tls", "http", "quic"]));
@@ -282,6 +331,47 @@ mod tests {
         let private = rules.iter().position(|r| r["ip_is_private"] == true).unwrap();
         let quic = rules.iter().position(|r| r["port"] == 443).unwrap();
         assert!(by_address < private && by_address < quic);
+    }
+
+    /// The VPN has IPv6, the computer's own network has none: a skipped
+    /// site's IPv6 address can't go straight out (Chrome failed on YouTube).
+    #[test]
+    fn skipped_sites_use_ipv4_where_the_network_has_no_ipv6() {
+        let mut p = params();
+        p.ipv6 = true;
+        p.bypass_domains = vec!["youtube.com".into()];
+        p.bypass_apps = vec!["steam.exe".into()];
+        let c = config(&settings(&p));
+
+        // Lookups: no IPv6 answers for skipped names, before they go to the
+        // computer's own DNS (the first rule that matches decides).
+        let dns = c["dns"]["rules"].as_array().unwrap();
+        for (key, value) in [("domain_suffix", json!(["youtube.com"])), ("process_name", json!(["steam.exe"]))] {
+            let blank = dns.iter().position(|r| r["action"] == "predefined" && r["rules"][0][key] == value).expect("no IPv6 rule");
+            let parts = &dns[blank]["rules"];
+            assert_eq!(parts[1]["query_type"], json!(["AAAA"]));
+            assert_eq!(parts[2], no_ipv6_outside());
+            assert_eq!(dns[blank]["rcode"], "NOERROR", "an empty answer, not \"no such site\"");
+            let local = dns.iter().position(|r| r[key] == value && r["server"] == "local").unwrap();
+            assert!(blank < local);
+        }
+        assert_eq!(no_ipv6_outside()["default_interface_address"], json!(["2000::/3"]));
+        assert_eq!(no_ipv6_outside()["invert"], true);
+
+        // Connections: every way of skipping leaves IPv6 to the VPN then.
+        let rules = c["route"]["rules"].as_array().unwrap();
+        let direct: Vec<_> = rules.iter().filter(|r| r["outbound"] == "direct" && r["type"] == "logical").collect();
+        assert_eq!(direct.len(), 3, "sites, their addresses, apps");
+        for rule in direct {
+            let last = rule["rules"].as_array().unwrap().last().unwrap();
+            assert_eq!(last["invert"], true);
+            assert_eq!(last["rules"], json!([{ "ip_version": 6 }, no_ipv6_outside()]));
+        }
+
+        // Without IPv6 in the plan nothing gets IPv6 answers anyway.
+        p.ipv6 = false;
+        let c = config(&settings(&p));
+        assert!(!c["dns"]["rules"].as_array().unwrap().iter().any(|r| r["action"] == "predefined"));
     }
 
     #[test]
@@ -326,6 +416,21 @@ mod tests {
         assert!(rules.iter().any(|r| r["action"] == "hijack-dns"));
     }
 
+    /// Android's sing-box can't see the phone's network, and would take it
+    /// as having no IPv6.
+    #[test]
+    fn android_leaves_ipv6_of_skipped_sites_alone() {
+        let mut p = params();
+        p.ipv6 = true;
+        p.bypass_domains = vec!["youtube.com".into()];
+        let mut s = settings(&p);
+        s.capture = Capture::Device;
+        let c = config(&s);
+        assert!(!c.to_string().contains("default_interface_address"));
+        let rules = c["route"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| r["outbound"] == "direct" && r["rules"] == json!([{ "domain_suffix": ["youtube.com"] }])));
+    }
+
     #[test]
     fn ipv6_only_for_users_with_their_own_address() {
         let mut p = params();
@@ -349,6 +454,8 @@ mod tests {
         all.block_ads = true;
         all.bypass_domains = vec!["mybank.com".into(), "donutsmp.net".into()];
         all.bypass_apps = vec!["steam.exe".into(), "Discord".into()];
+        let mut all_v6 = all.clone();
+        all_v6.ipv6 = true;
         let ads = format!("{dir}/ads.srs");
         std::fs::write(&ads, ADS_RULE_SET).unwrap();
         for (name, params, capture) in [
@@ -356,6 +463,8 @@ mod tests {
             ("local", &p, Capture::LocalPort(11095)),
             ("tun-ipv6", &v6, Capture::Tun),
             ("tun-all-options", &all, Capture::Tun),
+            ("tun-all-options-ipv6", &all_v6, Capture::Tun),
+            ("local-all-options-ipv6", &all_v6, Capture::LocalPort(11095)),
             ("android", &all, Capture::Device),
         ] {
             let skip = format!("{dir}/skip-addresses.json");

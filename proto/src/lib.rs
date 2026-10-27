@@ -37,7 +37,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 ///     checks, pings while connected, and the quick start over after
 ///     waking up work there again), and its ProgramData folder is for
 ///     SYSTEM and administrators only.
-pub const HELPER_REVISION: u32 = 13;
+/// 14: skipped websites and apps keep working on a network without IPv6
+///     when the plan has IPv6 (they get IPv4 addresses only, and anything
+///     still going to an IPv6 address uses the VPN).
+pub const HELPER_REVISION: u32 = 14;
 
 /// The oldest helper the app still works with. Revision 9 only adds
 /// silent updates on Windows, where the installer updates the helper anyway,
@@ -47,6 +50,8 @@ pub const HELPER_REVISION: u32 = 13;
 /// bad link keeps cutting every connection (the old helper starts sing-box
 /// over every 30 seconds), so a Mac runs "Set up" once more for it. 13 is
 /// not: its fixes are for Windows, where the installer updates the helper.
+/// Nor 14: a Mac with skipped websites and IPv6 is offered "Set up" in
+/// those settings instead.
 pub const MIN_HELPER_REVISION: u32 = 12;
 
 /// Most locations one ping request can name.
